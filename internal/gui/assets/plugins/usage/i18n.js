@@ -2,6 +2,20 @@
 // kernel adds them to i18n.js's (magpie.strings).
 magpie.strings({
   zh: {
+    "WorkBuddy free models": "WorkBuddy 免费模型",
+    "Ready": "可用",
+    "Used up": "已用尽",
+    "Stopped": "已停止",
+    "This window": "本周期",
+    "Window open": "窗口开放中",
+    "no calls yet": "尚无调用",
+    "{n} tokens in this window, of {limit}": "本周期已用 {n} token，共 {limit}",
+    "WorkBuddy named no reset; asking until it answers": "WorkBuddy 未给出重置时间，会一直重试直到可用",
+    "read {when}": "{when} 读取",
+    "{d}d {h}h": "{d}天{h}小时",
+    "{h}h {m}m": "{h}小时{m}分",
+    "{m}m": "{m}分",
+    "now": "即将",
     "(prompt not recorded)": "（未记录提示词）",
     "Gateway session": "网关会话",
     "Seen only through the gateway: the agent kept no session file magpie can read. Turn on Record gateway conversations in Sessions to keep its prompts.": "只经网关看到：agent 没有留下 magpie 能读的会话文件。在「会话」里开启「记录网关对话」可保留它的提示词。",

@@ -1124,6 +1124,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	providerRoutes(mux, w)
 	importRoutes(mux)
 	usageRoutes(mux, w)
+	workbuddyCustomRoutes(mux)
+	workbuddyRequestRoutes(mux)
 	callerKeyRoutes(mux)
 	sessionRoutes(mux, w)
 	sessionManageRoutes(mux, w)
@@ -1180,6 +1182,10 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		// nor whether updates download by themselves (#2296)
 		if _, sent := fields["noAutoDownload"]; !sent {
 			in.NoAutoDownload = cur.NoAutoDownload
+		}
+		// nor the Custom page's scheduled requests, which it sets itself
+		if _, sent := fields["workbuddyWatch"]; !sent {
+			in.WorkBuddyWatch = cur.WorkBuddyWatch
 		}
 		// nor whether the masked words match in any case
 		if _, sent := fields["redactWordsAnyCase"]; !sent {

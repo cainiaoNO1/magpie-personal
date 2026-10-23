@@ -180,6 +180,10 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		QuotaReads:           "asked",
 		NoAccountDiscovery:   true,
 		RedactModel:          true,
+		WorkBuddyWatch: settings.WorkBuddyWatch{
+			On: true, Models: []string{"deepseek-v4.1-flash"}, Every: 600,
+			Per: map[string]int{"me@example.com\x00deepseek-v4.1-flash": 300},
+		},
 	}
 	was.DesktopSubagentEffort = "high"
 	was.CodexAsyncCompact, was.CodexAsyncCompactPercent = true, 70

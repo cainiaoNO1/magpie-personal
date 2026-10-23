@@ -1,0 +1,82 @@
+/* Custom: WorkBuddy's free models on a schedule (custom.js) */
+.cu-view { display: flex; flex-direction: column; gap: 14px; }
+.cu-card { padding: 12px 14px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--card, transparent); }
+.cu-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.cu-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.cu-sub { margin-top: 4px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.cu-switch { flex: 0 0 auto; padding: 3px 12px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 600; cursor: pointer; }
+.cu-switch.on { border-color: color-mix(in srgb, var(--ok, #2e9e5b) 45%, transparent); background: color-mix(in srgb, var(--ok, #2e9e5b) 14%, transparent); color: var(--ok, #2e9e5b); }
+.cu-row { display: flex; align-items: center; gap: 10px; margin-top: 11px; flex-wrap: wrap; }
+.cu-k { flex: 0 0 auto; min-width: 130px; font-size: 11.5px; color: var(--muted); }
+.cu-models { display: flex; flex-wrap: wrap; gap: 6px; }
+.cu-chip { padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
+.cu-chip.on { border-color: color-mix(in srgb, var(--accent, #4b7bec) 45%, transparent); background: color-mix(in srgb, var(--accent, #4b7bec) 13%, transparent); color: var(--fg); }
+.cu-err { margin-top: 10px; padding: 7px 9px; border-radius: 6px; background: color-mix(in srgb, var(--err, #d64545) 12%, transparent); color: var(--err, #d64545); font-size: 11px; }
+.cu-accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 10px; }
+.cu-account { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.cu-account:hover { border-color: color-mix(in srgb, var(--fg) 22%, var(--line)); }
+.cu-account.picked { border-color: color-mix(in srgb, var(--accent, #4b7bec) 55%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #4b7bec) 30%, transparent); }
+.cu-account:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent, #4b7bec) 60%, transparent); outline-offset: 2px; }
+.cu-badge { flex: 0 0 auto; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cu-badge.ok { color: var(--ok, #2e9e5b); background: color-mix(in srgb, var(--ok, #2e9e5b) 14%, transparent); }
+.cu-badge.rest { color: var(--warn, #c8871a); background: color-mix(in srgb, var(--warn, #c8871a) 16%, transparent); }
+.cu-badge.off { color: var(--muted); background: color-mix(in srgb, var(--muted) 14%, transparent); }
+.cu-model + .cu-model { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.cu-mhead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cu-mname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--fg-2); }
+.cu-every { flex: 0 0 auto; padding: 0; font-size: 10.5px; color: var(--muted); }
+.cu-every:hover { color: var(--fg); }
+.cu-labels { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin: 6px 0 4px; font-size: 10.5px; color: var(--muted); }
+.cu-labels .cu-n { color: var(--fg-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cu-track { height: 4px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.cu-track > i { display: block; height: 100%; border-radius: inherit; background: var(--warn, #c8871a); transition: width .3s; }
+.cu-track > i.ok { background: var(--ok, #2e9e5b); }
+.cu-reset { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-top: 5px; font-size: 10.5px; color: var(--muted); }
+.cu-reset .cu-left { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.cu-list { margin-top: 6px; }
+.cu-list .row { align-items: flex-start; gap: 10px; }
+.cu-list .who { min-width: 0; flex: 1 1 auto; }
+.cu-list .name { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+.cu-list .sub { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 2px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.cu-tag { padding: 0 5px; border-radius: 4px; background: color-mix(in srgb, var(--warn, #c8871a) 15%, transparent); color: var(--warn, #c8871a); font-size: 9.5px; }
+.cu-said { flex: 0 0 auto; max-width: 52%; text-align: right; }
+.cu-why { margin-top: 3px; font-size: 10px; line-height: 1.45; color: var(--muted); word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* the calls of the account picked, in its window: a table, since the
+   columns are what is read down */
+.cu-calls { margin-top: 6px; display: flex; flex-direction: column; }
+.cu-chead, .cu-crow { display: grid; grid-template-columns: 150px minmax(120px, 1fr) 110px 92px 78px minmax(80px, 160px); gap: 10px; align-items: center; padding: 5px 8px; }
+.cu-chead { font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line, #e5e5e5); }
+.cu-crow { font-size: 12px; border-bottom: 1px solid color-mix(in srgb, var(--line, #e5e5e5) 55%, transparent); font-variant-numeric: tabular-nums; }
+.cu-crow:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.cu-crow.probe { color: var(--muted); }
+.cu-cwhen { white-space: nowrap; }
+.cu-cwho { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cu-cwho > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cu-ctok, .cu-cttft, .cu-cms { text-align: right; color: var(--muted); }
+.cu-csaid { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cu-csaid .cu-why { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.cu-records .opt .cu-n { margin-left: 5px; opacity: 0.7; font-variant-numeric: tabular-nums; }
+.cu-records .row-head { gap: 10px; flex-wrap: wrap; }
+.cu-records .row-head .label { font-weight: 600; }
+
+/* the account's window, drawn as the Usage page's Requests tab is: four
+   totals, the trend, the heatmap, then the list */
+.cu-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 8px 0 12px; }
+.cu-stat { border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 9px 12px; }
+.cu-sname { font-size: 11px; color: var(--muted); }
+.cu-svalue { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.cu-ssub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.cu-chart { border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.cu-bars { display: flex; align-items: flex-end; gap: 2px; height: 110px; }
+.cu-bar { flex: 1 1 0; min-width: 2px; background: var(--accent, #5b6ee1); border-radius: 2px 2px 0 0; opacity: 0.85; }
+.cu-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 4px; }
+.cu-heat { border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.cu-hgrid { display: grid; grid-template-columns: repeat(auto-fill, 11px); gap: 3px; }
+.cu-hcell { display: block; width: 11px; height: 11px; border-radius: 2px; background: var(--accent, #5b6ee1); }
+.cu-chead, .cu-crow { grid-template-columns: 150px minmax(90px, 130px) minmax(120px, 1fr) 100px 92px 78px minmax(70px, 130px); }
+
+/* the Usage page's Requests tab, embedded: the same page draws it, so it
+   reads exactly as there */
+.cu-frame { margin-top: 8px; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; overflow: hidden; }
+.cu-iframe { display: block; width: 100%; height: 1500px; border: 0; background: var(--bg, #fff); }

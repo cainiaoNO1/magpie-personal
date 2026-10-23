@@ -233,6 +233,32 @@ func switchedOff(p provider.Provider, model string) string {
 // Version is set by main.
 var Version = "dev"
 
+// watchOf is the Custom page's setting as the watching reads it.
+func watchOf(w settings.WorkBuddyWatch) provider.WorkBuddyWatch {
+	return provider.WorkBuddyWatchOf(w.On, w.Models, w.EveryFor(), w.Per)
+}
+
+// wakeWorkBuddy lifts the rest a WorkBuddy account and model rests under,
+// so a warm-up probe reaches the account it asks about: a request pinned
+// to a resting account is turned away at the gateway, which would read as
+// a refusal the vendor never made. The rest comes back if the probe is
+// refused again, with the reset the vendor names.
+func wakeWorkBuddy(providerID, account, model string) {
+	agent := "plugin:" + providerID
+	restingUntil.Lock()
+	defer restingUntil.Unlock()
+	for k, r := range restingUntil.note {
+		if r.agent != agent || !strings.EqualFold(r.user, account) {
+			continue
+		}
+		if r.Model != "" && model != "" && !strings.EqualFold(r.Model, model) {
+			continue
+		}
+		delete(restingUntil.m, k)
+		delete(restingUntil.note, k)
+	}
+}
+
 // Addr is the listen address: MAGPIE_ADDR, else Settings' port on
 // loopback (settings.GatewayAddr).
 func Addr() string { return settings.GatewayAddr() }
@@ -583,6 +609,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// and, when settings say to, starts its accounts' next windows as the last reset
 	go provider.KeepCodexWindowsWarm(ctx)
 	go provider.KeepClaudeWindowsWarm(ctx, warmClaude)
+	// and asks a frozen WorkBuddy account again once its window starts over,
+	// through this gateway as a client does: the plugin's own fetch answers
+	// a stream's head before the account is asked, and a request pinned to
+	// an account that rests is turned away here without being sent
+	provider.SetWorkBuddyProbeURL(URL())
+	provider.SetWorkBuddyWake(wakeWorkBuddy)
+	provider.SetWorkBuddyResets(resetsAt)
+	// the models watched and the interval, as the Custom page left them
+	provider.SetWorkBuddyWatch(watchOf(settings.Load().WorkBuddyWatch))
+	go provider.KeepWorkBuddyWarm(ctx)
 	// and spends a Codex reset about to run out unused, for the accounts
 	// that let it
 	go provider.KeepResetsFromRunningOut(ctx)

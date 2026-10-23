@@ -1,0 +1,129 @@
+# 任务拆解 · WorkBuddy 免费额度自由化
+
+> 配套 `doc/PRD.md`、`doc/design.md` · 2026-10-22
+> 原则：**先验证假设，再写代码**。A1/A2 不成立时，后面的任务会大幅缩水。
+
+---
+
+## 阶段 0 · 假设验证（先做，不写代码）
+
+| # | 任务 | 产出 | 阻塞 |
+| --- | --- | --- | --- |
+| 0.1 | 在 `18.188.150.249` 抓一次真实额度耗尽请求 | 完整 HTTP 状态码 + body | A1 |
+| 0.2 | 观察一个账号耗尽后的首次可用时刻，与首次使用时刻比对 | 时间差数据 | A2 |
+| 0.3 | 对比插件 credits 与 magpie usage 记录的累计 token | 口径差异说明 | A3 |
+| 0.4 | 确认免费额度与付费 credits 是否独立 | 结论 | A4 |
+
+**出口条件**：A1–A4 全部有明确结论，回填到 `doc/PRD.md §7`。
+
+> 若 A2 结论为「北京午夜重置」：阶段 2.2 与阶段 3 大幅简化，插件侧不改。
+
+---
+
+## 阶段 1 · magpie 侧计量与判定（无 UI）
+
+| # | 任务 | 文件 | 依赖 |
+| --- | --- | --- | --- |
+| 1.1 | 新增轮次起点表 `wbRounds`（内存 + 持久化） | `internal/gateway/wb_round.go`（新） | 0.2 |
+| 1.2 | 请求路径上记录首次会话时间与 token 累计 | `internal/gateway/gateway.go` | 1.1 |
+| 1.3 | 实现 `wbExhausted` 判定（14018 / insufficient_quota / 499） | `internal/gateway/routing.go` | 0.1 |
+| 1.4 | 耗尽时写入 `Rest{Why: failQuota, By: "window", Until: 轮次Reset}` | `internal/gateway/routing.go` | 1.3 |
+| 1.5 | 到期调 `renewed()` 解冻 | `internal/gateway/wb_round.go` | 1.1 |
+| 1.6 | 单元测试：判定、滚动、解冻 | `internal/gateway/wb_round_test.go`（新） | 1.1–1.5 |
+
+**出口条件**：`go test ./internal/gateway/...` 全绿；冻结账号不出现在候选列表。
+
+---
+
+## 阶段 2 · 额度卡片与查询自由度
+
+| # | 任务 | 文件 | 依赖 |
+| --- | --- | --- | --- |
+| 2.1 | `QuotaWindow` 接收 `span` / `rollingFrom` / `free` | `internal/provider/plugin_usage.go`、`plugin/*.go` | 阶段 1 |
+| 2.2 | 合成「Tokens / 滚动 24h」窗口（来源 `usage.Record`） | `internal/provider/plugin_usage.go` | 1.2, 2.1 |
+| 2.3 | ~~确认 `/api/usage/quotas/refresh` 支持单账号~~ **已验证：已支持**（`usage.go:205-215`） | — | — |
+| 2.4 | 前端：自定义时间区间 | `internal/gui/assets/app.js:16716` 附近 | 2.3 |
+| 2.5 | ~~账号级刷新按钮~~ **已验证：已存在**（`quotaRefresh` `app.js:17942`） | — | — |
+| 2.6 | 调整 `appScriptBudget` 并写清理由 | `internal/gui/core_budget_test.go:18` | 2.4, 2.5 |
+| 2.7 | i18n 四套文案（zh / zh-TW / ja / de） | `internal/gui/assets/i18n.js` | 2.4 |
+
+**出口条件**：面板可在任意时刻刷新单账号；自定义区间可用；`go test ./internal/gui/...` 全绿。
+
+---
+
+## 阶段 3 · 插件侧（仅当 A2 结论为滚动窗口）
+
+仓库：`/Users/ymj/Desktop/code/magpie-plugins/packages/workbuddy`
+
+| # | 任务 | 文件 | 依赖 |
+| --- | --- | --- | --- |
+| 3.1 | 免费窗口附带 `free: true`、`span: 86400` | `index.mjs:1290` `usageOf` | 0.2 |
+| 3.2 | 透出 `rollingFrom` | `index.mjs:1721` `usage()` | 0.2 |
+| 3.3 | `packagesOf` 切片周期按轮次 | `index.mjs:1357` | 0.2 |
+| 3.4 | `runsOutOf` 不再无条件跳过 SLICE | `index.mjs:1399` | 3.3 |
+| 3.5 | 更新 `usage.test.mjs` | — | 3.1–3.4 |
+| 3.6 | 本地 `bun test`（`HOME=$(mktemp -d)`） | — | 3.5 |
+
+**出口条件**：插件测试全绿；本地 magpie 能读到新字段。
+
+---
+
+## 阶段 4 · 发布与推送（本轮不做，待文档确认后启动）
+
+| # | 任务 | 说明 |
+| --- | --- | --- |
+| 4.1 | 在 GitHub 创建仓库 | 用 PAT，**不写入任何文件** |
+| 4.2 | 配置 `origin` | `git remote add origin ...` |
+| 4.3 | 推送分支 | 建议 `dev` 分支，`main` 保持与 upstream 对齐 |
+| 4.4 | 轮换 PAT | **推送完成后立即吊销并重新签发** |
+
+> 安全：PAT 已出现在对话中，视为已泄露。4.4 不是可选项。
+
+---
+
+## 阶段 5 · 文档同步
+
+| # | 任务 | 文件 |
+| --- | --- | --- |
+| 5.1 | 更新路由子系统文档 | `docs/subsystems/gateway-routing.md` |
+| 5.2 | 更新供应商/账号文档 | `docs/subsystems/providers-accounts.md` |
+| 5.3 | 回填 PRD §7 假设结论 | `doc/PRD.md` |
+| 5.4 | 记录踩坑 | `doc/notes.md`（新，可选） |
+
+---
+
+## 依赖图
+
+```
+阶段 0 (验证)
+   │
+   ├──► 阶段 1 (计量/判定/冻结)  ──► 阶段 2 (卡片/查询)
+   │                                        │
+   └──► 阶段 3 (插件, 仅 A2=滚动) ─────────┘
+                                            │
+                                            ▼
+                                   阶段 5 (文档同步)
+                                            │
+                                    阶段 4 (推送)
+```
+
+---
+
+## 里程碑
+
+| 里程碑 | 内容 | 验收 |
+| --- | --- | --- |
+| M1 | 阶段 0 完成 | A1–A4 有结论 |
+| M2 | 阶段 1 完成 | 冻结/解冻在真实流量上生效 |
+| M3 | 阶段 2 完成 | 面板可任意时刻按账号查 |
+| M4 | 阶段 3 完成（可选） | 插件测试全绿 |
+| M5 | 阶段 4 完成 | 代码在 GitHub，PAT 已轮换 |
+
+---
+
+## 建议起步顺序
+
+1. **阶段 0.2**（A2）——它决定后面一半的工作量；
+2. **阶段 0.1**（A1）——它决定判定函数怎么写；
+3. **阶段 1**——即使 A2 是午夜重置，冻结/解冻逻辑照样需要；
+4. 其余按依赖图推进。

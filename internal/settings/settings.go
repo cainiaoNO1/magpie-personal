@@ -208,6 +208,11 @@ type Settings struct {
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
 	// credits it gives while its event runs.
 	WorkBuddyCheckin bool `json:"workbuddyCheckin,omitempty"`
+	// WorkBuddyWatch is the Custom page's scheduled requests: the models
+	// watched on every WorkBuddy account, and how often an account that
+	// answers is asked. Empty is magpie's own watching (deepseek's free
+	// model, every half hour).
+	WorkBuddyWatch WorkBuddyWatch `json:"workbuddyWatch,omitzero"`
 	// TraeCheckin presses Trae CN's daily check-in (每日签到) for each
 	// signed-in Trae CN account (its plugin's) once a Beijing day, claiming
 	// the credits it gives.

@@ -177,6 +177,11 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 	// own /usage is run at once (provider.AskClaudeUsage).
 	// Only then are they read while the user has allowances read only
 	// when asked (#1518).
+	// WorkBuddy's free models: one row per account and model watched, its
+	// window, and what it has spent of it (workbuddy_card.go).
+	mux.HandleFunc("GET /api/usage/workbuddy", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, workbuddyRows(usage.Clock()))
+	})
 	mux.HandleFunc("GET /api/usage/quotas", func(rw http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		if r.URL.Query().Get("asked") != "" {

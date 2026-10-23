@@ -4374,3 +4374,9 @@ body .row.agent .ag-prefs .row.pref .who { display: block; }
 :is(.ag-prefs, .agent-prefs) .compact-at { flex: 0 1 auto; min-width: 0; flex-wrap: wrap; row-gap: 6px; }
 /* Settings' search finds them; not searching, the links stay out */
 #view-settings:not(.set-searching) #agentPrefLinks { display: none; }
+
+/* a page in another page's frame (the Custom page's account view): no
+   sidebar, no header, no page padding of its own */
+body.embedded :is(#side, #sideEdge, .top) { display: none !important; }
+body.embedded .view { padding: 0; margin: 0; }
+body.embedded { overflow-x: hidden; }

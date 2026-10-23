@@ -1837,6 +1837,19 @@ function renderLedger() {
 const USAGE_TABS = [["usage", "Overview"], ["requests", "Requests"], ["sessions", "Sessions"], ["context", "Context"]];
 let usageTab = "usage";
 try { const k = localStorage.getItem("magpie.usageTab"); if (USAGE_TABS.some(([id]) => id === k)) usageTab = k; } catch {}
+// A link can open the page on a tab and a pick of its own, which the
+// Custom page does to show one account's calls: ?tab=requests&account=…
+// &period=last:24h. The address wins over what was last shown.
+{
+  const q = new URLSearchParams(location.search);
+  const tab = q.get("tab");
+  if (tab && USAGE_TABS.some(([id]) => id === tab)) usageTab = tab;
+  const per = q.get("period");
+  if (per) period = per;
+  if (q.get("account")) ledAccount = q.get("account");
+  if (q.get("model")) ledModel = q.get("model");
+  if (q.get("agent")) ledAgent = q.get("agent");
+}
 let sessAgent = "all";
 let sessQuery = "";
 // The list is drawn in pages: every session is read (so the count beside it

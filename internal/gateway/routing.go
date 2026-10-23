@@ -403,7 +403,29 @@ func failureOf(c candidate, status int, body []byte) string {
 	if restrictedRefused(c.p, status, body) {
 		return failRestricted
 	}
-	return failure(status, body)
+	why := failure(status, body)
+	// WorkBuddy's free models come back 24 hours after they ran out, and
+	// nothing asks again when they do (workbuddy_warmup.go). Recorded
+	// here, where every refusal is told what it is: a request pinned to
+	// one account never reaches restAfterMarked, and it is the one that
+	// finds an account used up.
+	if why == failQuota {
+		if a := c.p.Account; a != nil {
+			now := time.Now()
+			// a refusal that names no reset is still a window used up:
+			// WorkBuddy's free models start one over 24 hours after the
+			// first call that spent it, which is what the vendor's own
+			// words say when they say a time at all. Left unrecorded,
+			// such an account was never watched, and real requests went
+			// on finding it every quarter of an hour for a day.
+			until := now.Add(provider.WorkBuddyWindow)
+			if d := resetsAt(body, now); d > 0 {
+				until = now.Add(d)
+			}
+			provider.NoteWorkBuddyFrozen(a.UsageAgent(), a.User, c.model, until, now)
+		}
+	}
+	return why
 }
 
 // restrictedSaid says an error is one magpie already put in words as an

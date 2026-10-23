@@ -1,0 +1,175 @@
+# REQ-001 · WorkBuddy 免费额度解冻探测
+
+> 状态：已确认，待实现 · 2026-10-22
+> 优先级：**P0**（本轮第一个实现的需求）
+> 关联：`doc/PRD.md`、`doc/design.md`
+
+---
+
+## 1. 需求陈述
+
+WorkBuddy 免费模型在额度用尽后，**首次调用起 24 小时**刷新额度。当前 magpie 只会被动等下一次真实请求撞上 429，账号解冻时刻无人主动确认。
+
+**要求**：
+
+1. 记录每个账号的**额度用尽时间**（含预计解冻时刻）；
+2. **定时**在解冻时刻自动发起一次极小请求；
+3. 只有拿到 **HTTP 200** 才算成功并停止；
+4. 没拿到 200 就在**随机间隔**后重试，直到成功或用尽重试预算。
+
+---
+
+## 2. 已验证的事实（来自 252 生产数据）
+
+| 事实 | 证据 |
+| --- | --- |
+| 解冻时刻来自 WorkBuddy 响应体，不是本地推算 | 路由日志 `{"why":"quota","status":429,"by":"resets","until":"..."}`，`by: resets` 出自 `routing.go:864` `resetsAt(body, now)` |
+| 重置 = 首次请求 + 24h | `a13437070786`：首次 11:38:30 → 解冻 11:38:30（差 **0:00:00**）；`913553562@qq`：差 **0:00:08** |
+| **499 不是额度耗尽** | `side_deadline.go:72`：`499 = "the agent canceled the request"`；252 上 15 条 499 的 `ms` 高达 988 秒，是客户端挂断 |
+| 真正的耗尽信号是 **429** | 252 上 9 条 `why:quota` 记录全部 `status: 429` |
+| 冻结已存在 | `restingUntil` + `Rest{Why: failQuota, Until}`，`routing.go:995` |
+| 固定账号的自代理走不通 | `pinTo`（`fallback.go:3248-3254`）遇 `restOf` 命中直接返回 429，探测必然被拒 |
+| 插件直连可用 | `provider.plugin.Fetch`（`plugins.go:504`）不经网关路由，能真实打到 WorkBuddy |
+
+---
+
+## 3. 设计决策（已与用户确认）
+
+| 决策点 | 结论 | 理由 |
+| --- | --- | --- |
+| 探测用什么模型 | **被冻结时的免费模型**（如 `deepseek-v4.1-flash`） | 直接验证免费额度是否恢复 |
+| 重试预算 | **自首次探测起最多 12 小时**，间隔 **5–15 分钟随机** | 约 48–60 次上限；基准是 `Until` 而非 `FrozenAt`，否则首次探测即超预算 |
+| 探测范围 | **只探测 `failQuota` 冻结中的账号** | 正常账号不被打扰 |
+| 成功判定 | **HTTP 200**，其余一律重试 | 用户明确要求 |
+| 发送路径 | **插件直连**（`plugin.Fetch`） | 网关自代理会被 `pinTo` 拒绝 |
+
+---
+
+## 4. 数据模型
+
+新增状态文件 `workbuddy-warmup.json`，与 `codex-warmup.json` 同级：
+
+```go
+// 一个账号本轮的解冻探测状态
+type wbWarm struct {
+    // FrozenAt 是捕获到 failQuota 的时刻
+    FrozenAt time.Time `json:"frozenAt"`
+    // Until 是 WorkBuddy 给的重置时刻（Rest.Until）
+    Until time.Time `json:"until"`
+    // Model 是被冻结时用的模型，探测沿用它
+    Model string `json:"model"`
+    // Attempts 已发出的探测次数
+    Attempts int `json:"attempts,omitempty"`
+    // LastAt 上次探测时刻
+    LastAt time.Time `json:"lastAt,omitzero"`
+    // NextAt 下次探测时刻（随机算出的）
+    NextAt time.Time `json:"nextAt,omitzero"`
+    // GaveUp 是重试预算耗尽后置位，等下一轮冻结覆盖
+    GaveUp bool `json:"gaveUp,omitempty"`
+    // LastStatus 上次拿到的状态码，0 表示没拿到响应
+    LastStatus int `json:"lastStatus,omitempty"`
+    // LastErr 上次失败原因
+    LastErr string `json:"lastErr,omitempty"`
+}
+```
+
+按 `账号 email` 索引，provider 固定为 `workbuddy-ai` / `workbuddy`。
+
+**并发要求**：`NoteWorkBuddyFrozen`（请求路径上调用）与 `KeepWorkBuddyWarm`（每分钟 tick）会并发读写同一个文件，必须用一把 `sync.Mutex` 包住「读-改-写」全过程，否则会丢条目。参考 `codex_warmup.go:79` `readWarmState` 的做法。
+
+---
+
+## 5. 行为规范
+
+### 5.1 记录冻结
+
+捕获 `failQuota` 时（`routing.go:995` 写 `restingUntil` 的同一处），追加写 `wbWarm`：
+
+- `FrozenAt` = 当前时刻
+- `Until` = `Rest.Until`
+- `Model` = 该候选的 model
+- `NextAt` = `Until` + 随机 0–60 秒（避免所有账号同一秒发探测）
+
+### 5.2 定时探测
+
+后台循环（复用 `keepWarm` 骨架，每分钟 tick）：
+
+```
+for each account in workbuddy-warmup.json:
+    if GaveUp: continue
+    if now < NextAt: continue
+    // 预算基准是 Until（首次探测时刻），不是 FrozenAt。
+    // FrozenAt 是撞 429 的时刻，Until 已是它之后约 24h；
+    // 若以 FrozenAt+12h 为界，第一次探测就会立刻判超预算。
+    if now > Until + 12h: mark GaveUp; continue
+    send probe
+    if status == 200:
+        clear the entry   // 解冻确认，停止探测
+    else:
+        Attempts++
+        NextAt = now + rand(5m, 15m)
+```
+
+### 5.3 探测请求
+
+走 `plugin.Fetch`，与 `pluginFetch` 相同的构造方式：
+
+- 方法：`POST`
+- 路径：`/v1/chat/completions`（插件内部转成 WorkBuddy 的 `/v2`）
+- 模型：`wbWarm.Model`
+- `max_tokens: 1`，`messages: [{"role":"user","content":"hi"}]`
+- 流式：关闭
+
+> 超时 60 秒。失败（网络错误）等同非 200，进入重试。
+
+### 5.4 成功后的清理
+
+拿到 200 后：
+
+1. 删除该账号的 `wbWarm` 条目；
+2. 调 `renewed(agent, user)`（`routing.go:497`）立即解除 resting，不等下一次额度读取；
+3. 记一行日志。
+
+### 5.5 与现有机制的关系
+
+- **不修改** `restingUntil` 的既有语义；
+- **不修改** 插件的 `auth.usage` 契约；
+- `renewed` 只解 `failQuota` / `by: window`，本需求写入的 rest 恰好符合；
+- 探测请求本身会经过 `usage.Record` 记账，但 `max_tokens: 1`，影响可忽略。
+
+---
+
+## 6. 验收标准
+
+| # | 标准 | 验证方式 |
+| --- | --- | --- |
+| 1 | 捕获 `failQuota` 时写入 `workbuddy-warmup.json`，含 `FrozenAt`/`Until`/`Model` | 单元测试 |
+| 2 | 到 `NextAt` 时自动发探测请求 | 单元测试（注入 fake 时钟 + fake send） |
+| 3 | 返回 200 → 条目删除 + `renewed` 被调用 | 单元测试 |
+| 4 | 返回 429 → `NextAt` 落在 5–15 分钟区间 | 单元测试，多次断言区间 |
+| 5 | 超过 12 小时 → 标记 `GaveUp`，不再探测 | 单元测试 |
+| 6 | 只探测 `failQuota` 账号，正常账号零请求 | 单元测试 |
+| 7 | 进程重启后从文件恢复，不重复计时 | 单元测试（写文件→重建→读） |
+| 8 | 真实环境：账号解冻后 12 小时内自动恢复可用 | 252 上观察日志（**非单测项**） |
+
+> §6 的第 1–7 条是可单测的验收标准，第 8 条是上线后的线上观察，两者口径分开。
+
+---
+
+## 7. 边界与不做
+
+- **不做**：修改插件、修改额度卡片、修改查询界面（后续需求）；
+- **不做**：主动推断解冻时刻（以 WorkBuddy 给的 `Rest.Until` 为准）；
+- **不做**：对正常账号保活；
+- **不做**：无限重试。
+
+---
+
+## 8. 风险
+
+| 风险 | 缓解 |
+| --- | --- |
+| `Rest.Until` 可能早于真实可用时刻（实测差 8 秒） | 正是兜底重试存在的理由 |
+| 免费模型 0 积分，探测可能不启动新窗口 | 探测目的只是确认「能拿到 200」，不要求启动窗口 |
+| 多实例（两台服务器）同时探测同一账号 | 每台只探测自己路由过的账号；`FrozenAt` 以本地记录为准 |
+| 探测请求计入用量 | `max_tokens: 1`，且记账与实际消耗一致 |

@@ -1,0 +1,227 @@
+# 技术设计 · WorkBuddy 免费额度自由化
+
+> 配套 `doc/PRD.md` · 2026-10-22 · 状态：待评审
+> 目标仓库：`magpie-personal`（本仓库）+ `magpie-plugins/packages/workbuddy`
+
+---
+
+## 1. 总体思路
+
+两侧各做各擅长的事，**权威信号优先于本地推算**：
+
+```
+                     ┌──────────────────────────┐
+                     │  WorkBuddy 上游           │
+                     │  14018 / 499 / credits   │
+                     └───────────┬──────────────┘
+                                 │
+              ┌──────────────────┴──────────────────┐
+              │                                      │
+   ┌──────────▼──────────┐              ┌────────────▼─────────────┐
+   │ 插件侧（workbuddy）  │              │ magpie 网关               │
+   │ · 上报轮次起点        │              │ · 本地 token 计量         │
+   │ · 暴露免费窗口字段    │              │ · 捕获耗尽 → Rest        │
+   │ · 区分 SLICE/滚动     │              │ · 24h 后 renewed 解冻    │
+   └──────────┬──────────┘              └────────────┬─────────────┘
+              │   auth.usage 字段扩展                 │
+              └──────────────┬───────────────────────┘
+                             │
+                  ┌──────────▼──────────┐
+                  │  额度卡片 / 面板     │
+                  │  任意时刻按账号查询  │
+                  └─────────────────────┘
+```
+
+**设计原则**
+
+1. **不 vendor 插件**：插件作为外部依赖，通过 `auth.usage` 契约通信（PRD §6、Q5 结论）。
+2. **不推翻现有排序**：`runsOutAt` / `notModels` / `spareFree` 语义保持不变（PRD R6）。
+3. **复用已有机制**：冻结走 `Rest`，解冻走 `renewed`，不新造并行系统。
+4. **权威优先**：上游说废了就废了；本地计量只用于预警和排序，不用于强制冻结。
+
+---
+
+## 2. 数据模型
+
+### 2.1 复用现有结构
+
+```go
+// internal/provider/subscription_usage.go:29
+type QuotaWindow struct {
+    Unlimited bool
+    Name      string
+    Used      float64
+    ResetsAt  *time.Time
+    ResetSecs int64
+    Display   string
+    Amount    float64   // 已用
+    Limit     float64   // 上限
+    Unit      string    // "credits" / "tokens"
+    RunsOutAt *time.Time
+    RunsOut   float64
+    // ... Span, Model, Aside, matches
+}
+```
+
+**不需要新类型**。新增的「token / 滚动 24h」窗口就是第二个 `QuotaWindow`，`Name = "Tokens"`、`Unit = "tokens"`。
+
+### 2.2 插件侧契约扩展（`auth.usage` 返回值）
+
+现状（`index.mjs:1290`）：
+
+```js
+{ plan, windows: [{ name, used, display, amount, limit, unit, runsOutAt?, runsOut?, notModels? }] }
+```
+
+**新增可选字段**（向后兼容，旧 magpie 忽略即可）：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `window.span` | number（秒） | 窗口长度；免费窗口填 `86400` |
+| `window.resetsAt` | RFC3339 | 该轮次预计刷新时刻 |
+| `window.rollingFrom` | RFC3339 | **本轮起点**（首次会话时间），滚动窗口专用 |
+| `window.free` | boolean | 该窗口是否为免费额度窗口（区别于付费 credits） |
+
+> 关键：`rollingFrom` 让 magpie 知道「这不是自然日重置」，从而正确展示与排序。
+
+### 2.3 magpie 侧新增状态
+
+**轮次起点表**（内存 + 磁盘，仿 `restingUntil` 的做法）：
+
+```go
+// internal/gateway/wb_round.go（新增）
+type wbRound struct {
+    First  time.Time // 本轮首次请求时间
+    Reset  time.Time // First + 24h
+    Tokens int64     // 本轮 magpie 经手的 token 累计
+}
+var wbRounds sync.Map // key: provider + "\x00" + account
+```
+
+- 首次遇到某账号请求时写入 `First`；
+- 每次请求结束累加 `Tokens`（来源 `usage.Record`，含 `prompt`+`completion`+`cache`）；
+- 超过 `Reset` 后自动滚动（清空重来）。
+
+---
+
+## 3. 关键流程
+
+### 3.1 捕获耗尽并冻结
+
+现有 `Rest` 结构（`routing.go:456`）已经有 `Why` 枚举，其中 `failQuota` 正是所需：
+
+```go
+Why: "failQuota"   // 已有
+By:  "window"      // 已有：额度窗口填满后重置
+```
+
+**改动点**：在网关把上游错误转成 `Rest` 的路径上，为 WorkBuddy 增加一个判定分支。
+
+```go
+// 伪代码，落在 internal/gateway/routing.go 附近
+func wbExhausted(p provider.Provider, status int, body []byte) (until time.Time, ok bool) {
+    if !wbLike(p.ID) { return time.Time{}, false }
+    if !bytes.Contains(body, []byte("14018")) &&
+       !bytes.Contains(body, []byte("insufficient_quota")) &&
+       !wbExhaustedText.Match(body) &&
+       status != 499 {
+        return time.Time{}, false
+    }
+    // 用轮次起点 + 24h 作为解冻时刻（PRD R4）
+    if r, found := wbRoundOf(p.ID, user); found {
+        return r.Reset, true
+    }
+    return time.Now().Add(24 * time.Hour), true // 起点未知，保守 24h
+}
+```
+
+冻结写入走现有 `restUntil` 路径，`By` 记 `"window"`，这样 `renewed()`（`routing.go:496`）能自动把它解掉。
+
+> **为什么用 `By: "window"`**：`renewed()` 只解除 `Why == failQuota || By == "window"` 的休息，其余（rate limit、credit、verify）保留。语义正好匹配。
+
+### 3.2 自动解冻
+
+两条路径，任一先到即可：
+
+1. **定时**：`wbRounds` 的 `Reset` 到期 → 调用 `renewed(agent, user)` 解除；
+2. **读取时**：下一次额度刷新发现 `resetsAt` 已过或窗口重新有余额 → 同样调 `renewed`。
+
+不新增后台循环，挂在已有的额度刷新节奏上（`plugin_usage.go` 的读取路径）。
+
+### 3.3 任意时刻按账号查询
+
+**后端**：已存在且**已支持单账号**——`POST /api/usage/quotas/refresh?provider=X&user=Y`（`usage.go:205-215`，`provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))`）。**零后端改动**。
+
+> 这意味着 R1 的「任意时刻按账号刷新」在后端**已经能用了**，缺的只是前端入口与自定义区间。工作量比预想小。
+
+**前端**（`app.js`）：
+
+| 现状 | 改动 |
+| --- | --- |
+| `:16716` `PANEL_USE_PERIODS = [today, 7d, 30d, all]` | 保留，作为快捷项 |
+| `:22002` Today/Yesterday 日标签 | 保留 |
+| 无自定义区间 | 新增 `custom` 项 + 起止时间输入 |
+| 账号级刷新按钮 | **已存在**：`quotaRefresh(q)`（`app.js:17942`，`:17042`/`:17177`/`:17191`/`:17218` 处已调用） |
+
+> **重要**：`app.js` 有脚本体积预算测试（`internal/gui/core_budget_test.go:18` `appScriptBudget`）。新增代码需要相应调整预算值并说明理由，否则测试失败。
+
+### 3.4 面板呈现
+
+复用现有额度卡片渲染。新增状态由 `Rest` 推导：
+
+- 账号在 `restingUntil` 中且 `Why == failQuota` → 显示「额度用尽 · 恢复时间」；
+- 否则显示正常。
+
+文案走 `i18n.js`（中文/繁体/日/德四套，参考现有 `{used} of {limit} used` 模式）。
+
+---
+
+## 4. 插件侧改动
+
+仓库：`/Users/ymj/Desktop/code/magpie-plugins/packages/workbuddy`
+
+| 文件 | 改动 |
+| --- | --- |
+| `index.mjs:1290` `usageOf` | 免费包窗口附带 `free: true`、`span: 86400` |
+| `index.mjs:1357` `packagesOf` | 免费包的 `SlicePeriodStartTime` 改为按轮次而非北京当天（依赖 A2 验证） |
+| `index.mjs:1399` `runsOutOf` | 不再无条件跳过 `SLICE`；若该包是滚动窗口则参与计算 |
+| `index.mjs:1721` `usage()` | 透出 `rollingFrom` |
+| `usage.test.mjs` | 同步更新期望值 |
+
+> **风险**：`packagesOf` 的日期参数是**请求上游时用的**，改成滚动起点可能改变上游返回内容。若 A2 验证为「北京午夜重置」，则插件侧**完全不用改**，只需 magpie 侧做展示层调整。**先验证 A2 再动插件**。
+
+---
+
+## 5. 影响面与风险
+
+| 风险 | 说明 | 缓解 |
+| --- | --- | --- |
+| **A1 未验证** | 「499」可能是用户对 14018 的口语称呼，不是 HTTP 状态码 | 阶段 1 先抓真实响应；判定函数同时兼容两种 |
+| **A2 未验证** | 滚动 24h vs 北京午夜，决定插件改不改 | 优先验证；先实现「跟随插件上报」，验证后再决定是否自算 |
+| `appScriptBudget` | 前端加代码会触发体积测试 | 同步调整预算常量并写清理由 |
+| `renewed()` 误伤 | 若 `By` 记错，可能解掉不该解的 rest | 只对 `Why=failQuota` 且 `By=window` 生效；加单元测试 |
+| 同步 upstream | 改动集中在新文件 + 少量分支，减少冲突 | 新逻辑放 `wb_round.go` 独立文件 |
+| 多 magpie 实例 | 两台服务器各自记账，轮次起点不一致 | 轮次起点以插件上报的 `rollingFrom` 为准，本地只作兜底 |
+
+---
+
+## 6. 测试策略
+
+| 层 | 测试 |
+| --- | --- |
+| Go 单元 | `wbExhausted` 判定：14018 / insufficient_quota / 499 / 正常响应 |
+| Go 单元 | 轮次滚动：首请求 → 23h59m → 24h01m 的行为 |
+| Go 集成 | 冻结后候选列表不含该账号；`renewed` 后重新出现 |
+| Go 回归 | `internal/gateway/routing_test.go`、`fallback` 相关测试全绿 |
+| 前端 | 自定义区间查询；预算测试 |
+| 插件 | `bun test`（需 `HOME=$(mktemp -d)`，见 `usage.test.mjs:8`） |
+| 端到端 | 在 `18.188.150.249` 用真实账号跑到耗尽，观察冻结与恢复 |
+
+---
+
+## 7. 与上游规范的对齐
+
+- `AGENTS.md`：改动 `docs/subsystems/` 覆盖的子系统时同步更新对应页面 → 本改动涉及 `gateway-routing.md` 与 `providers-accounts.md`；
+- `LESSONS.md`：动手前通读；
+- `docs/code-standards.md`：新代码遵循；
+- 自用文档留在 `doc/`，不污染上游 `docs/`。

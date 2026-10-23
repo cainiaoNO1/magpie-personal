@@ -24281,6 +24281,10 @@ $(".top").addEventListener("dblclick", (e) => {
 });
 if (mode === "window") { $("#open").remove(); $("#openMain").remove(); $("#quit").remove(); }
 else { $("#nav").remove(); $("#side").remove(); }
+// embedded: a page shown inside another one's frame (the Custom page's
+// account view), with no navigation or header of its own
+// hidden by CSS, not removed: the shell still reads them as it starts
+if (params.get("embed") === "1") document.body.classList.add("embedded");
 if (mode !== "window" || !document.body.classList.contains("linux")) $("#winclose").remove();
 
 // Config files may change underneath us (another magpie, an editor); reload when
