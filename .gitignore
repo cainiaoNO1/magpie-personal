@@ -6,3 +6,22 @@
 /rsrc_windows_*.syso
 /magpie-dev-backend
 /magpie-dev.new
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor & IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs & temp
+*.log
+/tmp/

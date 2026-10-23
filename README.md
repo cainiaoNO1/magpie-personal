@@ -1,3 +1,22 @@
+## 个人定制功能说明 (Personal Customizations)
+
+本仓库是在 [yetone/magpie](https://github.com/yetone/magpie) 基础上的个人定制分支，主要增强特性如下：
+
+1. **WorkBuddy 免费模型配额探测与解冻自愈 (WorkBuddy Quota Warmup & Watch)**
+   - 自动跟踪多账号下 WorkBuddy 免费模型（如 `deepseek-v4.1-flash`）额度使用情况。
+   - 用尽冻结机制：记录用尽时间，在 24 小时解冻期到达后自动发起带退避重试的探测请求，直至返回 200 确认解除冻结。
+   - 正常巡检保活：支持在设置中自定义正常状态账号的定时请求频次（如 10 分钟 / 30 分钟一次）。
+
+2. **独立自定义观测大盘 (Custom Dashboard)**
+   - 在侧边栏新增「自定义」视图。
+   - 点击具体账号卡片，自动根据账号及当前时间窗口（冻结期 / 至今）进行精准用量过滤。
+   - 包含请求指标汇总卡、小时级 Token 趋势柱状图、53 周每日用量热力图以及请求明细流式列表。
+
+3. **请求存档与生命周期清理 (Request Archive & R2 Sync)**
+   - 支持 S3 / Cloudflare R2 对象存储请求存档，配置单请求体积上限控制与生命周期自动过期。
+
+---
+
 <div align="center">
 
 <a href="https://usemagpie.ai"><img src="site/public/img/icon-256.png" width="112" alt="magpie"></a>
