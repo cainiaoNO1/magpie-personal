@@ -212,6 +212,13 @@ magpie.plugin("custom", (ctx) => {
     track.append(fill);
     row.append(track);
 
+    if (r.firstCallAt) {
+      const fLine = el("div", "cu-reset cu-firstcall");
+      const fAt = new Date(r.firstCallAt);
+      fLine.append(el("span", "", t("First called {when}", { when: resetClock(fAt) })));
+      row.append(fLine);
+    }
+
     if (r.until) {
       const at = new Date(r.until);
       const line = el("div", "cu-reset");

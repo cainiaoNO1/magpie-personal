@@ -30,6 +30,8 @@ type workbuddyRow struct {
 	Until *time.Time `json:"until,omitempty"`
 	// StartsAt is when the window began, from its reset and its span.
 	StartsAt *time.Time `json:"startsAt,omitempty"`
+	// FirstCallAt is the first request time of this window (after thaw, or today's earliest).
+	FirstCallAt *time.Time `json:"firstCallAt,omitempty"`
 	// Spent is what the window has spent, in tokens, of Limit; the two
 	// are zero when magpie routed nothing in it.
 	Spent int64 `json:"spent"`
@@ -87,6 +89,7 @@ func workbuddyRows(now time.Time) []workbuddyRow {
 		}
 		rows = append(rows, row)
 	}
+	workbuddyFirstCalls(rows, now)
 	workbuddySpent(rows, now)
 	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].User != rows[j].User {
@@ -95,6 +98,51 @@ func workbuddyRows(now time.Time) []workbuddyRow {
 		return rows[i].Model < rows[j].Model
 	})
 	return rows
+}
+
+// workbuddyFirstCalls finds each row's earliest call in this window:
+// after the thaw time if available/frozen, otherwise today's earliest call.
+func workbuddyFirstCalls(rows []workbuddyRow, now time.Time) {
+	y, m, d := now.Date()
+	todayStart := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+
+	earliest := make(map[string]time.Time, len(rows))
+	floor := todayStart
+	for _, r := range rows {
+		key := wbRowKey(r.User, r.Model)
+		if r.StartsAt != nil && r.StartsAt.Before(now) {
+			earliest[key] = *r.StartsAt
+			if r.StartsAt.Before(floor) {
+				floor = *r.StartsAt
+			}
+		} else {
+			earliest[key] = todayStart
+		}
+	}
+
+	firstFound := make(map[string]time.Time, len(rows))
+	for _, rec := range usage.Load(floor) {
+		if rec.ProviderAccount == "" || rec.Time.Before(floor) {
+			continue
+		}
+		key := wbRowKey(rec.ProviderAccount, rec.Model)
+		bound, ok := earliest[key]
+		if !ok || rec.Time.Before(bound) {
+			continue
+		}
+		if cur, seen := firstFound[key]; !seen || rec.Time.Before(cur) {
+			firstFound[key] = rec.Time
+		}
+	}
+
+	for i := range rows {
+		key := wbRowKey(rows[i].User, rows[i].Model)
+		if t, ok := firstFound[key]; ok {
+			rows[i].FirstCallAt = &t
+		} else if bound, ok := earliest[key]; ok {
+			rows[i].FirstCallAt = &bound
+		}
+	}
 }
 
 // workbuddySpent fills each row's Spent, Calls and Probed from the usage

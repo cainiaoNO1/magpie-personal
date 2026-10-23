@@ -42,6 +42,8 @@
 .cu-said { flex: 0 0 auto; max-width: 52%; text-align: right; }
 .cu-why { margin-top: 3px; font-size: 10px; line-height: 1.45; color: var(--muted); word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
+.cu-reset.cu-firstcall { margin-top: 4px; margin-bottom: 2px; }
+
 /* the calls of the account picked, in its window: a table, since the
    columns are what is read down */
 .cu-calls { margin-top: 6px; display: flex; flex-direction: column; }

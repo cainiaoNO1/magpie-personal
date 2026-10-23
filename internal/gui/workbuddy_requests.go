@@ -123,14 +123,16 @@ func workbuddyOurs(r usage.Record, user, model string) bool {
 	return model == "" || r.Model == model
 }
 
-// workbuddyWindow is where an account and model's card says its window
-// began: the reset WorkBuddy named, less the 24 hours a window is, or,
-// for one still answering, the reset that came. A row naming neither is
-// read from the start of today.
+// workbuddyWindow is where an account and model's calls start:
+// its first call time in this window (FirstCallAt), or startsAt if known,
+// falling back to today's start.
 func workbuddyWindow(user, model string, now time.Time) (time.Time, string) {
 	for _, r := range workbuddyRows(now) {
 		if r.User != user || (model != "" && r.Model != model) {
 			continue
+		}
+		if r.FirstCallAt != nil && !r.FirstCallAt.After(now) {
+			return *r.FirstCallAt, "window"
 		}
 		if r.StartsAt != nil && !r.StartsAt.After(now) {
 			return *r.StartsAt, "window"

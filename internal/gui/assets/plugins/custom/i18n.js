@@ -13,6 +13,7 @@ magpie.strings({
     "Minutes between requests, 0 for the setting's own": "请求间隔（分钟），填 0 表示跟随上面的设置",
     "{user}: {n} requests": "{user}：{n} 条请求",
     "Show every account": "显示全部账号",
+    "First called {when}": "首次调用于 {when}",
     "No requests yet. The first one goes when an account's window starts over, or at its interval.": "还没有请求记录。第一条会在账号窗口解冻时，或按间隔发出。",
     "after a window ran out": "解冻后",
     "All requests": "全部请求",
