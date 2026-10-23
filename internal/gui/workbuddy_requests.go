@@ -127,6 +127,8 @@ func workbuddyOurs(r usage.Record, user, model string) bool {
 // its first call time in this window (FirstCallAt), or startsAt if known,
 // falling back to today's start.
 func workbuddyWindow(user, model string, now time.Time) (time.Time, string) {
+	y, m, d := now.Date()
+	todayStart := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
 	for _, r := range workbuddyRows(now) {
 		if r.User != user || (model != "" && r.Model != model) {
 			continue
@@ -137,9 +139,9 @@ func workbuddyWindow(user, model string, now time.Time) (time.Time, string) {
 		if r.StartsAt != nil && !r.StartsAt.After(now) {
 			return *r.StartsAt, "window"
 		}
+		return todayStart, "today"
 	}
-	y, m, d := now.Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()), "today"
+	return todayStart, "today"
 }
 
 // workbuddyRequestRoutes is the Custom page's view of one account's calls.

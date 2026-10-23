@@ -82,14 +82,16 @@ func workbuddyRows(now time.Time) []workbuddyRow {
 				row.StartsAt = &start
 			}
 		}
-		if w.Healthy && !w.Until.IsZero() {
-			// a window still answering began when the account did
-			start := w.Until
-			row.StartsAt = &start
-		}
 		rows = append(rows, row)
 	}
 	workbuddyFirstCalls(rows, now)
+	// For healthy accounts, window and spending start from FirstCallAt (earliest call of today/after thaw)
+	for i := range rows {
+		if rows[i].Healthy && rows[i].FirstCallAt != nil {
+			start := *rows[i].FirstCallAt
+			rows[i].StartsAt = &start
+		}
+	}
 	workbuddySpent(rows, now)
 	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].User != rows[j].User {
@@ -139,8 +141,6 @@ func workbuddyFirstCalls(rows []workbuddyRow, now time.Time) {
 		key := wbRowKey(rows[i].User, rows[i].Model)
 		if t, ok := firstFound[key]; ok {
 			rows[i].FirstCallAt = &t
-		} else if bound, ok := earliest[key]; ok {
-			rows[i].FirstCallAt = &bound
 		}
 	}
 }

@@ -1481,10 +1481,11 @@ function renderLedger() {
   const l = ledger;
   const callers = l.callerKeys || [];
   const providers = l.providers || [];
+  const isEmbed = params.get("embed") === "1";
   const missingAgent = ledAgent && !l.agents.some((a) => a.id === ledAgent);
   const missingProvider = ledProvider && !providers.some((p) => p.id === ledProvider);
   const accounts = l.accounts || [];
-  const missingAccount = ledAccount && !accounts.some((a) => a.id === ledAccount);
+  const missingAccount = !isEmbed && ledAccount && !accounts.some((a) => a.id === ledAccount);
   // "none": the calls no gateway key made, a choice beside the keys when
   // there are such calls, so one key's are told from the rest (#2521)
   const noKey = callers.length > 0 && (ledCallerKey === "none" || (l.by?.callerKey || []).some((s) => s.id === "none"));
