@@ -229,11 +229,10 @@ magpie.plugin("custom", (ctx) => {
     return row;
   }
 
-  // records is the list under the cards: no account picked shows every
-  // probe; one picked shows that account's own calls in its window, the
-  // watching's apart from the account's use.
+  // records is the view under the cards: always show the usage requests view
+  // (when an account is picked, filtered to that account; when none, showing all)
   function records() {
-    return picked ? callList() : probeList();
+    return callList();
   }
 
   // probeList is every probe kept, newest first.
@@ -285,35 +284,37 @@ magpie.plugin("custom", (ctx) => {
   // probes apart from the account's use.
   function callList() {
     const box = el("div", "cu-records");
-    const head = el("div", "row-head");
-    head.append(el("span", "label", picked.split("@")[0]));
-    if (calls) {
-      head.append(el("span", "note", t("{from} to now", { from: new Date(calls.from).toLocaleString(intlLang()) })));
-    }
-    head.append(el("span", "grow"));
-    for (const [k, name] of [["", t("All requests")], ["use", t("Use")], ["probe", t("Scheduled")]]) {
-      const b = el("button", "opt" + (kind === k ? " on" : ""), name);
-      b.type = "button";
+    if (picked) {
+      const head = el("div", "row-head");
+      head.append(el("span", "label", picked.split("@")[0]));
       if (calls) {
-        const n = k === "probe" ? calls.probe : k === "use" ? calls.use : calls.probe + calls.use;
-        b.append(el("span", "cu-n", String(n)));
+        head.append(el("span", "note", t("{from} to now", { from: new Date(calls.from).toLocaleString(intlLang()) })));
       }
-      b.onclick = (ev) => { ev.stopPropagation(); kind = k; readCalls().then(draw); };
-      head.append(b);
+      head.append(el("span", "grow"));
+      for (const [k, name] of [["", t("All requests")], ["use", t("Use")], ["probe", t("Scheduled")]]) {
+        const b = el("button", "opt" + (kind === k ? " on" : ""), name);
+        b.type = "button";
+        if (calls) {
+          const n = k === "probe" ? calls.probe : k === "use" ? calls.use : calls.probe + calls.use;
+          b.append(el("span", "cu-n", String(n)));
+        }
+        b.onclick = (ev) => { ev.stopPropagation(); kind = k; readCalls().then(draw); };
+        head.append(b);
+      }
+      const clear = el("button", "text", t("Show every account"));
+      clear.type = "button";
+      clear.onclick = (ev) => { ev.stopPropagation(); picked = ""; calls = null; kind = ""; draw(); };
+      head.append(clear);
+      box.append(head);
     }
-    const clear = el("button", "text", t("Show every account"));
-    clear.type = "button";
-    clear.onclick = (ev) => { ev.stopPropagation(); picked = ""; calls = null; kind = ""; draw(); };
-    head.append(clear);
-    box.append(head);
 
-    if (!calls) {
+    if (picked && !calls) {
       box.append(el("p", "usage-note", t("Reading…")));
       return box;
     }
     // the Usage page's own Requests tab, embedded: the same code draws it,
     // so the figures, the trend, the heatmap and the list are what that
-    // page shows, narrowed to this account and its window
+    // page shows, narrowed to this account and its window (or all accounts when none picked)
     box.append(usageFrame(calls));
     return box;
   }
@@ -323,12 +324,28 @@ magpie.plugin("custom", (ctx) => {
   // (usage/page.js).
   function usageFrame(c) {
     const wrap = el("div", "cu-frame");
-    const q = new URLSearchParams({ view: "usage", tab: "requests", account: picked, embed: "1" });
-    if (c.period) q.set("period", c.period);
+    const params = { view: "usage", tab: "requests", embed: "1" };
+    if (picked) params.account = picked;
+    const q = new URLSearchParams(params);
+    if (c && c.period) q.set("period", c.period);
     const f = el("iframe", "cu-iframe");
     f.src = "/?" + q.toString();
     f.loading = "lazy";
     f.title = t("Requests");
+    f.scrolling = "no";
+    const fit = () => {
+      try {
+        const doc = f.contentDocument || f.contentWindow?.document;
+        if (!doc) return;
+        const h = Math.max(doc.body?.scrollHeight || 0, doc.documentElement?.scrollHeight || 0);
+        if (h > 100) f.style.height = (h + 30) + "px";
+      } catch {}
+    };
+    f.onload = () => {
+      fit();
+      setTimeout(fit, 800);
+      setTimeout(fit, 2500);
+    };
     wrap.append(f);
     return wrap;
   }

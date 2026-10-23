@@ -4376,7 +4376,7 @@ body .row.agent .ag-prefs .row.pref .who { display: block; }
 #view-settings:not(.set-searching) #agentPrefLinks { display: none; }
 
 /* a page in another page's frame (the Custom page's account view): no
-   sidebar, no header, no page padding of its own */
+   sidebar, no header, no page padding of its own, no internal scrollbar */
 body.embedded :is(#side, #sideEdge, .top) { display: none !important; }
-body.embedded .view { padding: 0; margin: 0; }
-body.embedded { overflow-x: hidden; }
+body.embedded .view { padding: 0; margin: 0; overflow-y: hidden !important; }
+body.embedded { overflow: hidden !important; height: auto !important; min-height: 0 !important; }
