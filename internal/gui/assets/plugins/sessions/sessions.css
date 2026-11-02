@@ -12,6 +12,7 @@
 .sm-agent-pick .ic { width: 13px; height: 13px; flex: none; }
 .sm-agent-pick em, .sm-agents em, .sm-trash-btn em { font-style: normal; font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .pop.proto-menu.sm-agent-menu { width: min(280px, calc(100vw - 16px)); max-height: min(360px, 70vh); overflow-y: auto; background: var(--card); }
+.sm-agent-menu .pm-item { align-items: center; }
 .sm-agent-menu .pm-words { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: 1; }
 .sm-agent-menu .pm-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sm-agent-menu .pm-note { flex: none; font-variant-numeric: tabular-nums; }
@@ -29,15 +30,34 @@
 .sm-bar .sm-delete:disabled { opacity: .45; }
 .sm-count { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .sm-check { flex: none; margin: 0; width: 14px; height: 14px; accent-color: var(--accent); }
-.sm-tree { display: flex; flex-direction: column; gap: 8px; }
+.sm-tree { display: flex; flex-direction: column; gap: 8px; container: sm-tree / inline-size; }
 .sm-group .skeleton.sk-line { width: 60%; height: 12px; }
-.row.sm-folder { min-height: 34px; gap: 8px; }
-.row.sm-folder .fold { color: var(--fg-2); font-weight: 500; flex: none; max-width: 45%; }
-.row.sm-folder .fold .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row.sm-folder .sm-path { flex: 0 1 auto; min-width: 0; margin: 0; font-family: var(--code-font, var(--code)); font-size: 10.5px; color: var(--faint); }
-:where(html[data-fonts]) .row.sm-folder .sm-path { font-style: var(--code-style, inherit); font-weight: var(--code-weight, inherit); font-stretch: var(--code-stretch, 100%); }
-.row.sm-folder .grow { flex: 1; }
-.row.sm-folder .note { flex: none; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.sm-select.on { background: var(--pill); color: var(--fg); }
+/* the folders are one list, parted by hairlines, never a card each; the
+   sessions of an open one go on in it, set in under its name */
+.sm-folders > .sm-group + .sm-group, .sm-folders > .sm-group + .sm-more-folders,
+.sm-others > .sm-group, .sm-others > .sm-more-folders { border-top: 1px solid var(--line-2); }
+.sm-group > .row.sm-folder + .sm-item { border-top: 1px solid var(--line-2); }
+.sm-tree .sm-more-folders { margin: 6px 11px; }
+.row.sm-folder, .row.sm-others-row { min-height: 44px; gap: 8px; }
+.row.sm-folder .fold, .row.sm-others-row .fold { flex: 1; min-width: 0; margin: 0 0 0 -4px; padding: 4px 6px 4px 4px; gap: 8px; text-align: left; color: var(--faint); }
+.row.sm-folder .fold:hover, .row.sm-others-row .fold:hover { background: none; }
+.row.sm-folder:hover, .row.sm-others-row:hover { background: color-mix(in srgb, var(--pill) 40%, transparent); }
+.sm-fwords { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
+.sm-fline { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.sm-fline .name, .sm-others-row .name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--fg); }
+.row.sm-folder .sm-path { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--faint); }
+.sm-latest { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
+.sm-when { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.sm-when .sm-ago { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.row.sm-folder .note, .row.sm-others-row .note { flex: none; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* what can be done to a whole folder waits under ⋯ until the row is pointed at */
+.sm-folder-more { flex: none; opacity: 0; transition: opacity .12s; }
+.row.sm-folder:hover .sm-folder-more, .row.sm-folder:focus-within .sm-folder-more, .sm-folder-more.open { opacity: 1; }
+@media (hover: none) { .sm-folder-more { opacity: 1; } }
+.sm-group .row.sm-sess { padding-left: 29px; }
+body.window .sm-group .row.sm-sess { padding-left: 32px; }
+.sm-others { margin-top: 4px; }
 .row.sm-sess { min-height: 44px; }
 .sm-item .sess-detail { padding-left: 34px; }
 .row.sess .sm-del:hover { color: var(--red); background: var(--red-soft); }
@@ -66,12 +86,28 @@
      scrolled and its scrollbar took 10px */
   .row.sess.sm-sess { gap: 8px; }
 }
+/* the list's own width, not the window's: beside the sidebar a 780px
+   window left a row's title "7" of its name, its tokens, cost, Resume and
+   Continue in taking the rest (cybercaius on Discord) */
+@container sm-tree (max-width: 700px) {
+  .row.sm-sess .num { display: none; }
+  .row.sm-sess .cost { min-width: 0; }
+  .row.sess.sm-sess { gap: 8px; }
+}
+/* narrower still, the title has the first line to itself and what is done
+   with the session goes under it, on the right */
+@container sm-tree (max-width: 600px) {
+  .row.sess.sm-sess { flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; padding-top: 7px; padding-bottom: 7px; }
+  .row.sm-sess > .who { flex-basis: 100%; }
+  .row.sm-sess:has(> .sm-check) > .who { flex-basis: calc(100% - 22px); }
+}
 @media (max-width: 420px) {
-  .sm-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; row-gap: 6px; }
+  .sm-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; row-gap: 6px; }
   .sm-switch { grid-column: 1 / -1; }
   .sm-agent-pick { max-width: 100%; }
-  .sm-filter { width: 100%; min-width: 0; }
-  .sm-trash-btn { grid-column: 2; justify-self: end; }
+  .sm-filter { grid-column: 1; grid-row: 2; width: 100%; min-width: 0; }
+  .sm-select { grid-column: 2; grid-row: 2; }
+  .sm-trash-btn { grid-column: 3; grid-row: 2; justify-self: end; }
 }
 /* Codex sessions made with another provider, hidden from Codex's history (#887) */
 .row.sm-provider { gap: 10px; min-height: 40px; padding: 8px 11px; height: auto; }
@@ -84,6 +120,9 @@
 .sm-provider-list li .name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sm-provider-list li .note { flex: none; font-size: 11px; color: var(--faint); }
 .sm-provider-list { max-height: min(300px, 45vh); overflow-y: auto; }
+.sm-provider-pick { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
+.sm-provider-pick .grow { flex: 1; }
+.sm-provider-pick .text { flex: none; font-size: 12px; }
 /* Recording gateway conversations (#1355): a setting card above the list,
    its switch, what it keeps and where, and a labelled delete */
 .list.row.sm-record { gap: 6px 12px; min-height: 48px; padding: 9px 11px 9px 13px; height: auto; flex-wrap: wrap; }
@@ -115,3 +154,16 @@ body.window .row.sm-sub-row { min-height: 42px; padding-left: calc(14px + var(--
 @media (max-width: 560px) {
   .sm-subs { --sub-step: 10px; padding-left: calc(12px + var(--sub-depth, 0) * var(--sub-step)); padding-right: 8px; }
 }
+
+/* the consent (RustCats on X): which agents' sessions may be read, asked
+   before any is; a plain grouped list of switches, as System Settings */
+.sm-consent { display: flex; flex-direction: column; gap: 10px; max-width: 560px; margin: 8px auto 16px; padding: 18px 18px 16px; border-radius: 12px; background: var(--card, var(--bg)); box-shadow: 0 0 0 0.5px var(--line); }
+.sm-consent-title { font-size: 14px; font-weight: 600; color: var(--fg); }
+.sm-consent-sub, .sm-consent-none { margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.sm-consent-list { margin: 2px 0 0; }
+.sm-consent-row { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 6px 12px; cursor: pointer; }
+.sm-consent-row > svg, .sm-consent-row > img { flex: none; width: 16px; height: 16px; }
+.sm-consent-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--fg); }
+.sm-consent-row .lib-switch { flex: none; cursor: pointer; padding: 0; border: 0; }
+.sm-consent-row .lib-switch:disabled { opacity: .5; cursor: default; }
+.sm-consent-acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 4px; }

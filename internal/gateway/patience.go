@@ -27,8 +27,17 @@ const didNotStream = "did not stream"
 // alone, as the last one left of a plain provider is (passing), while
 // another member is busy too. A streaming agent is kept alive with SSE
 // comments through the pause, as through a held stream. A plain provider,
-// which the agent picked as itself, keeps the retries passing gives the
-// last one left.
+// which the agent picked as itself, is kept the same way once the retries
+// passing gives the last one left are spent, its accounts its members,
+// for its own Patience, unset singlePatience.
+
+// singlePatience is how long a request to one provider, not a group, is
+// kept once it has failed in a way that passes and the same-one retries
+// (passing) are spent: as long as a group that sets no Patience waits
+// (zoecats on Discord), unless the provider sets its own Patience (magpie
+// provider set <id> patience=), which wins. A group's, set or not, is the
+// group's.
+var singlePatience = provider.PatienceDefault * time.Second
 
 // replanRounds is how many times the members are asked again, at most:
 // a backstop that never comes before the patience does. The pauses alone
@@ -51,17 +60,17 @@ type busyTry struct {
 
 // busy says whether a failure is one a member may be over in a moment:
 // overloaded, unavailable, timed out, or a rate limit that isn't the
-// plan's or the money's. A proxy that refused the connection, a quota used
-// up, response protection's 502, or an upstream that answered a stream
-// request with a whole reply (didNotStream) isn't: each fails the same
-// however often it is asked.
+// plan's or the money's, nor an account's token wall (walled). A proxy
+// that refused the connection, a quota used up, response protection's
+// 502, or an upstream that answered a stream request with a whole reply
+// (didNotStream) isn't: each fails the same however often it is asked.
 func busy(status int, body []byte) bool {
 	switch status {
 	case 408, 500, 502, 503, 504, 529:
 		return failure(status, body) == failOther && !protectionRefused(status, body) &&
 			!bytes.Contains(body, []byte(didNotStream))
 	case 429:
-		return failure(status, body) == failRate && !creditWords.Match(wordsOf(body))
+		return failure(status, body) == failRate && !creditWords.Match(wordsOf(body)) && !walled(body)
 	}
 	return false
 }
@@ -113,6 +122,20 @@ func replan(list []busyTry, round int, waitFrom time.Time, fallback time.Duratio
 	}
 	now := time.Now()
 	wait := min(retryPause<<(round+1), replanLongest())
+	// a vendor's time is read in whole seconds: one back within a second
+	// past a member's budget is asked as the budget ends, not given up on
+	// (zoecats on Discord: "will reset in 1 minutes" against the minute a
+	// lone provider waits by default, which the moment between the
+	// failure and its note put a hair past)
+	list = slices.Clone(list)
+	for i, b := range list {
+		if budget := waitsOf(b.c.patience, fallback); budget > 0 {
+			end := waitFrom.Add(budget)
+			if b.ready.After(end) && !b.ready.After(end.Add(time.Second)) {
+				list[i].ready = end
+			}
+		}
+	}
 	soonest := list[0].ready
 	for _, b := range list[1:] {
 		soonest = minTime(soonest, b.ready)
@@ -125,7 +148,7 @@ func replan(list []busyTry, round int, waitFrom time.Time, fallback time.Duratio
 		if budget <= 0 {
 			continue
 		}
-		if !at.Before(waitFrom.Add(budget)) {
+		if at.After(waitFrom.Add(budget)) {
 			continue // this member's budget is spent
 		}
 		alive = append(alive, b)

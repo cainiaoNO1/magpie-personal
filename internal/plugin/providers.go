@@ -91,6 +91,20 @@ type Model struct {
 	// OpenCode's order: not image alone (#1595)
 	Inputs  []string `json:"inputs,omitempty"`
 	Outputs []string `json:"outputs,omitempty"`
+	// OutputsSaid is whether capabilities.output said yes or no to any
+	// kind: an embedding's {"text": false} gives no Outputs and is still
+	// said (#3279), where a model said nothing of gives none and isn't
+	OutputsSaid bool `json:"outputsSaid,omitempty"`
+	// Temperature is whether the model takes temperature and top_p, where
+	// something said so: the config model's temperature (Factory's OpenAI
+	// route, plugins#154), models.dev's own, or the models hook's. Unsaid
+	// is nil, which keeps what the client sent.
+	Temperature *bool `json:"temperature,omitempty"`
+	// InputsSaid is whether capabilities.input is someone's word on what
+	// the model takes (models.dev, the config, the plugin's own models
+	// hook): the host's default for a config model said nothing of, input
+	// {"text": true} alone, is nobody's word (#1595, #4436)
+	InputsSaid bool `json:"inputsSaid,omitempty"`
 	// Fast is set by the plugin on a model it runs in its vendor's fast
 	// mode when the request says service_tier "priority" (m.fast: Cursor's
 	// plugin from 0.2.2, for a model Cursor has a fast variant of)
@@ -161,12 +175,18 @@ type Provider struct {
 	// magpie.maxConcurrency); 0 for none said. The user's setting on the
 	// provider goes over it.
 	MaxConcurrency int `json:"maxConcurrency,omitempty"`
+	// MaxAccounts is how many of its accounts the plugin says may take
+	// requests at the same time (the auth hook's maxAccounts, else
+	// package.json's magpie.maxAccounts: a vendor that blocks an address
+	// asking for more accounts at once); 0 for none said. The user's
+	// setting on the provider goes over it.
+	MaxAccounts int `json:"maxAccounts,omitempty"`
 }
 
 // Option is a switch a plugin declares for its provider (auth.options,
 // #2038): magpie shows it, keeps the user's value in settings'
-// PluginOptions and hands it to the plugin (input.magpie.option). Nothing
-// runs when it changes.
+// PluginOptions and hands it to the plugin (input.magpie.option). A change
+// has the providers listed again (SetProviderOptions); nothing else runs.
 type Option struct {
 	Key         string `json:"key"`
 	Label       string `json:"label"`
@@ -175,6 +195,16 @@ type Option struct {
 	// Confirm is asked before the switch is turned on, when the plugin
 	// says turning it on does something the user should agree to
 	Confirm string `json:"confirm,omitempty"`
+	// Labels, Descriptions and Confirms are the same words in the window's
+	// other languages, by its language ("zh", "zh-TW", "ja", "de"), as a
+	// page's Titles are (plugins#590); the plain ones are the fallback
+	Labels       map[string]string `json:"labels,omitempty"`
+	Descriptions map[string]string `json:"descriptions,omitempty"`
+	Confirms     map[string]string `json:"confirms,omitempty"`
+	// FiltersModels says the plugin's model list leaves models out while
+	// the switch is on (WorkBuddy's "Free models only"): the editor says
+	// so by the models
+	FiltersModels bool `json:"filtersModels,omitempty"`
 }
 
 // OptionOn is option o of a provider as it stands with the user's values
@@ -187,12 +217,18 @@ func OptionOn(chosen map[string]map[string]bool, provider string, o Option) bool
 }
 
 // SetProviderOptions hands the user's option values (settings' PluginOptions) to
-// the host running now; a host started later reads them at its start.
+// the host running now; a host started later reads them at its start. The
+// providers kept are asked again after: a models hook may list by an
+// option (WorkBuddy's "Free models only", plugins#430), and the list
+// follows the switch without a restart.
 func SetProviderOptions(ctx context.Context) error {
 	if !Running() {
+		forgetProviders()
 		return nil
 	}
-	return Call(ctx, "setProviderOptions", map[string]any{"options": settings.Load().PluginOptions}, nil)
+	err := Call(ctx, "setProviderOptions", map[string]any{"options": settings.Load().PluginOptions}, nil)
+	forgetProviders()
+	return err
 }
 
 // Account is one account a provider is signed in to: Key is where
@@ -1072,7 +1108,7 @@ type UsageResets struct {
 
 type UsageWindow struct {
 	Name      string   `json:"name"`
-	Used      float64  `json:"used"`     // percent
+	Used      *float64 `json:"used"`     // percent; nil when the plugin didn't say
 	ResetsAt  string   `json:"resetsAt"` // RFC 3339
 	ResetSecs int64    `json:"resetSecs"`
 	Display   string   `json:"display"`
@@ -1089,16 +1125,22 @@ type UsageWindow struct {
 	// apart from the window's reset (WorkBuddy's packages)
 	RunsOutAt string  `json:"runsOutAt"`
 	RunsOut   float64 `json:"runsOut"`
+	// Balance is how much is left in Unit, a prepaid wallet's reading,
+	// with no share to tell (#3950); nil when the plugin didn't say.
+	Balance *float64 `json:"balance"`
 }
 
 // Checkin is what came of an account's daily check-in, as the plugin's
 // auth.checkin said: Outcome is one of claimed, done, ineligible,
-// inactive, captcha and failed.
+// inactive, captcha and failed. Until (RFC 3339, "" when not told) is when
+// the vendor's own day turns and the answer stops holding: Qoder's daily
+// credits open at 10:00 UTC+8, not at Beijing midnight.
 type Checkin struct {
 	Outcome string  `json:"outcome"`
 	Credit  float64 `json:"credit"`
 	Streak  int     `json:"streak"`
 	Message string  `json:"message"`
+	Until   string  `json:"until"`
 }
 
 // AccountCheckin asks the plugin to check account of provider in for the

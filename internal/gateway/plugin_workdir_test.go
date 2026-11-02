@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -53,8 +54,14 @@ func TestPluginToldWhereTheAgentWorks(t *testing.T) {
 		out, _ := json.Marshal(b)
 		return string(out)
 	}
+	// a repository as git init lays one out, what git looks for in it
 	repo := filepath.Join(t.TempDir(), "My Repo 中文")
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+	for _, d := range []string{"objects", "refs/heads"} {
+		if err := os.MkdirAll(filepath.Join(repo, ".git", d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	inRepo := filepath.Join(repo, "sub")
@@ -62,6 +69,14 @@ func TestPluginToldWhereTheAgentWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := t.TempDir()
+	// under an empty .git, which git passes over (#3675)
+	underEmpty := filepath.Join(t.TempDir(), "sub")
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(underEmpty), ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(underEmpty, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	piAsks := func(dir string) string {
 		b, _ := json.Marshal(map[string]any{"model": pid + "/fake-1", "messages": []map[string]any{
 			{"role": "system", "content": "You are pi.\n<cwd>\n" + filepath.ToSlash(dir) + "\n</cwd>"},
@@ -83,34 +98,53 @@ func TestPluginToldWhereTheAgentWorks(t *testing.T) {
 		// a folder here: looked at on disk, the repository above it too
 		{"in a repository", "/v1/chat/completions", piAsks(inRepo), filepath.ToSlash(inRepo), "yes"},
 		{"not in one", "/v1/chat/completions", piAsks(plain), filepath.ToSlash(plain), "no"},
+		{"not in one, under an empty .git", "/v1/chat/completions", piAsks(underEmpty), filepath.ToSlash(underEmpty), "no"},
 		{"no folder said", "/v1/chat/completions", `{"model":"` + pid + `/fake-1","messages":[{"role":"user","content":"hi"}]}`, "", ""},
 	} {
 		mu.Lock()
 		got = nil
 		mu.Unlock()
-		postProto(t, New(), tc.path, tc.body)
+		rt := postProto(t, New(), tc.path, tc.body)
 		mu.Lock()
-		if len(got) != 1 {
-			mu.Unlock()
-			t.Fatalf("%s: the vendor got %d requests", tc.name, len(got))
-		}
-		h := got[0]
+		sent := slices.Clone(got)
 		mu.Unlock()
-		for _, k := range []string{"X-Magpie-Work-Dir", "X-Magpie-Work-Git"} {
-			if v := h.Values(k); len(v) > 0 {
-				t.Errorf("%s: the vendor got %s: %q", tc.name, k, v)
+		// the requests this case is about are its tries: one, or more when
+		// a try failed and the lone account was asked again after a moment
+		// (TestLastOneLeftIsTriedAgain), each told the same. A request with
+		// no try of its own would be a duplicate, and fails (#3347)
+		for _, x := range rt.Tries[:max(len(rt.Tries)-1, 0)] {
+			if x.Status == http.StatusOK {
+				t.Fatalf("%s: a try that answered was tried again: %+v", tc.name, rt.Tries)
 			}
+			t.Logf("%s: tried again after %d %s", tc.name, x.Status, x.Error)
 		}
-		dir := h.Get("X-Saw-Work-Dir")
-		if dir != "" {
-			d, err := url.PathUnescape(dir)
-			if err != nil {
-				t.Fatalf("%s: %q isn't percent-encoded: %v", tc.name, dir, err)
-			}
-			dir = d
+		if len(sent) == 0 || len(sent) > len(rt.Tries) {
+			t.Fatalf("%s: the vendor got %d requests in %d tries: %+v", tc.name, len(sent), len(rt.Tries), rt.Tries)
 		}
-		if dir != tc.dir || h.Get("X-Saw-Work-Git") != tc.git {
-			t.Errorf("%s: the plugin was told %q, git %q; want %q, %q", tc.name, dir, h.Get("X-Saw-Work-Git"), tc.dir, tc.git)
+		for _, h := range sent {
+			sawWorkPlace(t, tc.name, h, tc.dir, tc.git)
 		}
+	}
+}
+
+// sawWorkPlace checks what one request told the plugin (X-Saw-Work-*, as
+// the fake plugin echoes it) and that none of it reached the vendor.
+func sawWorkPlace(t *testing.T, name string, h http.Header, wantDir, wantGit string) {
+	t.Helper()
+	for _, k := range []string{"X-Magpie-Work-Dir", "X-Magpie-Work-Git"} {
+		if v := h.Values(k); len(v) > 0 {
+			t.Errorf("%s: the vendor got %s: %q", name, k, v)
+		}
+	}
+	dir := h.Get("X-Saw-Work-Dir")
+	if dir != "" {
+		d, err := url.PathUnescape(dir)
+		if err != nil {
+			t.Fatalf("%s: %q isn't percent-encoded: %v", name, dir, err)
+		}
+		dir = d
+	}
+	if dir != wantDir || h.Get("X-Saw-Work-Git") != wantGit {
+		t.Errorf("%s: the plugin was told %q, git %q; want %q, %q", name, dir, h.Get("X-Saw-Work-Git"), wantDir, wantGit)
 	}
 }

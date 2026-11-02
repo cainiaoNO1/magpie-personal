@@ -10,12 +10,15 @@ import (
 	"hash/maphash"
 	"reflect"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/tidwall/gjson"
 )
 
 // decodeJSON is json.Unmarshal(data, dst), made for a request body: one
@@ -38,7 +41,17 @@ import (
 // error, and what it leaves in dst, are encoding/json's own. So does a dst
 // that already holds something, which encoding/json decodes into in ways
 // of its own (a slice's old elements are decoded over, not replaced).
-func decodeJSON(data []byte, dst any) error {
+func decodeJSON(data []byte, dst any) error { return decodeJSONIn(data, dst, false) }
+
+// decodeJSONView is decodeJSON for a reader that keeps nothing it decodes
+// past its return and writes none of it: every raw value shares data's
+// bytes, capped, where decodeJSON copies what isn't a big share of a held
+// body. A body a route has rewritten is held by nobody, so each reader of
+// a rewritten Codex request copied its whole input to look at it: 1.4 of
+// the 16.4 MB a 680 KB request allocated (#3383).
+func decodeJSONView(data []byte, dst any) error { return decodeJSONIn(data, dst, true) }
+
+func decodeJSONIn(data []byte, dst any, share bool) error {
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Pointer || v.IsNil() || !v.Elem().IsZero() {
 		return json.Unmarshal(data, dst)
@@ -60,7 +73,7 @@ func decodeJSON(data []byte, dst any) error {
 		// of the value's opening and its close.
 		return json.Unmarshal(append(data[:start+1:start+1], close), dst)
 	}
-	if err := fillJSONIn(trimJSON(data), v.Elem(), members); err != nil {
+	if err := fillJSONIn(trimJSON(data), v.Elem(), members, share); err != nil {
 		v.Elem().SetZero()
 		return json.Unmarshal(data, dst)
 	}
@@ -82,6 +95,16 @@ var heldBodies struct {
 	list atomic.Pointer[[][]byte]
 	// facts: a held body's bodyFacts, by the body's first byte (factsOf)
 	facts map[*byte]heldFacts
+	// long: what longBody found of a held body, by its first byte
+	long map[*byte]heldLong
+}
+
+// heldLong is what longBody found of a held body: valid or not, and its
+// top level's members.
+type heldLong struct {
+	n       int
+	valid   bool
+	members []memberSpan
 }
 
 // heldBodiesMost bounds heldBodies: a body past it is decoded with copies, as
@@ -108,9 +131,9 @@ func holdBody(ctx context.Context, body []byte) {
 	if old != nil {
 		cur = *old
 	}
-	if len(cur) >= heldBodiesMost {
+	if len(cur) >= heldBodiesMost || slices.ContainsFunc(cur, func(b []byte) bool { return unsafe.SliceData(b) == unsafe.SliceData(body) }) {
 		heldBodies.Unlock()
-		return
+		return // held already: one release ends it
 	}
 	next := append(slices.Clip(cur), body)
 	heldBodies.list.Store(&next)
@@ -131,6 +154,7 @@ func holdBody(ctx context.Context, body []byte) {
 			return
 		}
 		delete(heldBodies.facts, unsafe.SliceData(body))
+		delete(heldBodies.long, unsafe.SliceData(body))
 		next := slices.Delete(slices.Clone(cur), i, i+1)
 		heldBodies.list.Store(&next)
 	})
@@ -279,14 +303,15 @@ func (f *fastFields) field(key []byte) int {
 
 // fillJSON decodes raw, a whole valid JSON value, into v; errSlowJSON or
 // another error leaves it to encoding/json.
-func fillJSON(raw []byte, v reflect.Value) error { return fillJSONIn(raw, v, nil) }
+func fillJSON(raw []byte, v reflect.Value, share bool) error { return fillJSONIn(raw, v, nil, share) }
 
 // fillJSONIn is fillJSON with where raw's members are, when known
-// (longBody): a struct or map at raw's top is filled from them.
-func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan) error {
+// (longBody): a struct or map at raw's top is filled from them. share
+// is decodeJSONView's: every raw value is raw's own bytes.
+func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan, share bool) error {
 	t := v.Type()
 	if t == rawMessageType {
-		if inHeldBody(raw) {
+		if share || inHeldBody(raw) {
 			// the request's own body, which nothing writes to: shared,
 			// and capped so an append to it can't write over the body
 			v.SetBytes(raw[:len(raw):len(raw)])
@@ -312,7 +337,7 @@ func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan) error {
 		if v.IsNil() {
 			v.Set(reflect.New(t.Elem()))
 		}
-		return fillJSONIn(raw, v.Elem(), members)
+		return fillJSONIn(raw, v.Elem(), members, share)
 	case reflect.String:
 		if null {
 			return nil
@@ -348,27 +373,36 @@ func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan) error {
 		if f.err != nil {
 			return f.err
 		}
-		var seen []bool
+		// seen is a bit a field, in few or in many when a struct has more
+		// than 64: a []bool made for each struct decoded was one of a
+		// request's commonest allocations
+		var few uint64
+		var many []bool
 		var err error
 		eachMemberIn(raw, members, func(key, val []byte) bool {
-			name, ok := unquoteJSON(key)
+			name, ok := keyName(key)
 			if !ok {
 				err = errSlowJSON
 				return false
 			}
-			i := f.field([]byte(name))
+			i := f.field(name)
 			if i < 0 {
 				return true
 			}
-			if seen == nil {
-				seen = make([]bool, len(f.names))
+			twice := false
+			if len(f.names) <= 64 {
+				twice, few = few&(1<<i) != 0, few|1<<i
+			} else {
+				if many == nil {
+					many = make([]bool, len(f.names))
+				}
+				twice, many[i] = many[i], true
 			}
-			if seen[i] {
+			if twice {
 				err = errSlowJSON // a key twice: encoding/json merges them
 				return false
 			}
-			seen[i] = true
-			err = fillJSON(val, v.Field(f.index[i]))
+			err = fillJSON(val, v.Field(f.index[i]), share)
 			return err == nil
 		})
 		return err
@@ -390,7 +424,7 @@ func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan) error {
 		})
 		s := reflect.MakeSlice(t, len(elems), len(elems))
 		for i, el := range elems {
-			if err := fillJSON(el, s.Index(i)); err != nil {
+			if err := fillJSON(el, s.Index(i), share); err != nil {
 				return err
 			}
 		}
@@ -418,7 +452,7 @@ func fillJSONIn(raw []byte, v reflect.Value, members []memberSpan) error {
 				return false
 			}
 			el := reflect.New(t.Elem()).Elem()
-			if err = fillJSON(val, el); err != nil {
+			if err = fillJSON(val, el, share); err != nil {
 				return false
 			}
 			v.SetMapIndex(reflect.ValueOf(name), el)
@@ -556,6 +590,26 @@ func elementsOf(raw []byte) []json.RawMessage {
 	return out
 }
 
+// inputList is a request's input list, raw from a decoded body (so valid
+// JSON), for a reader that looks at its items and keeps none past its
+// return: elementsOf, so no item is copied. Decoding it as a
+// []json.RawMessage copied every item, since each is under a sixteenth of
+// the body (heldShareMost): 3.7 of the 20 MB a 680 KB Codex request
+// allocated went to such copies (#3383). ok is what that decode's error
+// was: false when the input is missing or neither a list nor null.
+func inputList(raw json.RawMessage) ([]json.RawMessage, bool) {
+	raw = trimJSON(raw)
+	switch {
+	case len(raw) == 0:
+		return nil, false
+	case raw[0] == '[':
+		return elementsOf(raw), true
+	case string(raw) == "null":
+		return nil, true
+	}
+	return nil, false
+}
+
 // skipJSONString is the end of the valid JSON string at i.
 func skipJSONString(data []byte, i int) int {
 	i++
@@ -608,6 +662,23 @@ func skipJSONValue(data []byte, i int) int {
 		i++
 	}
 	return i
+}
+
+// keyName is a member's key as unquoteJSON reads it, without making a
+// string of it: a plain ASCII key, the kind nearly every key is, is the
+// bytes between its quotes.
+func keyName(key []byte) ([]byte, bool) {
+	if len(key) < 2 || key[0] != '"' || key[len(key)-1] != '"' {
+		return nil, false
+	}
+	k := key[1 : len(key)-1]
+	for _, c := range k {
+		if c == '\\' || c == '"' || c < ' ' || c >= utf8.RuneSelf {
+			name, ok := unquoteJSON(key)
+			return []byte(name), ok
+		}
+	}
+	return k, true
 }
 
 // unquoteJSON is the string a valid JSON string literal holds, as
@@ -695,7 +766,15 @@ func unquoteJSON(q []byte) (string, bool) {
 			b = utf8.AppendRune(b, rr)
 		}
 	}
-	return string(b), true
+	if cap(b)-len(b) > len(b)/4 {
+		// \u escapes came to much less than they were: a copy of its
+		// own size, so a string kept long holds no room it doesn't use
+		return string(b), true
+	}
+	// b is this string's own and nothing writes to it again: the string
+	// is b, not a second copy of a long text (a turn's text has escapes,
+	// its newlines at least, and was copied twice on every request)
+	return unsafe.String(unsafe.SliceData(b), len(b)), true
 }
 
 // hex4 is encoding/json's getu4: the rune of the \uXXXX at s, or -1.
@@ -765,7 +844,10 @@ var topSplit atomic.Pointer[func(data []byte)]
 // at its top level again by each of the dozen decodes it went through,
 // each a walk over every byte of the conversation.
 func longBody(data []byte) (valid bool, members []memberSpan) {
-	s := validSum{len(data), maphash.Bytes(validSeed, data)}
+	if e, held := heldLongOf(data); held {
+		return e.valid, e.members
+	}
+	s := validSum{len(data), validHash(data)}
 	validMemo.Lock()
 	i := slices.IndexFunc(validMemo.sums[:], func(e validEntry) bool { return e.validSum == s })
 	if i >= 0 && validMemo.sums[i].members != nil {
@@ -806,6 +888,64 @@ func longBody(data []byte) (valid bool, members []memberSpan) {
 
 var validSeed = maphash.MakeSeed()
 
+// validHash is data's sum in validMemo.
+func validHash(data []byte) uint64 {
+	if f := validHashed.Load(); f != nil {
+		(*f)(data)
+	}
+	return maphash.Bytes(validSeed, data)
+}
+
+// validHashed, when set (tests), is told of each body validHash sums.
+var validHashed atomic.Pointer[func(data []byte)]
+
+// heldLongOf is what longBody finds of data when data is a body being
+// served (holdBody), whole, and whether it is one. A held body is not
+// written while held, so it is known again by where it is, not by a hash
+// of all its bytes: each of the dozen decodes a request went through
+// summed its whole body, a twentieth of the gateway's CPU on long Codex
+// requests (#4371). What is found is kept until the body is released.
+func heldLongOf(data []byte) (heldLong, bool) {
+	key := unsafe.SliceData(data)
+	heldBodies.Lock()
+	e, ok := heldBodies.long[key]
+	heldBodies.Unlock()
+	if ok && e.n == len(data) {
+		return e, true
+	}
+	l := heldBodies.list.Load()
+	if l == nil || !slices.ContainsFunc(*l, func(b []byte) bool { return unsafe.SliceData(b) == key && len(b) == len(data) }) {
+		return heldLong{}, false
+	}
+	e = heldLong{n: len(data)}
+	if f := validScanned.Load(); f != nil {
+		(*f)(data)
+	}
+	if e.valid = jsonCheck(data); e.valid {
+		if raw := trimJSON(data); raw[0] == '{' {
+			if f := topSplit.Load(); f != nil {
+				(*f)(data)
+			}
+			e.members = []memberSpan{}
+			eachMemberAt(raw, func(k0, k1, v0, v1 int) bool {
+				e.members = append(e.members, memberSpan{k0, k1, v0, v1})
+				return true
+			})
+		}
+	}
+	heldBodies.Lock()
+	defer heldBodies.Unlock()
+	// only while body is held: one released may be freed, and its memory
+	// given to another body that would read as this one (factsOf)
+	if l := heldBodies.list.Load(); l != nil && slices.ContainsFunc(*l, func(b []byte) bool { return unsafe.SliceData(b) == key && len(b) == len(data) }) {
+		if heldBodies.long == nil {
+			heldBodies.long = map[*byte]heldLong{}
+		}
+		heldBodies.long[key] = e
+	}
+	return e, true
+}
+
 // validScanned, when set (tests), is told of each body of validMemoMin or
 // more that jsonValid checks byte by byte.
 var validScanned atomic.Pointer[func(data []byte)]
@@ -817,7 +957,10 @@ func jsonValid(data []byte) bool {
 	if len(data) < validMemoMin {
 		return jsonCheck(data)
 	}
-	s := validSum{len(data), maphash.Bytes(validSeed, data)}
+	if e, held := heldLongOf(data); held {
+		return e.valid
+	}
+	s := validSum{len(data), validHash(data)}
 	validMemo.Lock()
 	known := slices.ContainsFunc(validMemo.sums[:], func(e validEntry) bool { return e.validSum == s })
 	validMemo.Unlock()
@@ -1057,6 +1200,69 @@ func topMember(body []byte, key string) (val []byte, found, ok bool) {
 		return true
 	})
 	return val, found, true
+}
+
+// withoutTopMember is body without its top-level members named key (every
+// one, as a body may name a key twice), every other byte as it came, the
+// comma and spaces of a member taken out going with it. A body that isn't a
+// valid JSON object, or has no such member, is returned as it is: a body
+// that can't be read is not rewritten.
+func withoutTopMember(body []byte, key string) []byte {
+	var members []memberSpan
+	if len(body) >= validMemoMin {
+		var valid bool
+		if valid, members = longBody(body); !valid {
+			return body
+		}
+	} else if !jsonCheck(body) {
+		return body
+	}
+	start := skipJSONSpace(body, 0)
+	raw := trimJSON(body)
+	if raw[0] != '{' {
+		return body
+	}
+	if members == nil {
+		eachMemberAt(raw, func(k0, k1, v0, v1 int) bool {
+			members = append(members, memberSpan{k0, k1, v0, v1})
+			return true
+		})
+	}
+	// each run of members named key is cut from its first key to the next
+	// member's key, or, when it ends the object, from the end of the member
+	// before it (its comma with it) to the end of its last value
+	var cuts [][2]int
+	for i := 0; i < len(members); {
+		if !keyIs(raw[members[i].k0:members[i].k1], key) {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(members) && keyIs(raw[members[j].k0:members[j].k1], key) {
+			j++
+		}
+		switch {
+		case j < len(members):
+			cuts = append(cuts, [2]int{members[i].k0, members[j].k0})
+		case i > 0:
+			cuts = append(cuts, [2]int{members[i-1].v1, members[j-1].v1})
+		default:
+			cuts = append(cuts, [2]int{1, len(raw) - 1})
+		}
+		i = j
+	}
+	if len(cuts) == 0 {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	out = append(out, body[:start]...)
+	last := 0
+	for _, c := range cuts {
+		out = append(out, raw[last:c[0]]...)
+		last = c[1]
+	}
+	out = append(out, raw[last:]...)
+	return append(out, body[start+len(raw):]...)
 }
 
 // memberOf is topMember of obj, a valid JSON object.
@@ -1306,3 +1512,446 @@ func appendHTMLEscaped(dst, s []byte) []byte {
 	}
 	return append(dst, s[start:]...)
 }
+
+// getIn is gjson.GetBytes read in place: what it finds points into body
+// rather than into a copy. GetBytes copies the value it finds, and for a
+// conversation's list that is the conversation, 45 MiB of a Codex turn
+// for one look at its items (#4004). A string kept from the result keeps
+// all of body: clone one that outlives the request, and never change body
+// while one is held.
+func getIn(body []byte, path string) gjson.Result {
+	return gjson.Get(unsafe.String(unsafe.SliceData(body), len(body)), path)
+}
+
+// marshalBody is json.Marshal of a request body being built, byte for
+// byte, its lists (the messages, the input items) written an item at a
+// time into a buffer of the size they come to. json.Marshal writes the
+// whole body into one buffer that doubles as it fills, then copies it
+// out: a 45 MB Codex conversation built for Chat took the heap from 45 to
+// 316 MiB, the buffers it outgrew being garbage until the next GC (#4004,
+// jihuayu's profile on a 2 GiB server). Here no buffer outgrows the
+// largest item. A value json.Marshal refuses gets json.Marshal's answer.
+//
+// spent names the list the builder made for this body alone (its
+// messages, its input items): each of its items is let go once written,
+// so the built conversation, strings joined from the request's parts
+// among it, is garbage while the body fills instead of held beside it to
+// the end (#4004). A value json.Marshal refuses is refused still, and the
+// list is then left part spent.
+//
+// Past bodyKept of them, the written items aren't kept for the body
+// either: each is measured, its bytes written to no buffer, and written
+// again into the body once that is made. Kept, they were a copy of the
+// conversation beside the body at its peak; written twice costs a large
+// body's encoding once more, and a body under bodyKept nothing.
+func marshalBody(out map[string]any, spent string) ([]byte, error) {
+	keys := make([]string, 0, len(out))
+	for k := range out {
+		// a key json.Marshal writes another way, before anything is spent
+		if _, ok := appendJSONKey(nil, k, true); !ok {
+			return json.Marshal(out)
+		}
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	vals := make([][]json.RawMessage, len(keys))
+	kept := bodyKept
+	n := 2
+	for i, k := range keys {
+		items, sizes, ok := marshalItems(out[k], k == spent, &kept)
+		if !ok {
+			return json.Marshal(out)
+		}
+		vals[i] = items
+		n += len(k) + 4 + len(items) + sizes
+	}
+	dst := make([]byte, 0, n)
+	dst = append(dst, '{')
+	for i, k := range keys {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		var ok bool
+		if dst, ok = appendJSONKey(dst, k, true); !ok {
+			return json.Marshal(out)
+		}
+		dst = append(dst, ':')
+		items := vals[i]
+		vals[i] = nil
+		if !isSplitList(out[k]) {
+			dst = append(dst, items[0]...)
+			continue
+		}
+		dst = append(dst, '[')
+		list := reflect.ValueOf(out[k])
+		for j, it := range items {
+			if j > 0 {
+				dst = append(dst, ',')
+			}
+			if it != nil {
+				dst = append(dst, it...)
+				continue
+			}
+			// measured only: written now, straight into the body
+			var err error
+			if dst, err = appendJSONValue(dst, list.Index(j).Addr().Interface()); err != nil {
+				return nil, err
+			}
+			if k == spent {
+				list.Index(j).SetZero()
+			}
+		}
+		dst = append(dst, ']')
+	}
+	return append(dst, '}'), nil
+}
+
+// isSplitList says whether marshalItems writes v an item at a time: a
+// slice of two or more that isn't bytes and doesn't write itself.
+func isSplitList(v any) bool {
+	if _, ok := v.(json.Marshaler); ok {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() != reflect.Uint8 && rv.Len() > 1
+}
+
+// marshalItems is v as json.Marshal writes it: its items each on their
+// own for a list isSplitList takes, or one piece; false when json.Marshal
+// refuses any of it, and the bytes they come to. An item is kept while
+// *kept, the bytes left to keep, is above 0; past it an item is only
+// measured, nil among the items, and left as it was. spend sets each item
+// kept to its zero value.
+func marshalItems(v any, spend bool, kept *int) ([]json.RawMessage, int, bool) {
+	if !isSplitList(v) {
+		b, err := marshalSized(v)
+		*kept -= len(b)
+		return []json.RawMessage{b}, len(b), err == nil
+	}
+	rv := reflect.ValueOf(v)
+	items := make([]json.RawMessage, rv.Len())
+	size := 0
+	for i := range items {
+		// by its address, as json.Marshal reaches a slice's items: a
+		// MarshalJSON on the pointer is called
+		it := rv.Index(i).Addr().Interface()
+		if *kept <= 0 {
+			n, ok := jsonSize(it)
+			if !ok {
+				return nil, 0, false
+			}
+			size += n
+			continue
+		}
+		b, err := marshalSized(it)
+		if err != nil {
+			return nil, 0, false
+		}
+		items[i] = b
+		size += len(b)
+		*kept -= len(b)
+		if spend {
+			rv.Index(i).SetZero()
+		}
+	}
+	return items, size, true
+}
+
+// marshalSized is json.Marshal(v), written into one slice of its size.
+// json.Marshal grows its buffer by doubling and then copies it out, so a
+// long turn's text cost three to four times its size again on every
+// request to a Chat upstream. The maps, lists, strings, bools and ints a
+// body is built of are written here as encoding/json writes them; any
+// other value is json.Marshal's own.
+func marshalSized(v any) ([]byte, error) {
+	n, ok := jsonSize(v)
+	if !ok {
+		return json.Marshal(v)
+	}
+	return appendJSONValue(make([]byte, 0, n), v)
+}
+
+// jsonSize is how long json.Marshal(v) is; false when it fails.
+func jsonSize(v any) (int, bool) {
+	switch v := v.(type) {
+	case nil:
+		return 4, true
+	case string:
+		return jsonStringSize(v), true
+	case bool:
+		if v {
+			return 4, true
+		}
+		return 5, true
+	case int:
+		var b [20]byte
+		return len(strconv.AppendInt(b[:0], int64(v), 10)), true
+	case int64:
+		var b [20]byte
+		return len(strconv.AppendInt(b[:0], v, 10)), true
+	case *any:
+		// a []any's item, by its address
+		if v == nil {
+			return 4, true
+		}
+		return jsonSize(*v)
+	case *map[string]any:
+		if v == nil {
+			return 4, true
+		}
+		return jsonSize(*v)
+	case map[string]any:
+		if v == nil {
+			return 4, true
+		}
+		n := 2 + max(len(v)-1, 0)
+		for k, x := range v {
+			if !plainJSONKey(k) {
+				return 0, false
+			}
+			m, ok := jsonSize(x)
+			if !ok {
+				return 0, false
+			}
+			n += len(k) + 3 + m
+		}
+		return n, true
+	case *[]map[string]any:
+		if v == nil {
+			return 4, true
+		}
+		return jsonSize(*v)
+	case []map[string]any:
+		if v == nil {
+			return 4, true
+		}
+		n := 2 + max(len(v)-1, 0)
+		for _, x := range v {
+			m, ok := jsonSize(x)
+			if !ok {
+				return 0, false
+			}
+			n += m
+		}
+		return n, true
+	case *[]any:
+		if v == nil {
+			return 4, true
+		}
+		return jsonSize(*v)
+	case []any:
+		if v == nil {
+			return 4, true
+		}
+		n := 2 + max(len(v)-1, 0)
+		for _, x := range v {
+			m, ok := jsonSize(x)
+			if !ok {
+				return 0, false
+			}
+			n += m
+		}
+		return n, true
+	}
+	b, err := json.Marshal(v)
+	return len(b), err == nil
+}
+
+// appendJSONValue appends json.Marshal(v) to dst (jsonSize's values).
+func appendJSONValue(dst []byte, v any) ([]byte, error) {
+	switch v := v.(type) {
+	case nil:
+		return append(dst, "null"...), nil
+	case string:
+		return appendJSONString(dst, v), nil
+	case bool:
+		return strconv.AppendBool(dst, v), nil
+	case int:
+		return strconv.AppendInt(dst, int64(v), 10), nil
+	case int64:
+		return strconv.AppendInt(dst, v, 10), nil
+	case *any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		return appendJSONValue(dst, *v)
+	case *map[string]any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		return appendJSONValue(dst, *v)
+	case map[string]any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			if !plainJSONKey(k) {
+				return appendMarshalled(dst, v)
+			}
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			var err error
+			if dst, err = appendJSONValue(dst, v[k]); err != nil {
+				return dst, err
+			}
+		}
+		return append(dst, '}'), nil
+	case *[]map[string]any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		return appendJSONValue(dst, *v)
+	case []map[string]any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		dst = append(dst, '[')
+		for i, x := range v {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			var err error
+			if dst, err = appendJSONValue(dst, x); err != nil {
+				return dst, err
+			}
+		}
+		return append(dst, ']'), nil
+	case *[]any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		return appendJSONValue(dst, *v)
+	case []any:
+		if v == nil {
+			return append(dst, "null"...), nil
+		}
+		dst = append(dst, '[')
+		for i, x := range v {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			var err error
+			if dst, err = appendJSONValue(dst, x); err != nil {
+				return dst, err
+			}
+		}
+		return append(dst, ']'), nil
+	}
+	return appendMarshalled(dst, v)
+}
+
+func appendMarshalled(dst []byte, v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return dst, err
+	}
+	return append(dst, b...), nil
+}
+
+// plainJSONKey is a key json.Marshal writes as it is, between quotes.
+func plainJSONKey(k string) bool {
+	for i := 0; i < len(k); i++ {
+		if c := k[i]; c < 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonStringSize is how long json.Marshal(s) is.
+func jsonStringSize(s string) int {
+	n := 2
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			switch {
+			case c == '"', c == '\\', c == '\b', c == '\f', c == '\n', c == '\r', c == '\t':
+				n += 2
+			case c < 0x20, c == '<', c == '>', c == '&':
+				n += 6
+			default:
+				n++
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 || r == '\u2028' || r == '\u2029' {
+			n += 6
+		} else {
+			n += size
+		}
+		i += size
+	}
+	return n
+}
+
+// appendJSONString appends s as encoding/json writes a string, its HTML
+// characters escaped: invalid UTF-8 as \ufffd, and U+2028 and U+2029
+// escaped.
+func appendJSONString(dst []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != '"' && c != '\\' && c != '<' && c != '>' && c != '&' {
+				i++
+				continue
+			}
+			dst = append(dst, s[start:i]...)
+			switch c {
+			case '"', '\\':
+				dst = append(dst, '\\', c)
+			case '\b':
+				dst = append(dst, '\\', 'b')
+			case '\f':
+				dst = append(dst, '\\', 'f')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			default:
+				dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, `\ufffd`...)
+			i += size
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, '\\', 'u', '2', '0', '2', hex[r&0xF])
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+// bodyKept is how many bytes of a body's written items marshalBody keeps
+// to put in the body; past it they are measured and written again.
+var bodyKept = 4 << 20

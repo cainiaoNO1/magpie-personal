@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -79,15 +80,27 @@ func allows(who access.Identity, ids ...string) bool {
 	return false
 }
 
-// modelAllowed says the key may use provider p's model.
+// modelAllowed says the key may use provider p's model. A model the user lists by an id of their own (provider.SetModelID) is
+// the one model by either id, so a key held to one may use the other:
+// one written before the id was given, or an agent's old ref to the
+// provider's own id.
 func modelAllowed(who access.Identity, p provider.Provider, model string) bool {
-	return allows(who, p.ID+"/"+model)
+	if allows(who, p.ID+"/"+model) {
+		return true
+	}
+	if own := p.OwnModelID(model); own != model {
+		return allows(who, p.ID+"/"+own)
+	}
+	if local := p.ListedModelID(model); local != model {
+		return allows(who, p.ID+"/"+local)
+	}
+	return false
 }
 
 // memberAllowed says the key may use a routing group's member: the model,
 // or a group it is reached through that the key names.
 func memberAllowed(who access.Identity, m provider.Member) bool {
-	return allows(who, append([]string{m.Provider.ID + "/" + m.Model}, m.Path...)...)
+	return modelAllowed(who, m.Provider, m.Model) || len(m.Path) > 0 && allows(who, m.Path...)
 }
 
 // groupNamed says the key names the routing group g itself.
@@ -256,7 +269,7 @@ func allowedCandidates(who access.Identity, cs []candidate, pl planned, members 
 			held = true
 			if i < len(pl.order) {
 				w := pl.order[i]
-				w.Held = true
+				w.Held, w.HeldBy = true, who.Group
 				pl.left = append(pl.left, w)
 			}
 			continue
@@ -274,6 +287,16 @@ func allowedCandidates(who access.Identity, cs []candidate, pl planned, members 
 	}
 	pl.held = slices.DeleteFunc(slices.Clone(pl.held), gone)
 	pl.capped = slices.DeleteFunc(slices.Clone(pl.capped), gone)
+	// nor one whose own list lacks the model, asked once those that list
+	// it refused the model (unlistedNext)
+	var unlisted []candidate
+	var unlistedW []Weighed
+	for i, c := range pl.unlisted {
+		if !gone(c) {
+			unlisted, unlistedW = append(unlisted, c), append(unlistedW, pl.unlistedW[i])
+		}
+	}
+	pl.unlisted, pl.unlistedW = unlisted, unlistedW
 	return out, pl, held && len(out) == 0
 }
 
@@ -287,6 +310,47 @@ func accountAllowed(who access.Identity, c candidate) bool {
 		return true
 	}
 	return who.AllowsAccount(c.p.ID, c.p.AccountID())
+}
+
+// heldByGroup is r with its caller held to the routing group g's own
+// accounts too (Group.Accounts, duanckham on X): a request through the
+// group is held to them by everything that holds one to its gateway key's
+// accounts (accountHolds, accountAllowed, onKeys, allowedKey), on every
+// route, as one rule (access.HeldToGroup). A group with none is r.
+func heldByGroup(r *http.Request, g provider.Group) *http.Request {
+	if len(g.Accounts) == 0 {
+		return r
+	}
+	who := access.Caller(r.Context()).HeldToGroup(cmp.Or(g.Name, g.ID), g.Accounts)
+	return r.WithContext(access.WithIdentity(r.Context(), who))
+}
+
+// heldByGroupAt is heldByGroup for the routing group id names, as a
+// request may name one (a bare group's name, auto/<model>); r when it
+// names none.
+func heldByGroupAt(r *http.Request, id string) *http.Request {
+	if gid, ok := provider.GroupFor(id); ok {
+		id = gid
+	}
+	if sid, ok := provider.AutoStandIn(id); ok {
+		id = sid
+	}
+	if g, _, ok := provider.FindGroup(id); ok {
+		return heldByGroup(r, g)
+	}
+	return r
+}
+
+// groupHeld is the name of the first of gs, routing groups a candidate is
+// reached through, held to accounts (Group.Accounts) that leave its account
+// or key out — by AllowsAccount, a gateway key's rule; "" for none.
+func groupHeld(c candidate, gs []provider.Group) string {
+	for _, g := range gs {
+		if len(g.Accounts) > 0 && !(access.Identity{Accounts: g.Accounts}).AllowsAccount(c.p.ID, c.p.AccountID()) {
+			return cmp.Or(g.Name, g.ID)
+		}
+	}
+	return ""
 }
 
 // allowedKey is p sent on the first of its keys in use the calling key
@@ -350,10 +414,33 @@ func keyModelError(who access.Identity, model string) string {
 }
 
 // keyAccountsError is what a request every candidate of which was an
-// account or key its key may not use is told.
+// account or key its key may not use is told — or its routing group,
+// held to some accounts (who.Group).
 func keyAccountsError(who access.Identity, model string) string {
+	if who.Group != "" {
+		msg := fmt.Sprintf("The routing group %q is held to some accounts, and none of the accounts or keys behind %s is one of them; it may use %s. Change the group's accounts in magpie's Routing page",
+			who.Group, model, keyAccountNames(who))
+		if who.KeyName != "" {
+			msg += fmt.Sprintf(" (and the gateway key %q's in its Gateway page)", who.KeyName)
+		}
+		return msg + ", or use an account it has."
+	}
 	return fmt.Sprintf("The gateway key %q is not allowed to use the accounts behind %s: no account or key behind it is one the key may use; it may use %s. Change the key's accounts in magpie's Gateway page, or use an account it has.",
 		who.KeyName, model, keyAccountNames(who))
+}
+
+// groupsHeldError is what a request is told when every account or key
+// left was one a routing group it went through — a group in the group, a
+// group a fallback reached — is held away from (Weighed.HeldBy).
+func groupsHeldError(model string, left []Weighed) string {
+	var by []string
+	for _, w := range left {
+		if w.HeldBy != "" && !slices.Contains(by, w.HeldBy) {
+			by = append(by, w.HeldBy)
+		}
+	}
+	return fmt.Sprintf("Every account or key behind %s is one the routing group %s is held away from: it is held to other accounts. Change the group's accounts in magpie's Routing page, or use an account it has.",
+		model, strings.Join(by, ", "))
 }
 
 // keyAccountNames is the key's accounts as an error message shows them:
@@ -361,8 +448,12 @@ func keyAccountsError(who access.Identity, model string) string {
 // provider has the account now, the id alone otherwise.
 func keyAccountNames(who access.Identity) string {
 	names := provider.AccountNames()
-	shown := make([]string, len(who.Accounts))
-	for i, a := range who.Accounts {
+	accounts := who.ShownAccounts()
+	if len(accounts) == 0 {
+		return "none"
+	}
+	shown := make([]string, len(accounts))
+	for i, a := range accounts {
 		if n, ok := names[a]; ok {
 			shown[i] = n
 		} else {

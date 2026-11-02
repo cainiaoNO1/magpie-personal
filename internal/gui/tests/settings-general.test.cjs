@@ -6,7 +6,8 @@
 // 1000px and 440px, in both engines, on a Mac (the Dock and Session terminal
 // rows show only there), with the API faked:
 // - the rows whose names say enough have no line under them, and the lines
-//   kept are each one line, not cut short on a wide window;
+//   kept are never cut short, one line each on a wide window (narrower,
+//   they wrap whole beside the control: arculongus on Discord);
 // - Codex's and Claude Code's own settings aren't here: they are on the
 //   agents' rows (the owner, 10-20);
 // - Language is a button (never a native <select>) showing the language;
@@ -29,7 +30,7 @@ const names = { en: "English", zh: "简体中文", "zh-TW": "繁體中文", ja: 
 const appearance = { en: "Appearance", zh: "外观", "zh-TW": "外觀", ja: "外観", de: "Darstellung" };
 const system = { en: "System", zh: "跟随系统", "zh-TW": "跟隨系統", ja: "システム", de: "System" };
 // the rows whose name says enough, found by the control they hold
-const bare = ["#themeSegs", "#colorblindSegs", "#langPick", "#textSizeSegs", "#traySegs", "#plainNamesSegs", "#loginSegs", "#dockSegs"];
+const bare = ["#themeSegs", "#colorblindSegs", "#reduceMotionSegs", "#birdSegs", "#langPick", "#textSizeSegs", "#traySegs", "#plainNamesSegs", "#loginSegs", "#dockSegs"];
 // the rows that keep a line, one each
 const kept = ["#lightweightSegs", "#keepAwakeSegs", "#sessionTerminalRow .sess-pick"];
 
@@ -67,6 +68,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width, height: 760 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.addInitScript(() => Object.defineProperty(navigator, "platform", { get: () => "MacIntel" }));
@@ -100,8 +102,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await page.locator("#view-settings :is(#codexAgentsV1Row, #codexAsyncRow, #codexTitlesRow, #codexDescriptionsRow, #codexPredictionsRow, #codexAutoReviewRow, #codexMemoriesRow)").count(), 0, "an agent's own settings are on its row");
       for (const [sel, sub] of rows.kept) {
         assert.equal(typeof sub, "object", `${sel}: ${sub}`);
-        assert.ok(sub.text.trim() && sub.lines <= 1, `${sel}: ${JSON.stringify(sub)}`);
-        if (width === 1000) assert.equal(sub.cut, false, `${sel}'s line is cut short: ${sub.text}`);
+        assert.ok(sub.text.trim(), `${sel}: ${JSON.stringify(sub)}`);
+        if (width === 1000) assert.ok(sub.lines <= 1, `${sel} takes more than one line: ${JSON.stringify(sub)}`);
+        assert.equal(sub.cut, false, `${sel}'s line is cut short: ${sub.text}`);
       }
       assert.equal(rows.stripes, 0, "a row has a stripe down its left");
       assert.equal(rows.sideways, false, "the page scrolls sideways");

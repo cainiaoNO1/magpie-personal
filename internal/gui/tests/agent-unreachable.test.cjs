@@ -15,7 +15,7 @@ const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 const kept = "http://172.28.96.1:3425";
-const detail = `Codex is pointed at magpie at ${kept}, where nothing answers from this computer, though magpie answers at http://127.0.0.1:3425. Under WSL's NAT networking, Windows as WSL sees it reaches magpie only while something listens on 172.28.96.1:3425: magpie itself with Settings › Share on local network on, or a forward of your own (netsh interface portproxy, which may need setting up again after Windows restarts).`;
+const detail = `Codex is pointed at magpie at ${kept}, where nothing answers from this computer, though magpie answers at http://127.0.0.1:3425. Under WSL's NAT networking, Windows as WSL sees it reaches magpie only while something listens on 172.28.96.1:3425: magpie itself with Settings › Network and sharing › Share on local network on, or a forward of your own (netsh interface portproxy, which may need setting up again after Windows restarts).`;
 const codex = { id: "codex", name: "Codex", icon: "codex", path: "/c", wired: true,
   fields: [{ key: "model", label: "model", value: "fake/m1", options: [{ value: "fake/m1", label: "m1", ref: "fake/m1" }] }] };
 const filler = Array.from({ length: 4 }, (_, i) => ({ id: "pi" + i, name: "Pi " + i, path: "/p", fields: [{ key: "model", label: "model", value: "", options: [] }] }));
@@ -66,6 +66,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const open = async (mode, move, calls) => {
         const page = await (await browser.newContext({ viewport: { width: mode ? 440 : 560, height: 640 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, move, calls));
         await page.goto("http://magpie.test/" + (mode ? "?mode=" + mode : ""));

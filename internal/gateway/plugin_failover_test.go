@@ -36,7 +36,7 @@ func TestPluginFailover(t *testing.T) {
 	var mu sync.Mutex
 	var tried []string          // each request's account, as its token names it
 	fail := map[string]string{} // account → how it fails
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		who := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer fresh-r-")
 		mu.Lock()
@@ -78,7 +78,6 @@ func TestPluginFailover(t *testing.T) {
 		fmt.Fprint(w, `data: {"id":"c","object":"chat.completion.chunk","model":"fake-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	}))
 	defer up.Close()
-	t.Setenv("FAKE_BASE", up.URL+"/v1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -172,6 +171,33 @@ func TestPluginFailover(t *testing.T) {
 				t.Fatalf("%s: the next request tried %s again: %d %s (tried %v)", how, first, code, body, seen)
 			}
 			if how == "gone" {
+				// one 401 on an access token not due yet, with a
+				// refresh token beside it, makes the token due and
+				// keeps the sign-in (plugins#618): the account is
+				// marked when the token renewed for its next request
+				// is turned away too
+				for _, l := range provider.Logins("fakeco") {
+					if strings.HasPrefix(l.User, first+"@") && l.Lapsed != "" {
+						t.Fatalf("%s is marked for one 401 its refresh token can renew: %+v", first, l)
+					}
+				}
+				for again := 0; ; again++ {
+					restingUntil.Lock()
+					restingUntil.m = map[string]time.Time{}
+					restingUntil.Unlock()
+					sticks.Lock()
+					sticks.m = map[string]stick{}
+					sticks.Unlock()
+					mu.Lock()
+					tried = nil
+					mu.Unlock()
+					if _, _, seen := ask("fakeco/fake-1"); contains(seen, first) {
+						break
+					}
+					if again == 20 {
+						t.Fatalf("%s wasn't tried again", first)
+					}
+				}
 				for _, l := range provider.Logins("fakeco") {
 					if strings.HasPrefix(l.User, first+"@") && !strings.Contains(l.Lapsed, "sign-in has expired") {
 						t.Fatalf("%s refused isn't marked: %+v", first, l)
@@ -259,7 +285,7 @@ func TestPluginSaysSignIn(t *testing.T) {
 
 	var mu sync.Mutex
 	status, said := 200, ""
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		mu.Lock()
 		st, sa := status, said
@@ -277,7 +303,6 @@ func TestPluginSaysSignIn(t *testing.T) {
 		fmt.Fprint(w, `data: {"id":"c","object":"chat.completion.chunk","model":"fake-1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	}))
 	defer up.Close()
-	t.Setenv("FAKE_BASE", up.URL+"/v1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

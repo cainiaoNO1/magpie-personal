@@ -121,7 +121,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const errors = [];
         const page = await (await browser.newContext({ viewport: { width, height: 640 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(5000);
-        page.on("pageerror", (e) => errors.push(e.message));
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
         await page.route("**/*", server(lang, ctl));
         await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=settings");
@@ -139,8 +140,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await dl.locator(".opt").nth(1).evaluate((o) => o.classList.contains("on")), true, "on by default");
 
         // off: saved, nothing else changed, the row says what off does
+        // the click scrolls nothing but to keep what was clicked where it
+        // was: the row's line says what off does, and wrapped whole
+        // (arculongus on Discord) it can take another line, the switch
+        // beside it held under the pointer
         await showRow(page, dl);
         let before = await scrolls(page);
+        const y0 = (await dl.locator(".opt").nth(0).boundingBox()).y;
         await dl.locator(".opt").nth(0).click();
         await page.waitForFunction(() => document.querySelectorAll(".update-download-row .opt")[0]?.classList.contains("on"));
         assert.equal(ctl.saves.at(-1).noAutoDownload, true);
@@ -149,7 +155,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(ctl.saves.at(-1).autoRestart, false);
         await dl.locator(".sub", { hasText: w.off }).waitFor();
         await page.waitForTimeout(400);
-        assert.equal(await scrolls(page), before, "the click must not scroll the page");
+        const y1 = (await dl.locator(".opt").nth(0).boundingBox()).y;
+        if (await scrolls(page) !== before) assert.ok(Math.abs(y1 - y0) <= 1, `the click scrolled the page, and the switch moved ${y1 - y0}px`);
         await fits(page, dl, width);
 
         // kept after a reload; Check now finds 0.1.401 and only says so

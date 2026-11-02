@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/access"
@@ -30,6 +29,9 @@ func (s *Server) rememberCodexTurn(r *http.Request, who, agent, kind, asked stri
 		return
 	}
 	s.codexTurns.Store(codexTurnKey(r, who), asked)
+	// and by its conversation, for a memory call that raced it
+	// (codexMemoryStandIn)
+	s.codexLeads.saw(r, kind, asked)
 }
 
 // isReviewCall: Codex's auto-review of an approval (the guardian), which
@@ -39,14 +41,10 @@ func isReviewCall(kind, asked string) bool {
 	return kind == "guardian" || asked == "codex-auto-review"
 }
 
-// freeOnChatGPT says whether a ChatGPT sign-in's call on model is free,
-// counted in none of its usage windows: Codex's reviewer model,
-// codex-auto-review, since OpenAI made Auto-review free for every ChatGPT
-// sign-in on 2026-10-06 (#1593, hywang1230). A review run on another
-// model, or through an API key, is counted as any call.
-func freeOnChatGPT(model string) bool {
-	return strings.EqualFold(strings.TrimSpace(model), "codex-auto-review")
-}
+// freeOnChatGPT says whether a call on model by a ChatGPT account on plan
+// is free (provider.ChatGPTReviewFree, which the Usage page's prices
+// follow too).
+func freeOnChatGPT(model, plan string) bool { return provider.ChatGPTReviewFree(model, plan) }
 
 // codexMemoryStandIn is the model a Codex memory call goes to when magpie
 // knows none by the name it came with (#742): Codex writes and
@@ -65,12 +63,42 @@ func freeOnChatGPT(model string) bool {
 // another computer — was answered 404 "magpie knows no model
 // \"codex-auto-review\"" (Adam on Discord). "" for any other call, a model
 // magpie serves, or a Codex that has had no turn answered here.
-func (s *Server) codexMemoryStandIn(r *http.Request, who, agent, kind, asked string) string {
+//
+// Codex starts its memories with each turn of a conversation, so a memory
+// call can come before the turn it was started with, the first after the
+// model was switched: it is read after that turn, as the app's titles are
+// (codexLeads.sideOf, beside), not on the model switched away from
+// (cybercaius on Discord).
+func (s *Server) codexMemoryStandIn(r *http.Request, who, agent, kind, asked string, body []byte) string {
 	if agent != "codex" || !isMemoryKind(kind) && !isReviewCall(kind, asked) {
 		return ""
 	}
 	if _, _, ok := provider.Resolve(asked); ok {
-		return ""
+		// A memory call on one of Codex's own bare defaults that a
+		// provider of magpie's happens to serve under the same name:
+		// the name is Codex's own, not a pick of that provider's model,
+		// and the account it resolves to may refuse the model outright
+		// (400, three tries, the memory lost, #4765). With Codex's
+		// config naming no model for its memories, the call follows the
+		// conversation's, as it does on the ChatGPT backend's path
+		// (codexFollowTo). "" keeps it where the name resolves: any
+		// other call, the config's own pick, a call whose config magpie
+		// can't read, or no conversation of magpie's to follow.
+		if !isMemoryKind(kind) || CodexSideSet == nil || CodexSideSet("memories") {
+			return ""
+		}
+		to := s.codexMemorySession(r, body)
+		if to == "" || to == asked {
+			return ""
+		}
+		return to
+	}
+	if isMemoryKind(kind) {
+		if m := s.codexLeads.sideOf(r, body, true); m != "" && m != asked {
+			if _, _, ok := provider.Resolve(m); ok {
+				return m
+			}
+		}
 	}
 	key := codexTurnKey(r, who)
 	if m, ok := s.codexTurns.Load(key); ok {

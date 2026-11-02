@@ -75,6 +75,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1000, height: 700 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
@@ -97,7 +98,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // grouped as seen through the gateway, with no path
       const folder = view.locator(".sm-folder").first();
       assert.equal((await folder.locator(".fold .name").textContent()).trim(), await tr(KEYS.seen));
-      assert.equal((await folder.locator(".sm-path").textContent()).trim(), "");
+      assert.equal(await folder.locator(".sm-path").count(), 0);
       // what magpie recorded is its size; nothing recorded says no size at all
       const subA = (await rowA.locator(".sub").first().textContent());
       assert(subA.includes(await tr(KEYS.size, { size: "2 KB" })) || subA.includes(await tr(KEYS.size, { size: "2.0 KB" })), `recorded size in ${subA}`);

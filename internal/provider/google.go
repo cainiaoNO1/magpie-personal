@@ -39,6 +39,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/probelog"
 )
 
 // CodeAssist is Google's Code Assist API, which magpie only speaks
@@ -315,7 +316,66 @@ var googleState = struct {
 	tokens   map[string]googleAuth // by refresh token
 	projects map[string]googleProject
 	flags    map[string]geminiFlags // by refresh token and project
-}{tokens: map[string]googleAuth{}, projects: map[string]googleProject{}, flags: map[string]geminiFlags{}}
+	// when Google last refused each tier named in an account's
+	// fetchAvailableModels with a 400, by refresh token, project and tier
+	// (tierRefusedFor)
+	refused map[string]time.Time
+}{tokens: map[string]googleAuth{}, projects: map[string]googleProject{}, flags: map[string]geminiFlags{}, refused: map[string]time.Time{}}
+
+// tierRefusedFor is how long a tier Google answered an account's
+// fetchAvailableModels 400 for is left out of its next ones. A Google AI
+// Pro account gets 400 INVALID_ARGUMENT with g1-pro-tier named (#1553,
+// AnxForever's log) and its list only from the request without one, so
+// every list, start-up's, the hourly relist's, each quota reading's, sent
+// Google that 400 first, and each list's was a 400 "Model list" row on the
+// Requests page (ferock4669 on Discord). Asked again after a day, in case
+// Google takes it by then; a tier the account newly has is a new key.
+const tierRefusedFor = 24 * time.Hour
+
+func tierKey(rt, project, tier string) string { return rt + "\x00" + project + "\x00" + tier }
+
+// askTiers are the tiers to name in the account's next fetchAvailableModels,
+// best first, then "" (none): its entitlements less those Google refused
+// it within tierRefusedFor.
+func (g googleAccount) askTiers(p googleProject) []string {
+	googleState.Lock()
+	defer googleState.Unlock()
+	var out []string
+	for _, t := range p.entitlements() {
+		if at, ok := googleState.refused[tierKey(g.auth.RefreshToken, p.id, t)]; ok && time.Since(at) < tierRefusedFor {
+			continue
+		}
+		out = append(out, t)
+	}
+	return append(out, "")
+}
+
+// tierRefused notes that Google refused the account's fetchAvailableModels
+// with tier named.
+func (g googleAccount) tierRefused(p googleProject, tier string) {
+	googleState.Lock()
+	googleState.refused[tierKey(g.auth.RefreshToken, p.id, tier)] = time.Now()
+	googleState.Unlock()
+}
+
+// codeAssistError is Code Assist's answer to a call other than 200: its
+// status, and what Google said (APIError).
+type codeAssistError struct {
+	status int
+	msg    string
+}
+
+func (e *codeAssistError) Error() string { return e.msg }
+
+// codeAssistStatus is the status Code Assist answered err with, 0 for an
+// error that isn't such an answer.
+func codeAssistStatus(err error) int {
+	var e *codeAssistError
+	if errors.As(err, &e) {
+		return e.status
+	}
+	return 0
+}
 
 type googleProject struct {
 	id, plan string
@@ -458,7 +518,7 @@ func (g googleAccount) call(ctx context.Context, base, method string, body, out 
 	defer res.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", g.app.name, APIError(rb, res.Status))
+		return &codeAssistError{status: res.StatusCode, msg: fmt.Sprintf("%s: %s", g.app.name, APIError(rb, res.Status))}
 	}
 	if out == nil {
 		return nil
@@ -945,20 +1005,31 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 			} `json:"agentModelSorts"`
 		}
 		// with the account's tier named, as Antigravity asks; a tier Google
-		// won't take from it is left out, down to none
+		// won't take from it is left out, down to none, and not named
+		// again for a while (tierRefusedFor)
 		sent := ""
-		tiers := append(p.entitlements(), "")
+		tiers := g.askTiers(p)
 		for i, t := range tiers {
 			body := map[string]any{"project": p.id}
+			ask := ctx
 			if t != "" {
 				body["entitlement"] = map[string]any{"userTier": t}
+				// a step towards the list, which the request after it
+				// fetches: not a row of the request log, where a
+				// refused tier was a 400 "Model list" beside every list
+				// that was fetched (ferock4669); the last request, with
+				// none named, is written down as before
+				ask = probelog.Taken(ctx)
 			}
-			if err = g.call(ctx, g.app.base, "fetchAvailableModels", body, &res, nil); err == nil {
+			if err = g.call(ask, g.app.base, "fetchAvailableModels", body, &res, nil); err == nil {
 				sent = t
 				break
 			}
 			if ctx.Err() != nil {
 				return nil, err
+			}
+			if t != "" && codeAssistStatus(err) == http.StatusBadRequest {
+				g.tierRefused(p, t)
 			}
 			switch {
 			case t == "":
@@ -983,7 +1054,15 @@ func (g googleAccount) modelInfo(ctx context.Context) ([]googleModelInfo, error)
 				continue
 			}
 			if m.Disabled {
-				disabled = append(disabled, id) // still listed, as before
+				// Antigravity marks a model it won't serve the account
+				// disabled, and asking for it is a 404 "Requested entity
+				// was not found": gemini-4-argon-disabled on a real
+				// account, which DeepSeek Harness offered from magpie's
+				// list (kwanyu on Discord, 10-24). It is left out, as the
+				// chat_/tab_ ids are, and comes back on the refresh after
+				// Google enables it.
+				disabled = append(disabled, id)
+				continue
 			}
 			if strings.HasPrefix(id, "claude") {
 				claude = append(claude, id)
@@ -1106,6 +1185,14 @@ func (g googleAccount) models(ctx context.Context) ([]catalog.Model, error) {
 		}
 		return g.flags(ctx, p.id).offered(preview), nil
 	}
+	return g.antigravityList(infos), nil
+}
+
+// antigravityList is an Antigravity account's catalog from what its
+// fetchAvailableModels listed (models), the fallback list when it listed
+// none.
+func (g googleAccount) antigravityList(infos []googleModelInfo) []catalog.Model {
+	infos = slices.Clone(infos)
 	fallback := g.fallbackModels()
 	names := map[string]string{}
 	for _, m := range fallback {
@@ -1137,9 +1224,9 @@ func (g googleAccount) models(ctx context.Context) ([]catalog.Model, error) {
 		out = append(out, m)
 	}
 	if len(out) == 0 {
-		return fallback, nil
+		return fallback
 	}
-	return out, nil
+	return out
 }
 
 func (g googleAccount) fallbackModels() []catalog.Model {
@@ -1162,6 +1249,13 @@ func (g googleAccount) quota(ctx context.Context, plan string) SubscriptionQuota
 	if err != nil {
 		q.Error = err.Error()
 		return q
+	}
+	if g.app.agent == "antigravity" && len(infos) > 0 {
+		// the reading lists the account's models too: a model Google gave
+		// it since its list was fetched joins the account's list and the
+		// subscription's, for the picker, routing and its bar, without a
+		// probe or a sync (01huadalang on Discord)
+		noteAntigravityList(g.user, g.app.base, g.antigravityList(infos))
 	}
 	for _, mi := range infos {
 		if mi.remaining < 0 {
@@ -1198,6 +1292,12 @@ func (g googleAccount) quota(ctx context.Context, plan string) SubscriptionQuota
 // its group's name as its Pool, so the GUI shows one row a group. None
 // when the summary can't be read: the per-model windows stand alone. They
 // are Aside: routing goes on reading the per-model windows, as before.
+//
+// A group named for one model ("Gemini 4 Argon", whose quota is apart
+// from the other Gemini models' and has only a week: agy 1.4.0's /usage,
+// CodexBar #4585) takes that model, whatever windows it has, and no other
+// model of its family: the family-wide group ("Gemini Models") keeps the
+// rest, whichever of the two Google lists first (01huadalang on Discord).
 func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindow {
 	p, err := g.project(ctx)
 	if err != nil {
@@ -1220,7 +1320,12 @@ func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindo
 	if err := g.call(ctx, g.app.base, "retrieveUserQuotaSummary", map[string]any{"project": p.id}, &res, nil); err != nil {
 		return nil
 	}
+	type group struct {
+		pool, about string
+		five        bool // has its 5 hours, which stand in for its models'
+	}
 	var out []QuotaWindow
+	var groups []group
 	for _, gr := range res.Groups {
 		pool := poolName(gr.DisplayName)
 		if pool == "" {
@@ -1258,21 +1363,53 @@ func (g googleAccount) pools(ctx context.Context, ws []QuotaWindow) []QuotaWindo
 			n++
 			fiveHour = fiveHour || w.Span == modelSpan
 		}
-		if n == 0 || !fiveHour {
-			continue // without the group's 5 hours its models' own stand (#745)
+		if n > 0 {
+			groups = append(groups, group{pool, strings.ToLower(gr.DisplayName + " " + gr.Description), fiveHour})
 		}
-		// a model is in the group its name or description names its
-		// family in ("Models within this group: Claude Opus, Claude
-		// Sonnet, GPT-OSS")
-		about := strings.ToLower(gr.DisplayName + " " + gr.Description)
-		for i := range ws {
-			if ws[i].Pool == "" && ws[i].Family != "" && strings.Contains(about, strings.ToLower(ws[i].Family)) {
-				ws[i].Pool = pool
+	}
+	for i := range ws {
+		if ws[i].Pool != "" || ws[i].Family == "" {
+			continue
+		}
+		if j := slices.IndexFunc(groups, func(gr group) bool { return poolNames(gr.pool, ws[i]) }); j >= 0 {
+			ws[i].Pool = groups[j].pool
+			continue
+		}
+		// else the group its name or description names its family in
+		// ("Models within this group: Claude Opus, Claude Sonnet,
+		// GPT-OSS"), one with its 5 hours: without them its models' own
+		// stand (#745); a group that says a version ("Gemini 4 Argon") is
+		// its model's alone, never the family's
+		for _, gr := range groups {
+			if gr.five && !versioned(gr.pool) && strings.Contains(gr.about, strings.ToLower(ws[i].Family)) {
+				ws[i].Pool = gr.pool
+				break
 			}
 		}
 	}
 	return out
 }
+
+// poolNames is whether a quota group's name (pool) is a model's own: the
+// model's name or id begins with it and it says a version, as "Gemini 4
+// Argon" does Gemini 4 Argon (High)'s; "Gemini" names a family, not a model.
+func poolNames(pool string, w QuotaWindow) bool {
+	if !versioned(pool) {
+		return false
+	}
+	p := strings.ToLower(pool)
+	for _, s := range []string{w.Name, strings.ReplaceAll(w.Model, "-", " ")} {
+		s = strings.ToLower(s)
+		if s == p || strings.HasPrefix(s, p+" ") || strings.HasPrefix(s, p+"(") {
+			return true
+		}
+	}
+	return false
+}
+
+// versioned is whether a quota group's name says a version, a model's
+// group ("Gemini 4 Argon"), not a family's ("Gemini", "Claude & GPT").
+func versioned(pool string) bool { return strings.ContainsAny(pool, "0123456789") }
 
 // modelSpan is the window fetchAvailableModels gives a model of
 // Antigravity's, its 5 hours, which its window leaves without a Span.
@@ -1366,9 +1503,7 @@ func googleProvider(g googleAccount, plan string) Provider {
 		if err != nil {
 			return err
 		}
-		req.Body = io.NopCloser(bytes.NewReader(out))
-		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(out)), nil }
-		req.ContentLength = int64(len(out))
+		SetBody(req, out)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		req.Header.Set("User-Agent", g.app.userAgent(model))
 		req.Header.Del("Accept")

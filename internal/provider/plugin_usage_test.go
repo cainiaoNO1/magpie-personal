@@ -14,6 +14,9 @@ import (
 	"github.com/yetone/magpie/internal/testenv"
 )
 
+// fptr is a plugin's window share, for the tests' literals.
+func fptr(v float64) *float64 { return &v }
+
 // A plugin's accounts show their allowance as the built-ins' do: beside
 // each account, on the usage page, and to the gateway, a window counting
 // only some models holding back those alone.
@@ -373,7 +376,7 @@ func TestPluginAccountModels(t *testing.T) {
 // provider had, whatever the plugin calls itself.
 func TestMovedProviderName(t *testing.T) {
 	claudeHome(t)
-	for id, want := range map[string]string{CommandCodePlanID: "Command Code Plan", "grok": "Grok (SuperGrok)", "kiro": "Kiro"} {
+	for id, want := range map[string]string{CommandCodePlanID: "Command Code Plan", "grok": "Grok", "kiro": "Kiro"} {
 		if err := setMigration(id, func(m *Migration) { m.State = MovePlugin }); err != nil {
 			t.Fatal(err)
 		}

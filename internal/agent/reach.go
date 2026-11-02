@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -124,8 +125,8 @@ func reachesMagpie(v, want string) bool {
 }
 
 // surelyMagpie is reachesMagpie once magpie has answered there: what a
-// write that keeps the address waits for, so a relay not yet tried never
-// gets magpie's model or key.
+// write that keeps the address waits for (magpieAsked), so a relay not yet
+// tried never gets magpie's model or key.
 func surelyMagpie(v, want string) bool {
 	base, ok := proxyBase(v, want)
 	if !ok {
@@ -133,6 +134,18 @@ func surelyMagpie(v, want string) bool {
 	}
 	ok, known := magpieAt(base)
 	return ok && known
+}
+
+// magpieAsked is magpieAt waited for, for a write: base, not asked yet, is
+// asked now (probedNow, as codexProxyOK asks a proxy), so what the write
+// reads after is magpie's answer there. Unasked, surelyMagpie is no, and
+// the first write in a magpie just started, the CLI's, took a proxy to
+// magpie for the user's own endpoint (#1985). One answered before, at any
+// age, is what the write goes by, as the reads do.
+func magpieAsked(base string) {
+	if _, known := magpieAt(base); !known {
+		probedNow("magpie "+base, func() bool { return magpieProbe(base) })
+	}
 }
 
 var reach struct {
@@ -233,17 +246,31 @@ func (a *Agent) unreachable(on Field, now string) *Drift {
 		return nil
 	}
 	// both asked at once, so one round of probes settles it
-	ok, known := reachable(addr)
+	inside := a.reachFrom != nil && gateway.OnWSLNet(addr)
+	var ok, known bool
+	if inside {
+		ok, known = a.reachFrom(addr)
+	} else {
+		ok, known = reachable(addr)
+	}
 	up, upKnown := reachable(gateway.URL())
 	if ok || !known || !up || !upKnown {
 		return nil
 	}
 	d := &Drift{Kind: "unreachable", Field: on.Key, Now: now, Want: now, Addr: addr}
 	host := strings.TrimPrefix(strings.TrimPrefix(addr, "http://"), "https://")
+	if inside {
+		// magpie listens there itself (gateway/wsl.go): what keeps WSL out
+		// is Windows' firewall
+		d.Detail = a.Name + " is pointed at magpie at " + addr + ", where magpie listens for WSL, but nothing answers there from WSL " + a.WSL + ": Windows' firewall keeps WSL out. " +
+			"Allow magpie in when Windows asks, or, in PowerShell as administrator: " + wslFirewallCommand() + ". " +
+			"On Windows 11, networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig lets WSL reach magpie at 127.0.0.1 instead."
+		return d
+	}
 	d.Detail = a.Name + " is pointed at magpie at " + addr + ", where nothing answers from this computer, though magpie answers at " + gateway.URL() + ". "
 	if a.WSL != "" || runtime.GOOS == "windows" {
 		d.Detail += "Under WSL's NAT networking, Windows as WSL sees it reaches magpie only while something listens on " + host +
-			": magpie itself with Settings › Share on local network on (it then listens on every address, and asks other computers for a gateway key), or a forward of your own (netsh interface portproxy, which may need setting up again after Windows restarts). " +
+			": magpie itself with Settings › Network and sharing › Share on local network on (it then listens on every address, and asks other computers for a gateway key), or a forward of your own (netsh interface portproxy, which may need setting up again after Windows restarts). " +
 			"Once it answers here and WSL still can't connect, Windows' firewall may be keeping WSL out: allow the port " + gateway.Port() + " for the WSL network. " +
 			"On Windows 11, networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig lets WSL reach magpie at 127.0.0.1 instead."
 	} else {
@@ -254,6 +281,18 @@ func (a *Agent) unreachable(on Field, now string) *Drift {
 		d.Detail += " WSL " + distro + " reaches Windows at " + to + " now, not " + addr + " as before: Use " + to + " points " + a.Name + " there."
 	}
 	return d
+}
+
+// wslFirewallCommand lets magpie in from WSL's networks through Windows'
+// firewall, for an administrator's PowerShell. WSL's network is a Public
+// one, so a rule for Private networks only (what Windows' own prompt
+// offers ticked) doesn't do.
+func wslFirewallCommand() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		exe = "magpie.exe"
+	}
+	return "New-NetFirewallRule -DisplayName 'magpie (WSL)' -Direction Inbound -Action Allow -Profile Any -InterfaceAlias 'vEthernet (WSL*)' -Program '" + strings.ReplaceAll(exe, "'", "''") + "'"
 }
 
 // wslMovedFrom is the address a WSL distro reaches Windows at now, when

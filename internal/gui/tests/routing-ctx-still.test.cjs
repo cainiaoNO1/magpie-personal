@@ -91,7 +91,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await t.test(`${lang} ${width}px`, async () => {
         const context = await browser.newContext({ viewport: { width, height: 900 } });
         const page = await context.newPage();
+        // the block grid, the look these cells are drawn in (the map is the default)
+        await page.addInitScript(() => { try { localStorage.setItem("magpie.ctxLook", "grid"); } catch {} });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const feed = { next: null };

@@ -107,8 +107,9 @@ type WorkBuddyCheckin struct {
 	Credit  float64   `json:"credit,omitempty"`
 	Streak  int       `json:"streak,omitempty"`
 	Msg     string    `json:"msg,omitempty"`
-	// ValidUntil is a campaign's end, when a successful answer must be
-	// checked again, even if the Beijing day hasn't changed.
+	// ValidUntil is a campaign's end, or when a plugin said its vendor's
+	// day turns (auth.checkin's until), when the answer must be checked
+	// again, even if the Beijing day hasn't changed.
 	ValidUntil time.Time `json:"until,omitzero"`
 	// Offline is a failure that never reached WorkBuddy, and Tries how
 	// many before it the same day did the same.
@@ -120,8 +121,61 @@ type WorkBuddyCheckin struct {
 	// Vendor is a plugin's provider by name, for a check-in By
 	// "plugin:<id>"; never kept.
 	Vendor string `json:"vendor,omitempty"`
-	// Asked is true of one checked in on this run, not one read back.
-	Asked bool `json:"-"`
+	// Asked is true of one checked in on this run, not one read back;
+	// sent so a press can tell a claim now from one earlier today.
+	// Never kept: the file is written before it is set.
+	Asked bool `json:"asked,omitempty"`
+	// Claimed is when magpie last saw the account's credits claimed,
+	// carried over while later answers that day say done: a done after
+	// magpie's own claim is the day's, one before it may be yesterday's
+	// (#3326).
+	Claimed time.Time `json:"claimed,omitzero"`
+	// Again says the answer is provisional (provisional): magpie asks
+	// the vendor again later that day. Worked out when shown, never
+	// kept.
+	Again bool `json:"again,omitempty"`
+}
+
+// checkinSureHour is the Beijing hour from which a done, inactive or
+// ineligible answer is taken as the day's. Before it, the vendor's own
+// day may not have turned: at 00:00:28 Beijing AutoClaw CN, WorkBuddy,
+// CodeArts, Trae CN, MiniMax and Raccoon answered "already in" for
+// accounts whose day's credits were still to claim, and a claim at 10:54
+// paid them (#3326, connoryang331, 14 of 29 accounts). Days that turn at
+// UTC midnight (08:00 Beijing) and Qoder CN's 10:00 campaigns are past by
+// noon; a vendor counting a US day isn't covered.
+const checkinSureHour = 12
+
+// claimedOn says whether magpie saw the account's credits claimed on day.
+func (r WorkBuddyCheckin) claimedOn(day string) bool {
+	return r.Outcome == CheckinClaimed && r.Day == day || !r.Claimed.IsZero() && wbCheckinDay(r.Claimed) == day
+}
+
+// provisional says whether r is an answer that may describe the vendor's
+// day before (#3326): a done, inactive or ineligible one given before
+// checkinSureHour, on a day magpie saw no claim. The loop asks such an
+// account again every wbCheckinEvery until a claim, or one of these
+// answers from checkinSureHour on, settles the day: at most 24 more
+// asks a day for an account that was in early, none once magpie claims.
+func (r WorkBuddyCheckin) provisional() bool {
+	return r.unclaimedAnswer() && r.At.In(beijing).Hour() < checkinSureHour
+}
+
+// unclaimedAnswer says whether r is the vendor's word on how its day
+// stands (done, inactive or ineligible) on a day magpie saw no claim:
+// one a press asks the vendor again for, as it may have changed.
+func (r WorkBuddyCheckin) unclaimedAnswer() bool {
+	switch r.Outcome {
+	case CheckinDone, CheckinInactive, CheckinIneligible:
+		return !r.claimedOn(r.Day)
+	}
+	return false
+}
+
+// shown is r as a reader is given it: Again worked out.
+func (r WorkBuddyCheckin) shown() WorkBuddyCheckin {
+	r.Again = r.provisional()
+	return r
 }
 
 // Checked says whether the day's credits are in, claimed now or before.
@@ -129,10 +183,12 @@ func (r WorkBuddyCheckin) Checked() bool {
 	return r.Outcome == CheckinClaimed || r.Outcome == CheckinDone
 }
 
-// settled says whether r answers for day: it is that day's, and not a
-// failure due another try (at now; soon, at once).
+// settled says whether r answers for day: it is that day's, not past
+// ValidUntil (a plugin's vendor whose day turns at another hour said when:
+// Qoder's daily credits open at 10:00 UTC+8, sdytman on Discord), and not
+// a failure due another try (at now; soon, at once).
 func (r WorkBuddyCheckin) settled(day string, now time.Time, soon bool) bool {
-	if r.Day != day {
+	if r.Day != day || !r.ValidUntil.IsZero() && !now.Before(r.ValidUntil) {
 		return false
 	}
 	return r.Outcome != CheckinFailed || !soon && now.Sub(r.At) < r.retryAfter()
@@ -228,11 +284,15 @@ func wroteCheckins(path string, st map[string]WorkBuddyCheckin) {
 }
 
 // shownCheckins is readCheckins for a reader that only shows the entries:
-// on an error, what last read (logged by readCheckins).
+// on an error, what last read (logged by readCheckins); each with Again
+// worked out.
 func shownCheckins(path string) map[string]WorkBuddyCheckin {
 	st, _ := readCheckins(path)
 	if st == nil {
 		st = map[string]WorkBuddyCheckin{}
+	}
+	for k, r := range st {
+		st[k] = r.shown()
 	}
 	return st
 }
@@ -552,10 +612,15 @@ func (l *wbCheckinLoop) tick(ctx context.Context, c checkinRunner) []WorkBuddyCh
 	defer cancel()
 	rs := c.checkinNow(cx, false)
 	for _, r := range rs {
-		if r.Outcome != CheckinFailed {
-			continue
+		due := time.Time{}
+		if r.Outcome == CheckinFailed {
+			due = r.At.Add(r.retryAfter())
 		}
-		if due := r.At.Add(r.retryAfter()); l.again.IsZero() || due.Before(l.again) {
+		// and as the vendor's own day turns, when it said (ValidUntil)
+		if u := r.ValidUntil; u.After(now) && (due.IsZero() || u.Before(due)) {
+			due = u
+		}
+		if !due.IsZero() && (l.again.IsZero() || due.Before(l.again)) {
 			l.again = due
 		}
 	}

@@ -58,6 +58,12 @@ type Option struct {
 	// signed in to itself, so the agent reaches it on its own too: the
 	// picker folds these into one row a click opens (Claude Code, #496)
 	Same bool `json:"same,omitempty"`
+	// Served is a model of the agent's own that magpie's list shows it
+	// too, on the very account it is signed in to (Codex's ChatGPT
+	// models, its list's Codex section): not left out with the agent's
+	// own models (Picks), as the list's tick decides it (shiqi_40904: a
+	// routing group switched on took every one out of Codex's picker)
+	Served bool `json:"served,omitempty"`
 	// Alias is the value of the option a dated id is another name of
 	// (claude-opus-4-5-20251101 → claude-opus-4-5): the picker shows one
 	// row for the two, the alias, unless the dated one is the value set
@@ -147,6 +153,16 @@ type Agent struct {
 	// rather than asking the gateway, rewrites that list as the catalog is
 	// now — where magpie wrote one; nothing else changes (see SyncCatalog).
 	Sync func() error
+	// ListOnly: Sync does nothing but bring a block of magpie's name in the
+	// agent's files up to the catalog. A catalog sync runs it only while
+	// the agent is connected (Wired), as its switch on the Agents page
+	// says: switched off, nothing of magpie's writes its files. A custom
+	// provider the user named magpie in the agent, with a few models picked
+	// by hand (yyddbds on Discord, Xiaomi MiMo), was written over with the
+	// whole catalog at every start. A list magpie wrote while connected
+	// waits, while the agent runs a model of its own, until a model of
+	// magpie's is picked again.
+	ListOnly bool
 	// Unwire, for an agent whose fields' default is the agent as installed
 	// rather than what it had before magpie (Codex, Claude Code, Gemini
 	// CLI), takes magpie out of its config and puts back what the stash
@@ -176,6 +192,23 @@ type Agent struct {
 	// "" for none: Connect keeps the agent on that model through magpie
 	// where it can't Join (#940: Codex went to an unrelated model).
 	OwnVia func(model string) string
+	// AppOut reports magpie made Codex's provider for a ChatGPT sign-in
+	// whose account is used up (codex.out): the Codex app, which reads
+	// its sign-in only as it opens, sends nothing on it till it is opened
+	// again (MasterYi on Discord).
+	AppOut func() bool
+	// HoldMatters reports Codex takes magpie's models beside a ChatGPT
+	// sign-in, so that magpie is its provider while the Codex app holds
+	// the account (out), or is that already: what the app holds is read
+	// for it even with Codex switched off in magpie
+	// (provider.CodexHoldMatters).
+	HoldMatters func() bool
+	// SideModel is the model Codex is set to when it is one of magpie's,
+	// picked beside its ChatGPT sign-in (by the base URL, magpie not its
+	// provider), "" otherwise: the gateway answers the Codex app's hidden
+	// side turns (titles, descriptions, summaries), which it asks for on a
+	// model of its own, on it rather than on the ChatGPT account.
+	SideModel func() string
 	// Routed reports that the agent's config sends whatever model it
 	// names to magpie's gateway (Codex's openai_base_url or magpie as its
 	// provider), so a model's name the gateway takes as a routing group
@@ -228,14 +261,20 @@ type Agent struct {
 	Gateway func() string
 	// Import, for an app that takes magpie only through an import link of
 	// its own, which the user confirms there (Cindy), is that link; the app
-	// has no fields magpie sets. Added says whether it has magpie already;
-	// nil means the app exposes no way to read that status.
+	// has no fields magpie sets. Added says whether it has magpie already,
+	// known false when what it is read from couldn't be read: unknown,
+	// never "not added". nil means the app exposes no way to read that
+	// status.
 	Import func() string
-	Added  func() bool
+	Added  func() (added, known bool)
 	// Launch, for an agent that takes the gateway only from its
 	// environment (agy), is the command that starts it on magpie, while
 	// it is on one of magpie's models; "" otherwise.
 	Launch func() string
+	// Typed, for such an agent, is what the user types in a new terminal
+	// to start it on magpie, a function magpie gave their shells (agy);
+	// "" when there is none, and Launch is the way.
+	Typed func() string
 	// SplitSuffix, for an agent whose model values carry something of its
 	// own after the model that varies from value to value (omp's thinking
 	// level, "…:max"), splits a value into the model the picker offers and
@@ -267,6 +306,17 @@ type Agent struct {
 	// it where that is kept apart from Gateway (this machine's Codex at an
 	// address of the user's, #816): Drift tries it (see reach.go).
 	reach func() string
+	// reachFrom, when set, tries base from where the agent runs (inside
+	// its WSL distro), as reachable does from here: the last answer, and
+	// whether there is one. A WSL network's address answers from Windows
+	// whatever its firewall lets in from WSL, so only this tells.
+	reachFrom func(base string) (ok, known bool)
+	// wslVersion is an agent in a WSL distro's CLI's version, as the
+	// distro's probe asked it (wslKind.version); "" when not asked
+	wslVersion string
+	// unreached, for an agent in a WSL distro, is why its folder there
+	// can't be opened: a link the distro couldn't resolve (distro.open)
+	unreached error
 	// move, when set, points the agent's config at to where it names the
 	// gateway at from: an address of WSL's that changed (#1013).
 	move func(from, to string) error
@@ -292,6 +342,18 @@ type Agent struct {
 	// that is dirShared: a file only the agent (or its own app) writes
 	// there (the Qoder app's status file, #2138).
 	sign func() bool
+	// binNot, when set, says whether a binary found for Bin is not this
+	// agent's: another program's launcher of the same name (VS Code's
+	// copilot launcher, #3269), which detection and the CLI's lookup are
+	// not to take for the agent.
+	binNot func(bin string) bool
+}
+
+// binsOwn says whether bin, as binAt or proc.FindTool found it, is the
+// agent's own command: binNot, when set, turns away what another program
+// puts there under the same name.
+func (a *Agent) binsOwn(bin string) bool {
+	return bin != "" && (a.binNot == nil || !a.binNot(bin))
 }
 
 // Running reports whether a process whose command line matches any pattern
@@ -355,7 +417,7 @@ func (a *Agent) Detected() bool {
 	if a.sign != nil && a.sign() {
 		return true
 	}
-	if a.Bin != "" && binAt(a.Bin) != "" {
+	if a.Bin != "" && a.binsOwn(binAt(a.Bin)) {
 		return true
 	}
 	// one with no Bin, as its command's name is other tools' too, that
@@ -537,8 +599,9 @@ func (a *Agent) Picks(f Field, cur map[string]string) []Option {
 }
 
 // Own reports whether o is a model the agent reaches on its own, not one of
-// magpie's catalog: what Picks leaves out on the user's word.
-func Own(o Option) bool { return o.Ref == "" && o.Value != "" }
+// magpie's catalog: what Picks leaves out on the user's word. One magpie's
+// list shows the agent too (Served) is the list's to show or not.
+func Own(o Option) bool { return o.Ref == "" && o.Value != "" && !o.Served }
 
 // OwnModels reports whether one of a's pickers that picks among magpie's
 // catalog offers models of the agent's own too, which Picks can leave out.
@@ -564,9 +627,11 @@ func Detected() []*Agent {
 }
 
 // Find resolves a user-typed name (id, alias, or unique prefix).
-func Find(q string) (*Agent, error) {
+func Find(q string) (*Agent, error) { return FindIn(All(), q) }
+
+// FindIn is Find among all, a list of All() the caller has built already.
+func FindIn(all []*Agent, q string) (*Agent, error) {
 	q = strings.ToLower(strings.TrimSpace(q))
-	all := All()
 	var prefix []*Agent
 	for _, a := range all {
 		if strings.EqualFold(a.ID, q) { // codex@wsl:Ubuntu

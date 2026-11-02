@@ -60,6 +60,11 @@ type otelExporter struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	client     *http.Client
+	// moved is whether the global proxy moved since the exporter's last
+	// send: its transport is its own, not a dispatch, and pools an HTTPS
+	// collector's HTTP/2 connection by the collector alone, so a switch
+	// left the batches after it on the old proxy's connection (#4824)
+	moved      func() bool
 	salt       [8]byte
 	last       time.Time
 	dropped    atomic.Uint64
@@ -107,7 +112,7 @@ func (x *Exporter) Serve() func() {
 func newOTelExporter() *otelExporter {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &otelExporter{queue: make(chan otelItem, otelQueueSize), stop: make(chan struct{}), done: make(chan struct{}), ctx: ctx, cancel: cancel,
-		last: time.Now(), client: &http.Client{Timeout: 3 * time.Second,
+		last: time.Now(), moved: netproxy.Watch(), client: &http.Client{Timeout: 3 * time.Second,
 			Transport:     &http.Transport{Proxy: netproxy.Func, MaxIdleConnsPerHost: 2, IdleConnTimeout: 90 * time.Second},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	rand.Read(e.salt[:])
@@ -217,10 +222,20 @@ func (e *otelExporter) run(every time.Duration) {
 	defer close(e.done)
 	defer e.cancel()
 	defer e.client.CloseIdleConnections()
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
+	// the timer runs only while the batch holds something, so an idle
+	// exporter doesn't wake every few seconds (#3185)
+	timer := time.NewTimer(every)
+	timer.Stop()
+	defer timer.Stop()
 	batch := make([]otelItem, 0, otelBatchSize)
+	add := func(it otelItem) {
+		if len(batch) == 0 {
+			timer.Reset(every)
+		}
+		batch = append(batch, it)
+	}
 	flush := func() {
+		timer.Stop()
 		e.flush(batch)
 		for _, it := range batch {
 			if n := int64(recordBytes(it.record)); n > 0 {
@@ -232,11 +247,11 @@ func (e *otelExporter) run(every time.Duration) {
 	for {
 		select {
 		case it := <-e.queue:
-			batch = append(batch, it)
+			add(it)
 			if len(batch) == otelBatchSize {
 				flush()
 			}
-		case <-ticker.C:
+		case <-timer.C:
 			flush()
 		case <-e.stop:
 			for {
@@ -328,6 +343,9 @@ func (e *otelExporter) send(config settings.OTel, signal string, payload any) {
 			req.Header.Set(k, v)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if e.moved != nil && e.moved() {
+			e.client.CloseIdleConnections()
+		}
 		res, err := e.client.Do(req)
 		retry := err != nil
 		if res != nil {

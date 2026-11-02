@@ -99,6 +99,7 @@ func pricedRoutes(routes []gateway.Route) []routeJSON {
 	pub := publicRefs()
 	for _, r := range routes {
 		r = publicRoute(r, pub)
+		r.Usage = cacheCounted(r.Usage)
 		recs := make([]usage.Record, len(r.Usage))
 		for i, u := range r.Usage {
 			recs[i] = u.PricingRecord()
@@ -117,6 +118,32 @@ func pricedRoutes(routes []gateway.Route) []routeJSON {
 		out = append(out, routeJSON{Route: r, SessionTitle: name, Cost: sum.Cost, Priced: priced, Unpriced: sum.Unpriced})
 	}
 	return out
+}
+
+// cacheCounted marks the usage of a vendor that counts no cache as such,
+// kept before its plugin said so (usage.CountsNoCache): its hit rate is
+// none rather than 0% (#3464). us is copied before it is changed.
+func cacheCounted(us []gateway.RouteUsage) []gateway.RouteUsage {
+	var out []gateway.RouteUsage
+	for i, u := range us {
+		if u.CacheUnknown || !cacheNotCounted(u) {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(us)
+		}
+		out[i].CacheUnknown = true
+	}
+	if out == nil {
+		return us
+	}
+	return out
+}
+
+// cacheNotCounted is whether u's vendor counted no cache for it: it said
+// so, or it never does and none was recorded.
+func cacheNotCounted(u gateway.RouteUsage) bool {
+	return u.CacheUnknown || u.CacheRead+u.CacheWrite == 0 && usage.CountsNoCache(u.Provider)
 }
 
 // publicRefs is provider.PublicRef, each ref looked up once: a page of
@@ -173,16 +200,33 @@ func publicRoute(r gateway.Route, pub func(string) string) gateway.Route {
 
 // mainView is the tab the window is asked to open on, as the page's view
 // parameter: the Routing page on one request (req, its id) when the tray
-// panel's Routing tab asks for it, or the Usage page's Requests on one
+// panel's Routing tab asks for it, Masking on one request's record (key)
+// when a masked call's badge there does, or the Usage page's Requests on one
 // provider or agent when its Usage tab does, its Overview (the allowances)
-// when a menu-bar cell's click does. Anything but an id, or a name of the
-// kind a provider or an agent has, is dropped.
+// when a menu-bar cell's click does, or Plugins' Discover, looking for what
+// the panel's add sheet found nothing by (q), when its More in Plugins
+// does. Anything but an id, a name of the kind a provider or an agent has,
+// or a line of text to look for, is dropped.
 func mainView(q url.Values) string {
 	view := q.Get("view")
 	switch view {
+	case "plugins":
+		// q, even empty, says Discover: without it the page opens on the
+		// tab visited last (#3579)
+		if f, ok := q["q"]; ok {
+			s := ""
+			if mainFind.MatchString(f[0]) {
+				s = f[0]
+			}
+			view += "&q=" + url.QueryEscape(s)
+		}
 	case "routing":
 		if id, err := strconv.ParseInt(q.Get("req"), 10, 64); err == nil && id > 0 {
 			view += "&req=" + strconv.FormatInt(id, 10)
+		}
+	case "masking":
+		if key, err := strconv.ParseInt(q.Get("key"), 10, 64); err == nil && key > 0 {
+			view += "&key=" + strconv.FormatInt(key, 10)
 		}
 	case "usage":
 		if tab := q.Get("tab"); tab == "requests" || tab == "usage" {
@@ -207,6 +251,9 @@ func mainView(q url.Values) string {
 
 // mainName is the id of a provider or an agent.
 var mainName = regexp.MustCompile(`^[A-Za-z0-9._@:/ -]{1,80}$`)
+
+// mainFind is a line of text to look for, as a search field holds one.
+var mainFind = regexp.MustCompile(`^[^\x00-\x1f\x7f]{0,100}$`)
 
 // mainURL is the window's page for a view as mainView gives it, the
 // request's id kept as its own parameter (the panel's link to one request,
@@ -352,7 +399,28 @@ func traceRoutes(mux *http.ServeMux) {
 		day := r.URL.Query().Get("day")
 		days, routes, cut := gateway.History(day)
 		rememberTitleHistory(day, routes)
-		writeJSON(rw, map[string]any{"days": days, "routes": pricedRoutes(routes), "cut": cut})
+		out := map[string]any{"days": days, "routes": pricedRoutes(routes), "cut": cut}
+		if day == "" {
+			// the live page's accounts and keys say tried and answered of
+			// the day the Usage page reads, not of the last few requests
+			// the trace still keeps (#3351)
+			out["tallies"] = gateway.DayTallies()
+		}
+		writeJSON(rw, out)
+	})
+	// the report saved of a request held too long before routing, for its
+	// row's Copy Report: the app's log goes only to stderr, which its user
+	// can't reach. A magpie serving the gateway for this one (OwnerTrace)
+	// saves it in the same folder.
+	mux.HandleFunc("GET /api/gateway/held/{name}", func(rw http.ResponseWriter, r *http.Request) {
+		text, err := gateway.HeldReport(r.PathValue("name"))
+		if err != nil {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(rw).Encode(map[string]string{"error": "This report is no longer kept: magpie keeps the last 5."})
+			return
+		}
+		writeJSON(rw, map[string]string{"text": text})
 	})
 	// an account's rest lifted by hand: verified with its vendor, say
 	mux.HandleFunc("POST /api/gateway/unrest", func(rw http.ResponseWriter, r *http.Request) {

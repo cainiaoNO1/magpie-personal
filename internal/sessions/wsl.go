@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,11 @@ type WSLHome struct {
 	Distro  string
 	Home    string
 	Running bool
+	// Open maps a path under Home to where it can be read from Windows:
+	// a folder that is a link in the distro (~/.codex → /mnt/c/…) can't
+	// be followed through \\wsl.localhost (#4502), so what is below it is
+	// read where the link leads. nil reads every path as it is.
+	Open func(string) string
 }
 
 // WSLHomes are the WSL distros to read sessions in; nil (none) unless
@@ -67,15 +73,19 @@ var wslAgents = []struct{ agent, dir string }{
 	{"claude", ".claude"},
 	{"codex", ".codex"},
 	{"pi", filepath.Join(".pi", "agent")},
+	{"raft", ".slock"},
 	{"omp", filepath.Join(".omp", "agent")},
 	{"kimi", ".kimi-code"},
 }
 
 // wslScan lists the session files under a distro's home.
-func wslScan(home string) []file {
+func wslScan(h WSLHome) []file {
 	var out []file
 	for _, a := range wslAgents {
-		dir := filepath.Join(home, a.dir)
+		dir := filepath.Join(h.Home, a.dir)
+		if h.Open != nil {
+			dir = h.Open(dir)
+		}
 		switch a.agent {
 		case "claude":
 			out = append(out, ccFiles("claude", dir)...)
@@ -83,6 +93,8 @@ func wslScan(home string) []file {
 			out = append(out, codexFilesIn(dir)...)
 		case "pi":
 			out = append(out, piFilesIn(dir, "")...)
+		case "raft":
+			out = append(out, raftFilesIn(dir)...)
 		case "omp":
 			out = append(out, ompFilesIn(dir)...)
 		case "kimi":
@@ -133,7 +145,8 @@ func wslListPath() string { return filepath.Join(filepath.Dir(CachePath()), "ses
 // as last listed; a listing is started behind when the last is older than
 // wslRelist.
 func wslFiles(agents ...string) []file {
-	if !wslLooking() {
+	agents = slices.DeleteFunc(slices.Clone(agents), func(a string) bool { return !Reads(a) })
+	if len(agents) == 0 || !wslLooking() {
 		return nil
 	}
 	wslSess.Lock()
@@ -190,9 +203,10 @@ func wslFiles(agents ...string) []file {
 	for _, n := range names {
 		l := wslSess.lists[n]
 		cold := !l.Running || !up[n]
+		in := &fileMore{wsl: n} // the distro's files share it
 		for _, e := range l.Files {
 			if want[e.Agent] {
-				out = append(out, file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: e.Mod, wsl: n, cold: cold})
+				out = append(out, file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: e.Mod, more: in, cold: cold})
 			}
 		}
 	}
@@ -222,7 +236,7 @@ func wslList(gen uint64, done chan struct{}) {
 			continue
 		}
 		l := &wslListing{Home: h.Home, Running: true, Files: []wslEntry{}}
-		for _, f := range wslScan(h.Home) {
+		for _, f := range wslScan(h) {
 			l.Files = append(l.Files, wslEntry{Agent: f.agent, Key: f.key, Path: f.path, Main: f.main, Size: f.size, Mod: f.mod})
 		}
 		lists[h.Distro] = l
@@ -329,7 +343,7 @@ func wslHomeOf(distro string) string {
 func wslForget(fs []file) {
 	gone := map[string]bool{}
 	for _, f := range fs {
-		if f.wsl != "" {
+		if f.m().wsl != "" {
 			gone[f.path] = true
 		}
 	}

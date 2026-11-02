@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/yetone/magpie/internal/gwmw"
 	"github.com/yetone/magpie/internal/maskrec"
@@ -78,6 +81,10 @@ func TestMaskedRequestIsRecorded(t *testing.T) {
 	if !found {
 		t.Fatalf("route %d not in the trace", r.Route)
 	}
+	// the GUI opens the record by this key: a JS number would round it
+	if b, _ := json.Marshal(Masked{Key: r.Key}); !strings.Contains(string(b), `"key":"`+strconv.FormatInt(r.Key, 10)+`"`) {
+		t.Fatalf("masked's key not a string: %s", b)
+	}
 	if c, ok := s.RouteCall(r.Route); !ok || c.Masked == nil || c.Masked.Distinct != 2 {
 		t.Fatalf("call's masked: %+v %v", c.Masked, ok)
 	}
@@ -115,5 +122,40 @@ func TestSnipSharedByNearValues(t *testing.T) {
 	got := snipsOf(sent, []gwmw.Hit{{Placeholder: p}, {Placeholder: q}})
 	if got[p] == "" || got[p] != got[q] || !strings.Contains(got[p], q) {
 		t.Fatalf("snips = %q", got)
+	}
+}
+
+// A body is copied for a masked record only when the record keeps it:
+// with nothing masked there is no record, and one over maskrec.SentMax
+// keeps none of it. Converting every chat body to a string for it copied
+// a 45 MiB Codex turn whole on each request (#4004).
+func TestMaskedBodyCopiedOnlyWhenKept(t *testing.T) {
+	body := []byte(strings.Repeat("x", 2<<20))
+	if n := allocated(func() { _ = sentOf(maskHits{}, body) }); n > 64<<10 {
+		t.Fatalf("nothing masked: %d bytes allocated for a %d byte body", n, len(body))
+	}
+	if got := sentOf(maskHits{n: 1}, body); got != string(body) {
+		t.Fatal("a masked body under SentMax isn't kept as sent")
+	}
+	big := []byte(strings.Repeat("y", maskrec.SentMax+1))
+	if n := allocated(func() { _ = sentOf(maskHits{n: 1}, big) }); n > 64<<10 {
+		t.Fatalf("over SentMax: %d bytes allocated", n)
+	}
+}
+
+// A snip is the text around a value, never a window into the request:
+// a value that is a whole JSON string came back as a substring of the
+// body, and a record holding it kept the whole request (#2278).
+func TestSnipsHoldNoneOfTheBody(t *testing.T) {
+	const p = "{{API_KEY_ccccdddd}}"
+	sent := `{"api_key":"` + p + `","input":"` + strings.Repeat("a", 1<<20) + `"}`
+	snips := snipsOf(sent, []gwmw.Hit{{Placeholder: p}})
+	got, ok := snips[p]
+	if !ok || got != p {
+		t.Fatalf("snips: %q", snips)
+	}
+	start := uintptr(unsafe.Pointer(unsafe.StringData(sent)))
+	if at := uintptr(unsafe.Pointer(unsafe.StringData(got))); at >= start && at < start+uintptr(len(sent)) {
+		t.Fatal("the snip is a window into the request body, which it keeps whole")
 	}
 }

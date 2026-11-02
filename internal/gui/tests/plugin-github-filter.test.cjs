@@ -73,6 +73,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const ctx = await browser.newContext({ viewport: { width: 980, height: 860 } });
       const page = await ctx.newPage();
       page.setDefaultTimeout(6000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], fetched = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server("en", fetched, []));
@@ -93,6 +94,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const ctx = await browser.newContext({ viewport: { width, height: 860 } });
         const page = await ctx.newPage();
         page.setDefaultTimeout(6000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], fetched = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, fetched));
@@ -111,7 +113,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           // two of them, a provider and a middleware, are already here, as
           // the page's own cards say
           const have = sec.locator(".pm-ghhave .opt");
-          const wantHave = async (rs) => [await tr("All") + " · " + rs.length, await tr("Installed") + " · " + rs.filter(here).length, await tr("Not installed") + " · " + rs.filter((r) => !here(r)).length];
+          const wantHave = async (rs) => [await tr("All"), await tr("Installed") + " · " + rs.filter(here).length, await tr("Not installed") + " · " + rs.filter((r) => !here(r)).length];
           assert.deepEqual(await have.allTextContents(), await wantHave(GH.repos));
           assert.equal(await sec.locator(".pm-ghhave .opt.on").textContent(), (await wantHave(GH.repos))[0]);
           assert.deepEqual((await sec.locator(".pm-card.have .pm-name b").allInnerTexts()).sort(), names(GH.repos.filter(here)));

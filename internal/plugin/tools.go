@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -107,9 +109,37 @@ func noteTools(loaded []Loaded) {
 	if len(m) == 0 && errors.Is(err, fs.ErrNotExist) {
 		return
 	}
+	defer filememo.Forget() // the gateway follows this note (Written)
 	if err := writeWhole(toolsPath(), append(b, '\n')); err != nil {
 		log.Printf("plugin tools: noting them: %v", err)
+		return
 	}
+	if f := ToolsNoted; f != nil {
+		go f()
+	}
+}
+
+// ToolsNoted is called once the note of which plugins give tools has
+// changed: the library gives a plugin that gives tools a server of its
+// own then (library/plugin_tools.go), which can't be imported here.
+var ToolsNoted func()
+
+// ReadList is plugins.json, or an error when it couldn't be read or
+// parsed: the plugins installed are then unknown, never none. No file is
+// no plugin.
+func ReadList() (List, error) {
+	b, err := lastgood.Read(listPath(), lastgood.JSON)
+	if errors.Is(err, fs.ErrNotExist) {
+		return List{}, nil
+	}
+	if err != nil {
+		return List{}, err
+	}
+	var l List
+	if err := json.Unmarshal(b, &l); err != nil {
+		return List{}, fmt.Errorf("%s: %w", listPath(), err)
+	}
+	return l, nil
 }
 
 // ToolsOn counts the plugins on in plugins.json that gave tools when the

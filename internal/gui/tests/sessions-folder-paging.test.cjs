@@ -64,6 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const width of [1000, 380]) {
         const page = await (await browser.newContext({ viewport: { width, height: 640 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(10000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message + " " + e.stack));
         await page.route("**/*", serve(lang));
@@ -111,6 +112,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await page.mouse.move(width / 2, 320);
           await page.mouse.wheel(0, -40000);
           await page.waitForFunction(() => document.querySelector("#view-sessions").scrollTop === 0);
+          await view.locator(".sm-select").click();
           await view.locator(".sm-bar .sm-check").check();
           assert.equal(await view.locator(".sm-bar .sm-count").textContent(), w.all);
           await view.locator(".sm-bar .sm-check").uncheck();

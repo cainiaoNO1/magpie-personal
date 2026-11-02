@@ -13,6 +13,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"slices"
 	"strconv"
@@ -37,17 +38,19 @@ type keptBody struct {
 	id   int64
 	from provider.Protocol
 	body []byte
+	// plain: body went unmasked, and is masked when its text is read
+	plain bool
 }
 
 // keepBody keeps a request's masked body for its prompt's text, dropping
 // the oldest past promptBodies or promptBodiesMax.
-func (t *trace) keepBody(id int64, from provider.Protocol, body []byte) {
+func (t *trace) keepBody(id int64, from provider.Protocol, body []byte, plain bool) {
 	if len(body) == 0 || len(body) > promptBodyMax {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.bodies = append(t.bodies, keptBody{id: id, from: from, body: body})
+	t.bodies = append(t.bodies, keptBody{id: id, from: from, body: body, plain: plain})
 	total := 0
 	for _, b := range t.bodies {
 		total += len(b.body)
@@ -56,6 +59,17 @@ func (t *trace) keepBody(id int64, from provider.Protocol, body []byte) {
 		total -= len(t.bodies[0].body)
 		t.bodies[0] = keptBody{}
 		t.bodies = t.bodies[1:]
+	}
+}
+
+// maskedBody puts body, masked, in place of route id's plain kept body.
+func (t *trace) maskedBody(id int64, body []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.bodies {
+		if t.bodies[i].id == id && t.bodies[i].plain {
+			t.bodies[i].body, t.bodies[i].plain = body, false
+		}
 	}
 }
 
@@ -103,6 +117,14 @@ func (s *Server) PromptText(id int64, kind string, withText bool) (PromptText, b
 	kb, ok := s.trace.keptBodyOf(id)
 	if !ok || !slices.Contains(partOrder, kind) {
 		return PromptText{}, false
+	}
+	if kb.plain {
+		// masked here, not on the request's way (#3973); kept masked for
+		// the next read
+		if kb.body = maskedCopy(context.Background(), kb.body); kb.body == nil {
+			return PromptText{}, false
+		}
+		s.trace.maskedBody(id, kb.body)
 	}
 	b, ok := promptPieces(kb.from, kb.body)
 	if !ok {
@@ -166,6 +188,10 @@ func boolInt(b bool) int {
 // read is the piece with its JSON laid out to be read: indented, or a
 // string's text when the JSON is a string.
 func (pc PromptPiece) read() PromptPiece {
+	if pc.img != nil {
+		pc.Src = promptImageSrc(pc.img)
+		pc.img = nil
+	}
 	if pc.raw == nil {
 		return pc
 	}
@@ -190,6 +216,58 @@ func (pc PromptPiece) read() PromptPiece {
 		pc.Text = string(raw)
 	}
 	return pc
+}
+
+// promptImageSrc is an image's source as a data: URL the GUI can draw: an
+// Anthropic source ({type: base64, media_type, data}), an image_url (a
+// string, or {url}) or Gemini's inlineData ({mimeType, data}). "" for an
+// image that is a link, a file id, or anything but base64 PNG, JPEG, GIF
+// or WebP: the GUI never fetches a picture from elsewhere, and an SVG
+// could carry script.
+func promptImageSrc(raw []byte) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return dataImage(s)
+	}
+	var src struct {
+		URL       string `json:"url"`
+		MediaType string `json:"media_type"`
+		MimeType  string `json:"mimeType"`
+		Data      string `json:"data"`
+	}
+	if json.Unmarshal(raw, &src) != nil {
+		return ""
+	}
+	if src.URL != "" {
+		return dataImage(src.URL)
+	}
+	mt := src.MediaType
+	if mt == "" {
+		mt = src.MimeType
+	}
+	return dataImage("data:" + mt + ";base64," + src.Data)
+}
+
+// dataImage is u when it is a base64 data: URL of a picture the GUI
+// draws, else "".
+func dataImage(u string) string {
+	head, data, ok := strings.Cut(u, ",")
+	if !ok || data == "" {
+		return ""
+	}
+	switch strings.ToLower(head) {
+	case "data:image/png;base64", "data:image/jpeg;base64", "data:image/jpg;base64",
+		"data:image/gif;base64", "data:image/webp;base64":
+	default:
+		return ""
+	}
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '/' || c == '=') {
+			return ""
+		}
+	}
+	return u
 }
 
 // promptPieces reads a request's prompt keeping each item's text.

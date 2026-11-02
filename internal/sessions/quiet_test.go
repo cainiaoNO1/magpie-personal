@@ -69,6 +69,11 @@ func TestWarmReadsOnlyInItsSlots(t *testing.T) {
 	if got := len(List(0)); got < 12 {
 		t.Fatalf("%d sessions listed", got)
 	}
+	// the index read each file's calls along (callsRide): a line more in
+	// each leaves the calls something of their own to read
+	for _, s := range CallSources() {
+		appendText(t, s.Path, "\n")
+	}
 	warm("the calls", func() {
 		for _, s := range CallSources() {
 			ReadCallSource(s)
@@ -122,5 +127,21 @@ func TestLongReadKeepsWhatItRead(t *testing.T) {
 	case <-early:
 	default:
 		t.Fatal("nothing kept on disk until every file was read")
+	}
+}
+
+// With a page waiting, the index reads with half the cores, not twice
+// them: a first read held 22 of 32 cores beside the user's apps (#3238).
+func TestAskedIndexReadsWithHalfTheCores(t *testing.T) {
+	inZone(t, 0)
+	claude, _ := setup(t)
+	moreSessions(t, claude, 4*scanReaders()+8)
+	parseHook = func() { time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { parseHook = nil })
+	readPeak.Store(0)
+	defer Ask()()
+	statsAt(0, statsNow)
+	if n := readPeak.Load(); n > int32(scanReaders()) || n < int32(min(2, scanReaders())) {
+		t.Fatalf("the index read %d files at once, want 2 to %d", n, scanReaders())
 	}
 }

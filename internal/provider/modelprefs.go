@@ -247,26 +247,9 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	all := p.Known(model)
-	var keep []string
-	for _, e := range efforts {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" {
-			continue
-		}
-		if len(all) == 0 && !slices.Contains(Levels, e) {
-			return false, fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
-		}
-		if len(all) > 0 && !slices.Contains(all, e) {
-			return false, fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
-		}
-		if !slices.Contains(keep, e) {
-			keep = append(keep, e)
-		}
-	}
-	keep = effortsKept(all, keep) // in the vendor's order
-	if len(keep) == len(all) {
-		keep = nil
+	keep, err := keptEfforts(p, model, efforts)
+	if err != nil {
+		return false, err
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
@@ -289,6 +272,35 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// keptEfforts is the levels a user keeps of p's model as ModelEfforts
+// holds them: those given, checked against the model's own (or Levels, for
+// a model with none known), in the vendor's order, and none when they are
+// all of them.
+func keptEfforts(p *Provider, model string, efforts []string) ([]string, error) {
+	all := p.Known(model)
+	var keep []string
+	for _, e := range efforts {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if len(all) == 0 && !slices.Contains(Levels, e) {
+			return nil, fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
+		}
+		if len(all) > 0 && !slices.Contains(all, e) {
+			return nil, fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
+		}
+		if !slices.Contains(keep, e) {
+			keep = append(keep, e)
+		}
+	}
+	keep = effortsKept(all, keep) // in the vendor's order
+	if len(keep) == len(all) {
+		keep = nil
+	}
+	return keep, nil
 }
 
 // SetModelReasonless says whether a provider's model, spelt
@@ -339,9 +351,9 @@ func Reasonless(pid, model string) bool {
 // models, by model id.
 func (p Provider) ModelEfforts() map[string][]string {
 	out := map[string][]string{}
-	for k, es := range settings.Load().ModelEfforts {
+	for k, es := range settings.Shared().ModelEfforts {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && len(es) > 0 {
-			out[m] = es
+			out[m] = slices.Clone(es) // the shared settings' own
 		}
 	}
 	return out
@@ -457,12 +469,40 @@ func setModelAPI(ref, api string) (bool, error) {
 
 // ModelAPI is the API the user said p's model is asked on, when p has a
 // URL for it still.
+//
+// The Providers page asks it of each model of every provider's list, and
+// most have no API set: that is looked up first, and the protocols p
+// speaks are counted, not listed (a list made for each model was 12 MB of
+// what forty polls allocated with real accounts).
 func (p Provider) ModelAPI(model string) (Protocol, bool) {
-	if len(p.Speaks()) < 2 {
+	proto, ok := p.apiSet(model)
+	if !ok {
 		return "", false
 	}
+	n := 0
+	for range p.speaking {
+		if n++; n == 2 {
+			break
+		}
+	}
+	return p.modelAPIAmong(n, proto)
+}
+
+// apiSet is the API the user set model to be asked on, false with
+// none.
+func (p Provider) apiSet(model string) (Protocol, bool) {
 	proto := Protocol(heldSettings().ModelAPIs[p.ID+"/"+model])
-	if proto == "" || !modelAPI(proto) || p.Base(proto) == "" {
+	return proto, proto != ""
+}
+
+// modelAPIAmong is ModelAPI with the number of protocols p speaks (up to
+// two) and the one set found already.
+func (p Provider) modelAPIAmong(speaks int, proto Protocol) (Protocol, bool) {
+	// Vertex AI's model id says its one API (ListedAPIs)
+	if speaks < 2 || p.IsVertex() {
+		return "", false
+	}
+	if !modelAPI(proto) || p.Base(proto) == "" {
 		return "", false
 	}
 	return proto, true
@@ -499,6 +539,10 @@ type ModelPref struct {
 	// Kind is what the model makes, as SetModelKind takes it: "image",
 	// "video", or "" for what its vendor's list and name say (#1399)
 	Kind *string `json:"kind,omitempty"`
+	// ID is the id the model is listed by at its provider, as SetModelID
+	// takes it: "" for the provider's own. It is applied after every
+	// other change of the save, so those go with the model to its id.
+	ID *string `json:"id,omitempty"`
 }
 
 // SetModelPrefs makes the changes to a provider's models, by model id, as
@@ -568,9 +612,43 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 				}
 			}
 		}
-		return nil
+		return setModelIDs(pid, prefs, set)
 	}()
 	return touchedIf(changed, err)
+}
+
+// setModelIDs gives the models of one save the ids it lists them by
+// (ModelPref.ID), after everything else it changed. Two of them given one
+// id are refused before either is: one id is one model of a provider.
+func setModelIDs(pid string, prefs map[string]ModelPref, set func(bool, error) error) error {
+	to := map[string]string{}
+	for _, model := range slices.Sorted(maps.Keys(prefs)) {
+		id := prefs[model].ID
+		if id == nil {
+			continue
+		}
+		want := strings.TrimSpace(*id)
+		if want == "" {
+			continue
+		}
+		if other, ok := to[want]; ok {
+			return fmt.Errorf("%s and %s can't both be listed as %s: one id is one model of a provider", other, model, want)
+		}
+		to[want] = model
+	}
+	for want, model := range to {
+		if other := prefs[want].ID; other != nil && want != model && strings.TrimSpace(*other) != want {
+			return fmt.Errorf("%s is listed as another id in the same save that gives its id to %s: save one, then the other", want, model)
+		}
+	}
+	for _, model := range slices.Sorted(maps.Keys(prefs)) {
+		if id := prefs[model].ID; id != nil {
+			if _, c, err := setModelID(pid+"/"+model, *id); set(c, err) != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // setModelSame says which model a provider's model, spelt "provider/model",
@@ -699,9 +777,11 @@ func (e Entry) Label() string {
 
 // Labels are how an agent's list names each of es, in order: as Label, or,
 // when the user wants names plain (settings' PlainNames, #335), by the
-// name alone — but for two or more the list would call the same, as a
-// routing group found for a model is called with that model left in the
-// list, which keep their provider's after it to tell them apart. With
+// name alone — but for two or more models the list would call the same,
+// which keep their provider's after it to tell them apart, and a routing
+// group named as anything else in the list (the group found for a model,
+// with that model left in it), which keeps "· routing group" while the
+// model it is named as stays plain. With
 // their own names plain (PlainOwnNames, #92), a name the user gave — a
 // model's, or a routing group's they made (#868: "· routing group" was
 // what an agent's narrow menu cut off) — is that name just as they wrote
@@ -711,16 +791,29 @@ func Labels(es []Entry) []string {
 	s := heldSettings()
 	plain := s.PlainNames
 	own := !plain && s.PlainOwnNames
-	same := map[string]int{}
+	// models and groups by name: a group is told apart by its "· routing
+	// group", so a model it shares a name with stays plain (nb5p on
+	// Discord: one relay's GPT-6.1 Terra kept "· MyGateway" beside the
+	// group found for it while its GPT-6.1 Sol had none)
+	models, groups := map[string]int{}, map[string]int{}
 	if plain || own {
 		for _, e := range es {
-			same[strings.ToLower(e.PlainName())]++
+			if e.Group == "" {
+				models[strings.ToLower(e.PlainName())]++
+			} else {
+				groups[strings.ToLower(e.PlainName())]++
+			}
 		}
 	}
 	for i, e := range es {
 		out[i] = e.Label()
 		mine := own && (e.Default != "" || e.Named)
-		if name := e.PlainName(); (plain || mine) && name != "" && same[strings.ToLower(name)] == 1 {
+		name := e.PlainName()
+		if !(plain || mine) || name == "" {
+			continue
+		}
+		k := strings.ToLower(name)
+		if e.Group == "" && models[k] == 1 || e.Group != "" && models[k] == 0 && groups[k] == 1 {
 			out[i] = name
 		}
 	}
@@ -865,7 +958,7 @@ func SetPlainNames(on bool) error {
 // ModelNames are the names the user gave the provider's models, by model id.
 func (p Provider) ModelNames() map[string]string {
 	out := map[string]string{}
-	for k, n := range settings.Load().ModelNames {
+	for k, n := range settings.Shared().ModelNames {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && n != "" {
 			out[m] = n
 		}
@@ -911,7 +1004,7 @@ func ServesModel(p Provider, model string) bool { return p.serves(model) }
 // model asked for by the name the vendor serves it under is not read as
 // another one.
 func UpstreamName(p Provider, model string) string {
-	return UpstreamNameIn(settings.Load().ModelWires, p.ID, model)
+	return UpstreamNameIn(settings.Load().Wires(), p.ID, model)
 }
 
 // UpstreamNameIn is UpstreamName over a settings' ModelWires already read,
@@ -941,7 +1034,7 @@ func UpstreamNameIn(wires map[string]string, pid, model string) string {
 // asks for gemini-3.7-flash-high and gemini-3.7-flash-low each by its own,
 // rather than for the one id whatever level the effort picked.
 func UpstreamNameAs(p Provider, model, sent string) string {
-	return UpstreamNameAsIn(settings.Load().ModelWires, p.ID, model, sent)
+	return UpstreamNameAsIn(settings.Load().Wires(), p.ID, model, sent)
 }
 
 // UpstreamNameAsIn is UpstreamNameAs over a settings' ModelWires already
@@ -1000,6 +1093,14 @@ func SentNameIn(wires map[string]string, pid, model, effort string) string {
 // the route, which is holding the provider, asks about the account and lets
 // the gateway's dispatch (codeAssistID, on the same agent) be the one rule.
 func SentNameOnIn(wires map[string]string, pid, account, model, effort string) string {
+	if account == "antigravity" {
+		// a family the user lists by an id of theirs (SetModelID) goes
+		// out as the variant of its own id the effort picks, as the
+		// gateway's envelope does (codeAssistBody)
+		if own := modelIDsOf(pid).ownOf(model); own != model {
+			return UpstreamNameAsIn(wires, pid, own, antigravitySentID(account, own, effort))
+		}
+	}
 	return UpstreamNameAsIn(wires, pid, model, antigravitySentID(account, model, effort))
 }
 

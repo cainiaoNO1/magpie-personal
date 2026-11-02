@@ -31,7 +31,9 @@ const entry = (tok, name, title, reads, file = "index.html") => ({
 const TITLES = { zh: "用量速览", "zh-TW": "用量速覽", ja: "使用量の概要" };
 const pages = [
   { ...entry(GLANCE, "glance", "Usage glance", ["usage:summary"]), titles: TITLES },
-  entry(PROBE, "probe", "Probe", []),
+  // a page with a local service (magpie.page.service), as /api/plugin-pages
+  // lists it to a browser: relative to the page's address
+  { ...entry(PROBE, "probe", "Probe", []), service: "_magpie/service/" },
   entry(OPEN, "open", "Probe without a policy", []),
   entry(BROKEN, "broken", "Broken", []),
 ];
@@ -54,6 +56,7 @@ const PROBE_HTML = `<!doctype html><meta charset="utf-8"><script src="_magpie/br
 const PROBE_JS = `(async () => {
   const out = {};
   await magpie.ready;
+  out.service = magpie.service;
   try { const r = await fetch("/api/state?probe=1"); out.fetch = "status " + r.status; } catch (e) { out.fetch = "refused"; }
   try { out.storage = typeof localStorage.length; } catch (e) { out.storage = "refused"; }
   try { out.cookie = document.cookie; } catch (e) { out.cookie = "refused"; }
@@ -79,9 +82,11 @@ function server(lang, seen, plugins) {
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:${JSON.stringify(lang)},theme:"light",web:false};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
+    if (url.pathname === "/api/providers" && seen.slow) await new Promise((r) => setTimeout(r, seen.slow));
     if (url.pathname === "/api/providers") return json({ providers: [], presets: [], excluded: [], gateway: { running: true, window: true }, plugins: [] });
     if (url.pathname === "/api/groups") return json({ groups: [], pools: [] });
-    if (url.pathname === "/api/plugin-pages") return json(pages);
+    if (url.pathname === "/api/plugin-pages") return json(seen.pages ? seen.pages() : pages);
+    if (url.pathname === "/api/plugins/off" && seen.off) return json(seen.off(req.postDataJSON()));
     if (url.pathname === "/api/plugin-pages/read") {
       const b = req.postDataJSON();
       seen.reads.push(b);
@@ -141,6 +146,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width, height: 700 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(8000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const seen = { api: [], reads: [], options: [] };
@@ -160,9 +166,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         if (lang === "de") {
           // a new language retitles the tab, and back
           await page.evaluate(() => setLocale("ja"));
-          await page.waitForFunction(() => document.querySelector("#nav button[data-plugin-page] span").textContent === "使用量の概要");
+          await page.waitForFunction(() => document.querySelector("#nav button[data-plugin-page] span")?.textContent === "使用量の概要");
           await page.evaluate(() => setLocale("de"));
-          await page.waitForFunction(() => document.querySelector("#nav button[data-plugin-page] span").textContent === "Usage glance");
+          await page.waitForFunction(() => document.querySelector("#nav button[data-plugin-page] span")?.textContent === "Usage glance");
         }
         // no frame until the page is looked at
         assert.equal(await page.locator("iframe.plugin-frame").count(), 0, `${where}: nothing loaded unseen`);
@@ -171,7 +177,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.evaluate(() => show("plugin-glance"));
         const glance = await frameReady(page, GLANCE);
         assert.equal(await page.locator("#view-plugin-glance iframe").getAttribute("sandbox"), "allow-scripts", where);
-        await glance.waitForFunction(() => document.getElementById("cost").textContent === "$0.50");
+        await glance.waitForFunction(() => document.getElementById("cost")?.textContent === "$0.50");
         assert.equal(await glance.locator("#calls").textContent(), "12 calls, 1234 tokens", where);
         assert.deepEqual(seen.reads.map((r) => [r.spec, r.read]), [["/x/glance", "usage:summary"]], where);
         assert.equal(await glance.evaluate(() => document.documentElement.lang), lang, `${where}: the window's language`);
@@ -180,7 +186,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await glance.waitForFunction(() => document.documentElement.dataset.theme === "dark");
         assert.ok((await glance.evaluate(() => document.documentElement.style.getPropertyValue("--magpie-bg"))).length > 0, `${where}: the tokens`);
         await glance.locator("#hide").click();
-        await glance.waitForFunction(() => document.getElementById("cost").textContent === "");
+        await glance.waitForFunction(() => document.getElementById("cost")?.textContent === "");
         assert.deepEqual(seen.options.map((o) => [o.spec, o.options.hideCost]), [["/x/glance", true]], `${where}: its own options`);
         // the frame fits the window
         assert.ok(await page.evaluate(() => { const v = document.querySelector("#view-plugin-glance"); const f = v.querySelector("iframe"); return f.getBoundingClientRect().width <= v.clientWidth + 1 && v.scrollWidth <= v.clientWidth + 1 && f.getBoundingClientRect().height > 200; }), `${where}: fits`);
@@ -199,6 +205,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.equal(probe.read2, "Probe doesn't ask to read providers:list", where);
           assert.equal(seen.api.length, 0, `${where}: nothing reached /api`);
           assert.equal(seen.reads.length, 1, `${where}: an undeclared read never reached the server`);
+          // its service, where the window's server serves it: an absolute
+          // address under the page's own
+          assert.match(probe.service, new RegExp(`^https?://[^/]+/_magpie/plugin/${PROBE}/_magpie/service/$`), `${where}: magpie.service`);
           // a page with no stylesheet of its own reads as part of the window
           const win = await page.evaluate(() => {
             const d = document.createElement("div");
@@ -224,6 +233,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.equal(open.fetch.startsWith("status") || open.fetch === "refused", true, where);
           assert.equal(seen.api.length, 1, `${where}: the fetch went out`);
           assert.equal(seen.api[0].origin, "null", `${where}: as Origin: null`);
+          assert.equal(open.service, "", `${where}: a page with no service has no magpie.service`);
           assert.ok(!seen.api[0].cookie, `${where}: without a cookie`);
 
           // a message from another frame naming a page is nothing
@@ -259,6 +269,47 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     }
   });
 
+  // a page plugin switched on gets its tab at once, not when the Plugins
+  // page is next opened (the owner: it took a long while to show), and
+  // switched off loses it; the providers' answer, slow here, isn't
+  // waited for
+  test(`${engine}: a page plugin's tab comes and goes with it`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    for (const lang of ["en", "zh"]) {
+      const where = `${engine} ${lang}`;
+      const page = await (await browser.newContext({ viewport: { width: 980, height: 820 } })).newPage();
+      page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      const mine = structuredClone(plugins);
+      const quiet = mine.plugins.find((e) => e.spec === "/x/quiet-page");
+      const seen = { api: [], reads: [], options: [] };
+      seen.pages = () => quiet.off ? [] : [entry(PROBE, "quiet-page", "Quiet", [])];
+      seen.off = (b) => { quiet.off = b.off; seen.slow = 4000; return mine; };
+      await page.route("**/*", server(lang, seen, mine));
+      await page.goto("http://magpie.test/?view=plugins");
+      const view = page.locator("#view-plugins");
+      const installed = await page.evaluate(() => t("Installed"));
+      await page.locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: installed }).first().click();
+      const row = view.locator(".pm-row").filter({ has: page.locator(".name", { hasText: "quiet-page" }) });
+      const tab = page.locator('#nav button[data-plugin-page][data-view="plugin-quiet-page"]');
+      const tr = (k) => page.evaluate((k) => t(k), k);
+      await row.waitFor();
+      assert.equal(await tab.count(), 0, where);
+      await row.getByRole("button", { name: await tr("Switch on"), exact: true }).click();
+      await tab.waitFor({ timeout: 2000 });
+      assert.ok(await view.isVisible(), `${where}: the page stays`);
+      await page.waitForTimeout(4200);
+      seen.slow = 0;
+      await row.getByRole("button", { name: await tr("Switch off"), exact: true }).click();
+      await tab.waitFor({ state: "detached", timeout: 2000 });
+      assert.deepEqual(errors, [], where);
+      await page.context().close();
+    }
+  });
+
   test(`${engine}: Plugins says what a page may read before it is on`, async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
@@ -267,6 +318,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const where = `${engine} ${lang} ${width}`;
         const page = await (await browser.newContext({ viewport: { width, height: 820 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, { api: [], reads: [], options: [] }, plugins));

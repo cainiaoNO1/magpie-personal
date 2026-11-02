@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -89,5 +90,38 @@ func TestBackupLibraryRoundTrip(t *testing.T) {
 	}
 	if iv, _ := library.ReadInstructions(); iv.Shared != "Be brief." {
 		t.Fatalf("instructions: %q", iv.Shared)
+	}
+}
+
+// 1Shin on Discord: an export joined $HOME/Downloads. On a Linux desktop in
+// Chinese, Downloads is ~/下载 (user-dirs.dirs); the export goes there, and
+// to home\Downloads when the folder named there isn't one.
+func TestExportGoesToTheSystemsDownloads(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("user-dirs.dirs is read on Linux and the BSDs (appdir's tests fake Windows' known folder)")
+	}
+	h := sandboxHome(t)
+	os.MkdirAll(filepath.Join(h, ".config"), 0o700)
+	os.WriteFile(filepath.Join(h, ".config", "user-dirs.dirs"), []byte("XDG_DOWNLOAD_DIR=\"$HOME/下载\"\n"), 0o600)
+	mux := http.NewServeMux()
+	backupRoutes(mux, folderOnly{})
+	export := func() string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/backup/export", strings.NewReader(`{"pass":"pw"}`)))
+		if w.Code != 200 {
+			t.Fatalf("export: %d %s", w.Code, w.Body)
+		}
+		var out struct{ Path string }
+		json.Unmarshal(w.Body.Bytes(), &out)
+		return filepath.Dir(filepath.Join(h, strings.TrimPrefix(out.Path, "~")))
+	}
+	os.MkdirAll(filepath.Join(h, "Downloads"), 0o700)
+	if got, want := export(), filepath.Join(h, "Downloads"); got != want {
+		t.Errorf("~/下载 not made yet: saved in %s, want %s", got, want)
+	}
+	os.MkdirAll(filepath.Join(h, "下载"), 0o700)
+	if got, want := export(), filepath.Join(h, "下载"); got != want {
+		t.Errorf("saved in %s, want %s", got, want)
 	}
 }

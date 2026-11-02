@@ -73,6 +73,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], posts = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, posts, 0));
@@ -116,6 +117,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(300);
         assert.equal(await scrolled(), top, "no click moved the page");
 
+        // back up past Currency's rows, taller now their lines wrap whole
+        // (arculongus on Discord)
+        await reach(page, opts.nth(0));
         await opts.nth(0).click();
         assert.equal((await posted(3)).turnDoneAlert, 0, "Off saves 0");
         assert.equal(await page.locator("#turnDoneRow").evaluate((e) => getComputedStyle(e).borderLeftWidth), "0px");
@@ -128,6 +132,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const page = await (await browser.newContext({ viewport: { width: 900, height: 600 }, reducedMotion: "reduce" })).newPage();
     t.after(() => browser.close());
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     await page.route("**/*", server("en", [], 45));
     await watchSettingsReads(page);
     await page.goto("http://magpie.test/?view=settings&tab=usage");

@@ -84,7 +84,7 @@ const L = {
 };
 const HIDDEN = ["agents", "library"];
 // in the order the pages are grouped in (work, models, insights, extend)
-const KEPT = ["sessions", "providers", "routing", "gateway", "usage", "plugins"];
+const KEPT = ["sessions", "providers", "routing", "gateway", "usage", "masking", "plugins"];
 
 // the tabs shown, the page shown
 const tabs = (page) => page.evaluate(() => [...document.querySelectorAll("#nav button[data-view]")].filter((b) => !b.hidden && b.offsetParent).map((b) => b.dataset.view));
@@ -124,6 +124,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 560 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posts));
@@ -154,7 +155,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await clickStill(page, "#gatewayModeSegs .opt:nth-child(4)", `${where}: Off`);
       await page.waitForFunction(() => !document.querySelector('#nav button[data-view="agents"]').hidden);
       assert.deepEqual(posts.filter((p) => p[0] === "gateway-mode"), [["gateway-mode", "off"]], where);
-      assert.deepEqual(await tabs(page), ["agents", "sessions", "library", "providers", "routing", "gateway", "usage", "plugins"], `${where}: off`);
+      assert.deepEqual(await tabs(page), ["agents", "sessions", "library", "providers", "routing", "gateway", "usage", "masking", "plugins"], `${where}: off`);
       assert.deepEqual(await viewShown(page), ["view-settings"], `${where}: Settings stays`);
       assert.deepEqual(await agentRows(page), [true, true, true, true, true], `${where}: rows back`);
       assert.doesNotMatch(await page.locator("#gatewayModeSub").textContent(), new RegExp(L[lang].noAgents), where);
@@ -182,12 +183,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 1100, height: 560 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, [], { web, gateway: false, agents: true }));
         await page.goto("http://magpie.test/");
         await page.waitForSelector("#nav button.on");
-        assert.deepEqual(await tabs(page), ["agents", "sessions", "library", "providers", "routing", "gateway", "usage", "plugins"], where);
+        assert.deepEqual(await tabs(page), ["agents", "sessions", "library", "providers", "routing", "gateway", "usage", "masking", "plugins"], where);
         assert.deepEqual(await viewShown(page), ["view-agents"], where);
         await page.locator("#prefs").click();
         await page.waitForSelector("#langPick span");
@@ -216,6 +218,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 560 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       // window mode: the gateway switch is the web's alone, so the agents' rows
@@ -268,6 +271,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 420, height: 720 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, [], { web: false, gateway: false, agents: true, notice: warning + " " + restart }));

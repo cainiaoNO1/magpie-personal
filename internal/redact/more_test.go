@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // allKinds is Mask personal data with every category turned on.
@@ -15,7 +16,8 @@ func allKinds() Options {
 	return o
 }
 
-// Each category finds its values, as the placeholder of its kind, and puts
+// Each category finds its values, as the placeholder of its kind (an IP as
+// a public-ip- name, a user name as a made-up one), and puts
 // them back; and leaves alone what only looks like one: versions,
 // timestamps, hashes, UUIDs, ordinary dates, model ids, URLs in code.
 func TestMoreKinds(t *testing.T) {
@@ -58,7 +60,7 @@ func TestMoreKinds(t *testing.T) {
 		{in: `C:\Users\Rina Kato\Desktop\a.txt`, gone: []find{{"Rina Kato", "USERNAME"}}, kept: []string{`C:\Users\`, `\Desktop\a.txt`}},
 		{in: `"path":"C:\\Users\\rkato\\proj"`, gone: []find{{"rkato", "USERNAME"}}},
 		{in: "file:///Users/rinak/notes.md", gone: []find{{"rinak", "USERNAME"}}},
-		{in: "see /Users/rinak.", gone: []find{{"rinak", "USERNAME"}}, kept: []string{"}}."}},
+		{in: "see /Users/rinak.", gone: []find{{"rinak", "USERNAME"}}, kept: []string{standInOf("rinak") + "."}},
 		// user@host
 		{in: "rinak@rina-mbp:~/src$ ls", gone: []find{{"rinak", "USERNAME"}, {"rina-mbp", "HOSTNAME"}}, kept: []string{":~/src$ ls"}},
 		{in: "[deploy@build-07 ~]$ make", gone: []find{{"deploy", "USERNAME"}, {"build-07", "HOSTNAME"}}},
@@ -94,7 +96,19 @@ func TestMoreKinds(t *testing.T) {
 			if strings.Contains(unmarked(out), g.value) {
 				t.Errorf("%q: %q still in %q", c.in, g.value, out)
 			}
-			if p := placeholder(g.kind, g.value); !strings.Contains(out, p) {
+			p := placeholder(g.kind, g.value)
+			if g.kind == "USERNAME" {
+				p = standInOf(g.value) // a made-up name (shape.go)
+			}
+			if at, n, ok := ipStandIns(g.value); g.kind == "IP" && ok {
+				for i := 0; i < n; i++ { // a public-ip- name (shape.go)
+					if strings.Contains(out, at(i)) {
+						p = at(i)
+						break
+					}
+				}
+			}
+			if !strings.Contains(out, p) {
 				t.Errorf("%q: no %s placeholder for %q in %q", c.in, g.kind, g.value, out)
 			}
 		}
@@ -150,6 +164,35 @@ func TestMoreKindsLeaveAlone(t *testing.T) {
 		"claude-opus-4-1-20250805", "gpt-5.1-codex-mini", "3f786850e387550fdab836ed7e6dc881de23001b", "123e4567-e89b-12d3-a456-426614174000",
 		"go 1.26.8", "uses: actions/checkout@v4", "const url = 'https://api.acme.io/v1/users'", "2026-10-10 12:00:00",
 	} {
+		if out, n := Mask(s, allKinds()); n != 0 || out != s {
+			t.Errorf("%q masked as %q", s, out)
+		}
+	}
+}
+
+// A date in the last year or ahead after a birthday's word is the day the
+// agent runs on (JackyCcao on X: 2026-10-24 masked in 122 requests), not a
+// birthday; one over a year ago still is. Today is held, and then real.
+func TestBirthdayNotRecent(t *testing.T) {
+	defer func(c func() time.Time) { dateClock = c }(dateClock)
+	dateClock = func() time.Time { return time.Date(2026, 10, 24, 9, 30, 0, 0, time.Local) }
+	for _, s := range []string{
+		"生日：2026-10-24", "birthday: 2026-10-23", "DOB: 10/24/2026", "出生于2026年4月1日", "born on May 1, 2026",
+		`{"birth_date": "2025-10-25"}`, "生日：2026-12-01", "Geburtsdatum: 01.01.2027",
+	} {
+		if out, n := Mask(s, allKinds()); n != 0 || out != s {
+			t.Errorf("%q masked as %q", s, out)
+		}
+	}
+	for _, s := range []string{"生日：2025-10-23", "DOB: 10/24/2024", "born on May 1, 1990"} {
+		if out, _ := Mask(s, allKinds()); !strings.Contains(out, "BIRTHDAY") {
+			t.Errorf("%q not masked: %q", s, out)
+		}
+	}
+	dateClock = time.Now
+	now := time.Now()
+	for _, d := range []time.Time{now, now.AddDate(0, 0, -1), now.AddDate(0, 0, 1)} {
+		s := "生日：" + d.Format("2006-01-02")
 		if out, n := Mask(s, allKinds()); n != 0 || out != s {
 			t.Errorf("%q masked as %q", s, out)
 		}
@@ -215,9 +258,9 @@ func TestMoreKindsKnown(t *testing.T) {
 	o := allKinds()
 	a, _ := Mask("cwd /Users/rkatodev/src", o)
 	b, _ := Mask("rkatodev@rina-mbp:~$ ls", o)
-	p := placeholder("USERNAME", "rkatodev")
+	p := standInOf("rkatodev")
 	if !strings.Contains(a, p) || !strings.Contains(b, p) {
-		t.Fatalf("not one placeholder: %q %q", a, b)
+		t.Fatalf("not one made-up name: %q %q", a, b)
 	}
 	reply := "Your account rkatodev has no access to 34.117.59.82."
 	Mask("connect 34.117.59.82", o)

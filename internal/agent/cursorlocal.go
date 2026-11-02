@@ -85,7 +85,7 @@ func cursorLocalRoots() []string {
 		return out
 	}
 	return append(proc.SystemDirs("/opt", "/usr/share", "/usr/lib"), filepath.Join(home, ".local", "share"), filepath.Join(home, "Applications"),
-		filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"), filepath.Join(home, "Downloads"), home)
+		filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"), appdir.Downloads(), filepath.Join(home, "Downloads"), home)
 }
 
 // findCursorLocal is the program of the Cursor Private Inference among the

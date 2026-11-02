@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
@@ -22,13 +23,62 @@ import (
 // pluginAgent is what logins.json lists a plugin provider's accounts as.
 func pluginAgent(pp plugin.Provider) string { return "plugin:" + pp.ID }
 
-// pluginLabels names each account: its id, else the end of its key, else
-// what it signed in with; a name two share gets the account's slot.
-func pluginLabels(pp plugin.Provider) map[string]string {
+// publicPlugin is whether every way to sign in to the plugin's provider is
+// keyless, its credential one the plugin gives whatever is typed: OpenCode
+// Zen Free's shared "public". Such an account is nobody's, so with
+// subscription accounts off (#1535, discovery.go) it is still listed and
+// served. Before, Zen Free signed in all the same with them off, the
+// Plugins page said so, and magpie listed it nowhere (lileo0668 on
+// Discord: "signed in, but magpie can't list it").
+func publicPlugin(pp plugin.Provider) bool {
+	if len(pp.Methods) == 0 {
+		return false
+	}
+	for _, m := range pp.Methods {
+		if m.Type != "api" || !m.Keyless {
+			return false
+		}
+	}
+	return true
+}
+
+// publicLogins are a public plugin's accounts while subscription accounts
+// are off, read from the plugin alone: logins.json and plugin-auth.json
+// are left unread then (discovery.go), so the first is in use and every
+// one is on.
+func publicLogins(pp plugin.Provider) []pluginLogin {
+	agent, labels := pluginAgent(pp), pluginLabels(pp, nil)
+	var out []pluginLogin
+	for _, a := range pp.Accounts {
+		saved := savedLogin{Agent: agent, User: labels[a.Key], Home: a.Key, On: true}
+		out = append(out, pluginLogin{sideLogin{Login{Agent: agent, User: saved.User, On: true}, saved}, a})
+	}
+	if len(out) > 0 {
+		out[0].Active = true
+	}
+	return out
+}
+
+// publicAccount is whether p is a public plugin's provider (publicPlugin),
+// served while subscription accounts are off.
+func (p Provider) publicAccount() bool {
+	return p.IsPlugin() && publicPlugin(*p.Account.plugin)
+}
+
+// pluginLabels names each account: by named (the agent's own, as the
+// agent is signed in now), else its id, else the end of its key, else what
+// it signed in with; a name two share gets the account's slot. The slot
+// goes on after the own name, so the own account never reads as another
+// signed in to the same one (dev on Discord: ZCode's, its id "ZCode",
+// named as one magpie signed in, and Remove on that one took the own).
+func pluginLabels(pp plugin.Provider, named map[string]string) map[string]string {
 	out := map[string]string{}
 	seen := map[string]int{}
 	for _, a := range pp.Accounts {
-		l := a.AccountID
+		l := named[a.Key]
+		if l == "" {
+			l = a.AccountID
+		}
 		if l == "" && a.Hint != "" {
 			l = "API key …" + a.Hint
 		}
@@ -51,9 +101,46 @@ func pluginLabels(pp plugin.Provider) map[string]string {
 	return out
 }
 
+// pluginNames is pluginLabels as the accounts list names them, the
+// agent's own as the agent is signed in now.
+func pluginNames(pp plugin.Provider) map[string]string {
+	_, named := pluginOwnNames(pp)
+	return pluginLabels(pp, named)
+}
+
+// pluginOwnNames tells the provider's accounts that are the agent's own,
+// and names them as the agent is signed in now, where that can be read.
+func pluginOwnNames(pp plugin.Provider) (own map[string]bool, named map[string]string) {
+	own, named = map[string]bool{}, map[string]string{}
+	listed := map[string]bool{}
+	for _, a := range pp.Accounts {
+		listed[a.Key] = true
+	}
+	for k, a := range plugin.Auths(pp.ID) {
+		if listed[k] && pluginOwn(pp.ID, a) {
+			own[k] = true
+		}
+	}
+	if len(own) > 0 {
+		if u := pluginOwnUser(pp.ID); u != "" {
+			for k := range own {
+				named[k] = u
+			}
+		}
+	}
+	return own, named
+}
+
 type pluginLogin struct {
 	sideLogin
 	acct plugin.Account
+}
+
+// cliMarked says a sign-in carries the "cli" mark of the agent's own
+// sign-in: true as a mover wrote it before, "true" as the Devin plugin
+// writes it since 0.1.24 (plugins #396).
+func cliMarked(md map[string]any) bool {
+	return md["cli"] == true || md["cli"] == "true"
 }
 
 // pluginOwn says a plugin sign-in is the agent's own (its CLI's, its
@@ -64,7 +151,7 @@ func pluginOwn(id string, auth map[string]any) bool {
 	md, _ := auth["metadata"].(map[string]any)
 	switch id {
 	case "devin", CommandCodePlanID:
-		return md["cli"] == true
+		return cliMarked(md)
 	case "grok":
 		return samePath(str(auth["refresh"]), GrokHome())
 	case "cursor":
@@ -116,70 +203,87 @@ var pluginOwnUser = func(id string) string {
 	return ""
 }
 
+// pluginLoginLocks counts the times pluginLogins took loginsMu (a test
+// reads it).
+var pluginLoginLocks atomic.Int64
+
 // pluginLogins are the provider's accounts, the first in use first. What
 // plugin-auth.json keeps is the truth: logins.json follows it. The agent's
 // own account is named as the agent is signed in now; removed in magpie,
 // it is only hidden, and shows again once the agent signs in anew.
 func pluginLogins(pp plugin.Provider) []pluginLogin {
 	if settings.AccountDiscoveryOff() {
+		if publicPlugin(pp) {
+			return publicLogins(pp)
+		}
 		return nil
 	}
 	agent := pluginAgent(pp)
-	labels := pluginLabels(pp)
 	byKey := map[string]plugin.Account{}
 	for _, a := range pp.Accounts {
 		byKey[a.Key] = a
 	}
-	own := map[string]bool{}
-	for k, a := range plugin.Auths(pp.ID) {
-		if _, ok := byKey[k]; ok && pluginOwn(pp.ID, a) {
-			own[k] = true
-		}
-	}
+	own, named := pluginOwnNames(pp)
 	mark := ""
 	if len(own) > 0 {
-		if u := pluginOwnUser(pp.ID); u != "" {
-			for k := range own {
-				labels[k] = u
-			}
-		}
 		mark = ownMark(pp.ID)
 	}
-	loginsMu.Lock()
-	ls := readLogins()
-	changed := false
-	have := map[string]bool{}
-	keep := ls[:0]
-	for _, l := range ls {
-		if l.Agent == agent {
-			if _, ok := byKey[l.Home]; !ok || have[l.Home] {
-				changed = true // signed out, or listed twice
-				continue
+	labels := pluginLabels(pp, named)
+	// looked at as kept, and copied only at the first change: nearly
+	// every list changes nothing, and a page's state lists each plugin's
+	settle := func(ls []savedLogin) ([]savedLogin, bool) {
+		changed := false
+		have := map[string]bool{}
+		var keep []savedLogin
+		for i, l := range ls {
+			drop, edit := false, false
+			if l.Agent == agent {
+				if _, ok := byKey[l.Home]; !ok || have[l.Home] {
+					drop = true // signed out, or listed twice
+				} else {
+					have[l.Home] = true
+					renamed := l.User != labels[l.Home]
+					if renamed {
+						l.User, edit = labels[l.Home], true
+					}
+					// the agent's own, hidden, shows again once the agent signs
+					// in anew: told by its sign-in's mark, else by another account
+					if l.Hidden != "" && own[l.Home] && (mark != "" && mark != l.Hidden || mark == "" && l.Hidden == hiddenNoMark && renamed) {
+						l.Hidden, edit = "", true
+					}
+				}
 			}
-			have[l.Home] = true
-			renamed := l.User != labels[l.Home]
-			if renamed {
-				l.User, changed = labels[l.Home], true
+			if (drop || edit) && !changed {
+				keep, changed = slices.Clone(ls[:i:i]), true
 			}
-			// the agent's own, hidden, shows again once the agent signs
-			// in anew: told by its sign-in's mark, else by another account
-			if l.Hidden != "" && own[l.Home] && (mark != "" && mark != l.Hidden || mark == "" && l.Hidden == hiddenNoMark && renamed) {
-				l.Hidden, changed = "", true
+			if changed && !drop {
+				keep = append(keep, l)
 			}
 		}
-		keep = append(keep, l)
-	}
-	ls = keep
-	for _, a := range pp.Accounts {
-		if !have[a.Key] {
-			ls = append(ls, savedLogin{Agent: agent, User: labels[a.Key], Home: a.Key, On: true, Seen: time.Now().UTC().Truncate(time.Second)})
-			changed = true
+		if changed {
+			ls = keep
 		}
+		for _, a := range pp.Accounts {
+			if !have[a.Key] {
+				if !changed {
+					ls, changed = slices.Clone(ls), true
+				}
+				ls = append(ls, savedLogin{Agent: agent, User: labels[a.Key], Home: a.Key, On: true, Seen: time.Now().UTC().Truncate(time.Second)})
+			}
+		}
+		return ls, changed
 	}
-	if changed {
-		_ = writeLogins(ls)
+	// what nothing changes takes no lock: taken, it opens logins.json's
+	// lock file, across magpies, and /api/providers lists every plugin
+	// (a fifth of its CPU). A change is made from a read under it.
+	if _, changed := settle(sharedLogins()); changed {
+		pluginLoginLocks.Add(1)
+		loginsMu.Lock()
+		if ls, changed := settle(sharedLogins()); changed {
+			_ = writeLogins(ls)
+		}
+		loginsMu.Unlock()
 	}
-	loginsMu.Unlock()
 	var out []pluginLogin
 	for _, l := range sideLogins(agent, "", func(l savedLogin) bool { _, ok := byKey[l.Home]; return ok && l.Hidden == "" }) {
 		l.Lapsed = l.saved.Lapsed // a refused sign-in shows on the account
@@ -252,10 +356,15 @@ func forgetPluginLogin(pp plugin.Provider, user string) error {
 		}
 	}
 	key := ls[i].saved.Home
-	err := editSideLogin(agent, user, func(saved []savedLogin, j int) ([]savedLogin, error) {
+	isNext := listedMatch(agent, next, ls)
+	err := editListedLogin(agent, user, ls, func(saved []savedLogin, j int) ([]savedLogin, error) {
+		n := -1
+		if next != "" {
+			n = pickSaved(saved, isNext)
+		}
 		for k := range saved {
 			if saved[k].Agent == agent && (first || k == j) {
-				saved[k].First = next != "" && strings.EqualFold(saved[k].User, next)
+				saved[k].First = k == n
 			}
 		}
 		if own {
@@ -309,6 +418,18 @@ func keepPluginPlan(pp plugin.Provider, key, plan string) {
 			return
 		}
 	}
+}
+
+// PluginAccountUser is who the plugin id's account at key is (an email, a
+// login), as the Routing trace and the request log name it: "" when no
+// account is kept there.
+func PluginAccountUser(id, key string) string {
+	for _, l := range readLogins() {
+		if l.Agent == "plugin:"+id && l.Home == key {
+			return l.User
+		}
+	}
+	return ""
 }
 
 // notePluginLapse marks the account at key lapsed when its vendor refused
@@ -401,7 +522,7 @@ func clearPluginLapse(saved plugin.Saved) {
 	notePluginLapseOf("plugin:"+saved.Provider, saved.Account, http.StatusOK, toldNow, nil)
 	for _, pp := range plugin.Cached() {
 		if pp.ID == saved.Provider {
-			if user := pluginLabels(pp)[saved.Account]; user != "" {
+			if user := pluginNames(pp)[saved.Account]; user != "" {
 				StaleAllowance(pluginAgent(pp), user)
 			}
 		}

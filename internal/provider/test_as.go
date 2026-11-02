@@ -10,6 +10,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/yetone/magpie/internal/filememo"
 )
 
 // A relay can serve only the agents its plan is sold for, and tell them by
@@ -80,6 +83,11 @@ func (p Provider) TestsAs(client string) string {
 	if p.IsOpenCode() || p.IsCline() || p.IsKilo() {
 		return "its requests are asked as its own client already"
 	}
+	if p.IsVertex() && client == ClientCodex {
+		// Google's own endpoints, as Claude Code's are below: its chat
+		// completions serve the partner models alone
+		return "a test is asked as Codex only of a relay"
+	}
 	if clientProto(client, p.Speaks()) == "" {
 		if client == ClientClaudeCode {
 			return "it has no Anthropic endpoint, where Claude Code's requests go"
@@ -113,11 +121,13 @@ func clientShapesPath() string {
 
 // shapeHeader is one of client's headers a test asks with: not what is
 // this conversation's or this turn's alone (its session, thread or turn,
-// a request id, a subagent's kind), nor the betas this request asked for,
-// nor anything that signs it.
+// a request id, a subagent's kind, the Codex window it came from, a
+// retry's count), nor the betas this request asked for, nor anything that
+// signs it. One that differs between two of the client's windows would
+// write the file again on each of their requests (#3394).
 func shapeHeader(k string) bool {
 	k = strings.ToLower(k)
-	for _, s := range []string{"session", "thread", "conversation", "turn", "request-id", "authorization", "api-key", "attestation", "subagent", "luna-reserve"} {
+	for _, s := range []string{"session", "thread", "conversation", "turn", "request-id", "window", "retry-count", "authorization", "api-key", "attestation", "subagent", "luna-reserve"} {
 		if strings.Contains(k, s) {
 			return false
 		}
@@ -173,12 +183,25 @@ func equalHeaders(a, b http.Header) bool {
 	return a != nil && maps.EqualFunc(map[string][]string(a), map[string][]string(b), slices.Equal[[]string])
 }
 
+// shapeParses counts client-shapes.json's parses (a test reads it).
+var shapeParses atomic.Int64
+
 // clientShape is the headers last seen from client, nil when it hasn't
-// come through.
+// come through. The file is parsed once until it changes: /api/providers
+// asks it of every relay a list shows, and read anew each time it was a
+// sixth of the list's CPU. A copy goes out, as a request's headers take
+// it.
 func clientShape(client string) http.Header {
-	clientShapes.Lock()
-	defer clientShapes.Unlock()
-	return readClientShapes(clientShapesPath())[client]
+	m, err := filememo.Read("client-shapes", clientShapesPath(), func(b []byte) (map[string]http.Header, error) {
+		shapeParses.Add(1)
+		m := map[string]http.Header{}
+		json.Unmarshal(b, &m)
+		return m, nil
+	})
+	if err != nil {
+		return nil
+	}
+	return m[client].Clone()
 }
 
 // clientHeaders puts client's headers on a test request: those last seen

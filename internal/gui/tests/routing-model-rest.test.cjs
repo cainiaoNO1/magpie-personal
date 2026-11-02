@@ -90,6 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], lifted = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, lifted));
@@ -111,6 +112,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         for (const user of ["old@x.test", "me@x.test"]) {
           const opus = stage(user, "claude-opus-5.5"), flash = stage(user, "gemini-3.8-flash");
           await opus.first().waitFor({ state: "attached" });
+          // a row is in before the frame that says how it rests: under load
+          // the class was read before that frame came (#2115)
+          await opus.first().evaluate((e) => new Promise((done) => { const ok = () => e.classList.contains("rest") ? done() : requestAnimationFrame(ok); setTimeout(done, 5000); ok(); }));
           assert.equal(await opus.count(), 1, `${user}: one Opus row`);
           assert.equal(await flash.count(), 1, `${user}: one gemini-3.8-flash row`);
           assert(!(await flash.evaluate((e) => e.classList.contains("rest"))), `${user}: gemini-3.8-flash rests with Opus`);

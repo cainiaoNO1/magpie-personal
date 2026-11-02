@@ -90,6 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, [], theme));
@@ -97,6 +98,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#nav").getByRole("button", { name: nav[lang], exact: true }).click();
         const view = page.locator("#view-sessions");
         await view.locator('.row.sm-sess[data-id="a-login"]').waitFor();
+        await view.locator(".sm-select").click();
         // read once the box's own transitions end: reduced motion makes every
         // transition .01ms, not none, and Chromium under load can still show
         // one at its start two frames after the click

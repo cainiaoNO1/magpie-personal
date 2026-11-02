@@ -52,26 +52,7 @@ type callerCtx struct{}
 // headers that said so off it.
 func withCaller(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader)), ua: r.Header.Get("User-Agent")}
-		if dshCompacts(r.Header) {
-			c.compact = boundedSession(r.Header.Get(dshCompactHeader))
-		}
-		for _, h := range sessionHeaders {
-			if v := boundedSession(r.Header.Get(h)); v != "" {
-				c.native = [2]string{h, v}
-				break
-			}
-		}
-		if strings.HasPrefix(r.Header.Get("User-Agent"), "magpie/") {
-			if a := label(r.Header.Get(AgentHeader)); a != "" {
-				c.agent = usage.AgentOf(a)
-				c.via = label(r.Header.Get(ViaHeader))
-				if c.via == "" {
-					c.via, _, _ = net.SplitHostPort(r.RemoteAddr)
-				}
-			}
-		}
-		ctx := context.WithValue(r.Context(), callerCtx{}, c)
+		ctx := context.WithValue(r.Context(), callerCtx{}, callerFrom(r))
 		if searchingFrom(r) {
 			// another magpie's search: only the model itself searches
 			ctx = context.WithValue(ctx, searchingKey{}, true)
@@ -81,6 +62,35 @@ func withCaller(next http.Handler) http.Handler {
 		r.Header.Del(SearchingHeader)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// callerFrom reads who r is recorded as from its headers, before withCaller
+// takes magpie's own off: the one rule for every place that names a
+// request's agent (usage, sessions, the routing trace, the masking log,
+// the requests in flight), so another magpie's request is shown as the
+// agent that made it there, never as "magpie" (linkaww on Discord: the
+// masking log named magpie where usage named Pi).
+func callerFrom(r *http.Request) caller {
+	c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader)), ua: r.Header.Get("User-Agent")}
+	if dshCompacts(r.Header) {
+		c.compact = boundedSession(r.Header.Get(dshCompactHeader))
+	}
+	for _, h := range sessionHeaders {
+		if v := boundedSession(r.Header.Get(h)); v != "" {
+			c.native = [2]string{h, v}
+			break
+		}
+	}
+	if strings.HasPrefix(r.Header.Get("User-Agent"), "magpie/") {
+		if a := label(r.Header.Get(AgentHeader)); a != "" {
+			c.agent = usage.AgentOf(a)
+			c.via = label(r.Header.Get(ViaHeader))
+			if c.via == "" {
+				c.via, _, _ = net.SplitHostPort(r.RemoteAddr)
+			}
+		}
+	}
+	return c
 }
 
 // callerOf is who the request is recorded as.
@@ -114,8 +124,13 @@ func boundedSession(v string) string {
 // X-Magpie-Session and the agent's own header (session_id, …) — so the
 // other magpie records the call under it and keeps a conversation on its
 // account by it rather than by its first message (#672). Only a remote
-// magpie is sent them; a vendor never is.
+// magpie is sent them; a vendor never is. It is asked, too, to name the
+// vendor's model in its reply, as it did before a reply named the model
+// asked for: this magpie records what served the call from it (served,
+// swapped, routed; TestRemoteMagpieGroupNotSwapped), and gives its own
+// agent the name it asked for itself.
 func passOnCaller(ctx context.Context, req *http.Request) {
+	req.Header.Set(responseModelHeader, "vendor")
 	c, ok := ctx.Value(callerCtx{}).(caller)
 	if !ok {
 		return

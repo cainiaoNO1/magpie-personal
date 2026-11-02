@@ -117,6 +117,7 @@ type model struct {
 	bal       map[string]string
 	asked     bool // balances were asked for
 	groups    []provider.Group
+	provOff   map[string]bool // providers switched off, read with the groups
 	grow      int
 	shown     int    // groups from here on were removed: listed last, to bring back
 	gid       string // the group open
@@ -168,7 +169,7 @@ func Run(ready func()) error {
 	stop()
 	wait()
 	if served {
-		fmt.Fprintln(os.Stderr, gatewayGoneNote())
+		fmt.Fprintln(os.Stderr, keepGateway(connected(m.agents)))
 	}
 	return err
 }

@@ -100,6 +100,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
@@ -127,6 +128,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await menu.waitFor();
       assert.equal((await menu.locator(".pm-head").textContent()).trim(), w.head);
       assert.deepEqual(await menu.locator(".pm-item .pm-name").allTextContents(), ["omp", "omp"]);
+      assert.deepEqual(await menu.locator(".pm-item > .ic").evaluateAll((l) => l.map((e) => e.dataset.icon)), ["omp", "omp"], "each agent to continue in shows its icon");
       assert.deepEqual(await menu.locator(".pm-item .pm-note").allTextContents(), [w.copyNote, w.termNote]);
       assert.equal(await page.locator("select").count(), 0, "no native select");
       assert.equal(await carry.getAttribute("aria-expanded"), "true");

@@ -24,10 +24,6 @@ var kept = map[string]bool{
 	"stop_reason": true, "finish_reason": true, "status": true, "object": true, "event": true,
 }
 
-func keep(key, s string) bool {
-	return kept[key] || strings.HasPrefix(s, "data:")
-}
-
 // keepIn is keep for a request's string at path, with its ids kept too.
 // In a tool call's arguments (args) the keys are the tool's, not the
 // vendor's: a "signature", "name" or "user_id" there holds what the agent
@@ -69,12 +65,13 @@ var signatureKeys = []string{"signature", "thoughtSignature", "thought_signature
 // sealed with a signature: what is in them the vendor wrote and checks, so
 // it goes back exactly as the vendor wrote it. args are a tool call's
 // arguments (Anthropic's tool_use input, Gemini's functionCall args), whose
-// keys are the tool's own; nothing in them counts as sealed. defs are what
-// the agent defines for the vendor rather than says to the model
-// (definitions).
+// keys are the tool's own, as are those of Gemini's functionResponse
+// response, the structured result the tool gave; nothing in them counts
+// as sealed. defs are what the agent defines for the vendor rather than
+// says to the model (definitions).
 func scan(body []byte) (signed, args, defs []string) {
 	found := false
-	for _, k := range append(signatureKeys, "tool_use", "functionCall", "function_call") {
+	for _, k := range append(signatureKeys, "tool_use", "functionCall", "function_call", "functionResponse", "function_response") {
 		found = found || bytes.Contains(body, []byte(`"`+k+`"`))
 	}
 	for _, k := range defKeys {
@@ -99,7 +96,8 @@ func scan(body []byte) (signed, args, defs []string) {
 			t, _ := x["type"].(string)
 			for k, c := range x {
 				if k == "input" && (t == "tool_use" || t == "server_tool_use") ||
-					k == "args" && (key == "functionCall" || key == "function_call") {
+					k == "args" && (key == "functionCall" || key == "function_call") ||
+					k == "response" && (key == "functionResponse" || key == "function_response") {
 					args = append(args, join(path, k))
 					continue
 				}
@@ -214,7 +212,13 @@ func walk(b []byte, fn func(path, key, s string) string) (out []byte, ok bool) {
 		return b, true
 	}
 	w.out.Write(b[w.last:])
-	return w.out.Bytes(), true
+	out = w.out.Bytes()
+	if cap(out)-len(out) > len(out)/8 {
+		// placeholders longer than what they stand for grew it past the
+		// room made for it: held as it is, a doubled buffer (#3383)
+		out = bytes.Clone(out)
+	}
+	return out, true
 }
 
 type walker struct {
@@ -324,6 +328,12 @@ func (w *walker) value(i int, path, key string) (int, bool) {
 			return i, false
 		}
 		if t := w.fn(path, key, s); t != s {
+			if w.out.Cap() == 0 {
+				// the masked body is about the body's size: grown by
+				// doubling, its buffer was up to twice that, held as the
+				// request's body while it streams (#3383)
+				w.out.Grow(len(w.in) + len(w.in)/16 + 64)
+			}
 			w.out.Write(w.in[w.last:i])
 			w.out.WriteByte('"')
 			w.out.WriteString(jsonEscape(t))
@@ -353,10 +363,28 @@ func jsonEscape(s string) string {
 	return string(out[1 : len(out)-2]) // the quotes and the newline
 }
 
+// namedSecret says a string under a field named for a secret holds one,
+// whatever the value looks like: the rules judge a value by its shape, the
+// name by what a field so called carries (#2946) — {"api_key": "…"} with a
+// value no rule knows, an AKIA under access_key_id, a bearer token under
+// "Authorization". A short value, and one that stands for a variable
+// (${PASS}, <token>, ****), are left alone. It is asked only of a tool
+// call's arguments and a tool's structured result (args), whose keys are
+// the tool's: a key the vendor's protocol names (Anthropic's
+// mcp_servers[].authorization_token, a tool's own settings) is the
+// vendor's to read, and masked by its name, it would no longer work.
+func namedSecret(key, s string) bool {
+	return key != "" && len(s) >= 8 && notAVariable(s) && SecretName(key)
+}
+
 // MaskJSON masks the strings of a request body, and says how many values
 // it masked. A body that isn't JSON is masked as text.
 //
-// What a vendor sealed with a signature (a thinking block, Gemini's
+// In a tool call's arguments and a tool's structured result (args), a
+// field named for a secret has its value masked by its name, with secret
+// masking on (#2946). Anywhere else a key is the protocol's, and a value
+// is judged by its shape alone. What
+// a vendor sealed with a signature (a thinking block, Gemini's
 // thoughts, Responses' encrypted reasoning) is checked by the vendor
 // against the text it wrote, so it goes back as written: the values
 // masked elsewhere in the request become their placeholders again, which
@@ -369,15 +397,26 @@ func jsonEscape(s string) string {
 // placeholder: either way the text no longer matched its signature, and
 // Anthropic answers 400 "Invalid `signature` in `thinking` block".
 func MaskJSON(body []byte, o Options) ([]byte, int) {
+	o.sent = true
 	signed, args, defs := scan(body)
 	masked := func(path, key, s string) bool {
 		return !keepIn(path, key, s, args, defs) && (signed == nil || !under(path, signed))
 	}
+	// What the agent defines (its tools' and schemas' descriptions) is
+	// masked by the rules alone, as with the model off: it is the agent's
+	// or a tool server's text, the same in every request, and no one's
+	// conversation. Read by the model it was most of a request's text,
+	// 52,577 of Claude Code 2.1.296's 67,532 bytes, and on a 4-core
+	// server the first request waited out the gateway's 2 minutes while
+	// the model read it (niuniu_8964 on X); on three real Claude Code
+	// requests the model masked nothing there the rules didn't.
+	defsO := o
+	defsO.Model = nil
 	if o.Model != nil {
 		// the model is asked once, for all of the request's texts
 		var texts []string
 		if _, ok := walk(body, func(path, key, s string) string {
-			if masked(path, key, s) {
+			if masked(path, key, s) && !under(path, defs) {
 				texts = append(texts, s)
 			}
 			return s
@@ -388,18 +427,38 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 	total := 0
 	var seen []string // value, placeholder, value, placeholder…
 	put := func(kind, v string) string {
-		p := placeholder(kind, v)
+		p := o.put()(kind, v)
 		seen = append(seen, v, p)
 		return p
 	}
+	// the definitions after the rest, so a value the model found in what
+	// is said is masked in them too, as known
 	out, ok := walk(body, func(path, key, s string) string {
-		if !masked(path, key, s) {
+		if strings.HasPrefix(s, "data:") || signed != nil && under(path, signed) {
 			return s
 		}
-		t, n := mask(s, o, put)
+		if o.Secrets && under(path, args) && namedSecret(key, s) {
+			p := put("SECRET", s)
+			total++
+			return p
+		}
+		if !masked(path, key, s) || under(path, defs) {
+			return s
+		}
+		t, n := mask(s, o, put, asJSON(key, ""))
 		total += n
 		return t
 	})
+	if ok && len(defs) > 0 {
+		out, ok = walk(out, func(path, key, s string) string {
+			if !masked(path, key, s) || !under(path, defs) {
+				return s
+			}
+			t, n := mask(s, defsO, put, asJSON(key, ""))
+			total += n
+			return t
+		})
+	}
 	if !ok {
 		t, n := Mask(string(body), o)
 		return []byte(t), n
@@ -427,7 +486,8 @@ func MaskJSON(body []byte, o Options) ([]byte, int) {
 		// number or an address the vendor wrote of its own can be one
 		// masked in another conversation (13800138000 is in many), and
 		// masked, its text would no longer match its signature
-		t, n := apply(t, knownSpans(t, Options{Secrets: o.Secrets}), placeholder, o)
+		ko := Options{Secrets: o.Secrets, Route: o.Route}
+		t, n := apply(t, sentSpans(sentKnown, t, ko, func() []span { return knownSpans(t, ko) }), o.put(), o)
 		total += n
 		return t
 	})
@@ -461,20 +521,80 @@ func asJSON(key, eventType string) bool {
 	return key == "arguments" || key == "partial_json" || key == "delta" && strings.Contains(eventType, "arguments")
 }
 
-// RestoreJSON puts the values back in a response body.
-func RestoreJSON(body []byte) []byte {
-	if !bytes.Contains(body, []byte("{{")) {
-		return body
-	}
+// typeOf is the type a JSON object says it is, wherever its "type" is
+// among its keys. Read as the keys came, a Responses
+// function_call_arguments.delta whose "delta" came before its "type", as
+// a Go map writes them, had its value put back unescaped: a password
+// with a quote in it ended the arguments' string there, and the arguments
+// the agent put together were JSON no longer.
+func typeOf(data []byte) string {
 	typ := ""
-	out, ok := walk(body, func(path, key, s string) string {
+	walk(data, func(path, _, s string) string {
 		if path == "type" {
 			typ = s
 		}
-		return Restore(s, asJSON(key, typ))
+		return s
+	})
+	return typ
+}
+
+// RestoreJSON puts the values back in a response body.
+func RestoreJSON(body []byte) []byte { return restoreJSON(body, nil) }
+
+// restoreJSON is RestoreJSON, counting in put as restore does.
+func restoreJSON(body []byte, put map[string]int) []byte {
+	if !heldIn(body) && !hasShapes(body) {
+		return body
+	}
+	typ := typeOf(body)
+	out, ok := walk(body, func(path, key, s string) string {
+		return restore(s, asJSON(key, typ), put)
 	})
 	if !ok {
-		return []byte(Restore(string(body), false))
+		return []byte(restore(string(body), false, put))
 	}
 	return out
+}
+
+// heldIn says b may have a placeholder of a value held, in any of the
+// ways Restore takes one back: a kind, _ and the 8 of its hash, in any
+// case, with its braces or without. Looked for "{{" alone, a whole reply
+// whose model wrote PERSON_kb32hzkg or {PERSON_kb32hzkg} kept it, while a
+// stream had it put back.
+func heldIn(b []byte) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	if len(values) == 0 {
+		return false
+	}
+	for i := 0; ; {
+		j := bytes.IndexByte(b[i:], '_')
+		if j < 0 {
+			return false
+		}
+		i += j + 1
+		z := i + 8
+		if z > len(b) || z < len(b) && isWordByte(b[z]) || !base32Lower(b[i:z]) {
+			continue
+		}
+		hash := strings.ToLower(string(b[i:z]))
+		for k := range kinds {
+			if n := len(k); i-1 >= n && strings.EqualFold(string(b[i-1-n:i-1]), k) {
+				if _, ok := values["{{"+strings.ToUpper(k)+"_"+hash+"}}"]; ok {
+					return true
+				}
+			}
+		}
+	}
+}
+
+// base32Lower says b is of the letters a placeholder's hash has, in
+// either case.
+func base32Lower(b []byte) bool {
+	for _, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '2' && c <= '7') {
+			return false
+		}
+	}
+	return true
 }

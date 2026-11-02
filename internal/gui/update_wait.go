@@ -9,8 +9,10 @@ import (
 
 // A restart to update ends the gateway this process serves, and with it
 // whatever the agents have in flight through it (#577: an agent's reply
-// streaming, a Claude Code turn waiting on its caller's tool results). So a
-// restart asked for while the gateway is busy waits until it is idle:
+// streaming, a Claude Code turn waiting on its caller's tool results). On
+// a Mac or Linux it hands the gateway over instead (handover.go), and only
+// the Claude subscription's turns would be cut short (restartBusy). So a
+// restart asked for while those are busy waits until they are idle:
 // nothing in flight, no turn waiting on tools, and nothing ended in the
 // last idleSettle — the gap of a tool chain, an agent running a tool
 // between one request and the next. It waits waitMost at most; then the
@@ -32,7 +34,8 @@ var gatewayBusy = func() gateway.Busy {
 	return gateway.Busy{}
 }
 
-// waitRecheck asks the feed again before the restart (updater.recheck).
+// waitRecheck asks the feed again before the restart (updater.recheck),
+// asked when a click armed the wait.
 var waitRecheck = (*updater).recheck
 
 // idleAt is whether b leaves nothing for a restart at now to cut short.
@@ -41,13 +44,14 @@ func idleAt(b gateway.Busy, now time.Time) bool {
 }
 
 // idle is whether the gateway is idle now.
-func (u *updater) idle() bool { return idleAt(gatewayBusy(), time.Now()) }
+func (u *updater) idle() bool { return idleAt(restartBusy(), time.Now()) }
 
 // waitIdle has restart run once the gateway is idle; a wait under way
-// takes the newer restart (the window as it is now).
-func (u *updater) waitIdle(restart func() bool) {
+// takes the newer restart (the window as it is now). asked is a click's
+// (Restart to update), not Settings' AutoRestart's.
+func (u *updater) waitIdle(restart func() bool, asked bool) {
 	u.mu.Lock()
-	u.whenIdle, u.gaveUp = restart, false
+	u.whenIdle, u.gaveUp, u.waitAsked = restart, false, asked
 	if u.waiting {
 		u.mu.Unlock()
 		return
@@ -84,7 +88,7 @@ func (u *updater) waitingFor() (bool, gateway.Busy) {
 	if !w {
 		return false, gateway.Busy{}
 	}
-	return true, gatewayBusy()
+	return true, restartBusy()
 }
 
 func (u *updater) told() {
@@ -114,7 +118,7 @@ func (u *updater) waitFor(gen int) {
 			return
 		}
 		u.mu.Unlock()
-		b := gatewayBusy()
+		b := restartBusy()
 		if b.Requests != last.Requests || b.Tools != last.Tools {
 			last = b
 			u.told()
@@ -125,8 +129,11 @@ func (u *updater) waitFor(gen int) {
 		switch u.json().State {
 		case "ready":
 			// a newer version out since is downloaded first, and waited for
-			waitRecheck(u)
-			if u.json().State != "ready" {
+			u.mu.Lock()
+			asked := u.waitAsked
+			u.mu.Unlock()
+			waitRecheck(u, asked)
+			if u.asking() || u.json().State != "ready" {
 				continue
 			}
 		case "checking", "downloading":
@@ -170,7 +177,27 @@ func (u *updater) autoTick(s settings.Settings) {
 	if j := u.json(); j.State != "ready" || j.Latest == "" || j.Latest == skip {
 		return
 	}
-	u.waitIdle(restart)
+	u.waitIdle(restart, false)
+}
+
+// restartAsked is the tray's Restart to update, restart doing it. With the
+// gateway busy it waits for it to be idle (#577), and a click while it
+// waits restarts at once. The feed is asked first, as the page's restart
+// asks it (coeo91 on Discord: the tray restarted into the version the
+// last check found): a newer version out since is downloaded, and the
+// restart waits for it.
+func (u *updater) restartAsked(restart func() bool) {
+	if waiting, _ := u.waitingFor(); !waiting && !u.idle() {
+		u.waitIdle(restart, true)
+		return
+	}
+	u.cancelWait()
+	u.recheck(true)
+	if u.asking() || u.json().State != "ready" {
+		u.waitIdle(restart, true)
+		return
+	}
+	restart()
 }
 
 // callOff is the user's Cancel of a restart waiting: the wait stops, and

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -101,6 +102,12 @@ func DisconnectPreview(a *Agent, exe string) ([]FileChange, error) {
 	if appdir.Portable() != "" {
 		return nil, errors.New("no preview for a portable magpie")
 	}
+	// A portable VS Code's folder is found through its launcher, on the
+	// PATH the preview's process keeps, not through home: that process
+	// would disconnect the build's own files, not the copy (#4151).
+	if vscodePortableFile(a.Path) {
+		return nil, errors.New("no preview for a portable VS Code")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
@@ -116,11 +123,12 @@ func DisconnectPreview(a *Agent, exe string) ([]FileChange, error) {
 	if !ok || !ok2 {
 		return nil, errors.New("the agent's files are outside home")
 	}
+	sweepPreviews()
 	tmp, err := os.MkdirTemp("", "magpie-preview-")
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmp)
+	defer removePreview(tmp)
 	tmp, _ = filepath.EvalSymlinks(tmp)
 	// the agent's folder: its files, copied; its folders aren't its config
 	before := map[string][]byte{}
@@ -197,6 +205,40 @@ func DisconnectPreview(a *Agent, exe string) ([]FileChange, error) {
 		}
 	}
 	return changes, nil
+}
+
+// previewStale is how old a sandbox in the temporary dir must be for the
+// sweep to take it: a live preview lasts seconds (the dry run is bounded
+// at 20 seconds), so an hour-old one is a sandbox an earlier magpie was
+// killed holding (#3136).
+const previewStale = time.Hour
+
+// sweepPreviews removes sandboxes an earlier magpie was killed holding,
+// as sweepCursorSnaps does for its magpie-cursor-* copies.
+func sweepPreviews() {
+	old, _ := filepath.Glob(filepath.Join(os.TempDir(), "magpie-preview-*"))
+	for _, d := range old {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() && time.Since(fi.ModTime()) > previewStale {
+			removePreview(d)
+		}
+	}
+}
+
+// removePreview removes a sandbox, retrying while processes of the dry run
+// are still letting go of files in it (Windows keeps a file locked until
+// the last holder is out), and says so when it still could not.
+var previewRemoveAll = os.RemoveAll
+
+func removePreview(dir string) error {
+	var err error
+	for try := 0; try < 5; try++ {
+		if err = previewRemoveAll(dir); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(try+1) * 100 * time.Millisecond)
+	}
+	log.Printf("agent: removing disconnect-preview sandbox %s: %v", dir, err)
+	return err
 }
 
 // sortTail sorts all but the first name.

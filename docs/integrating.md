@@ -47,7 +47,7 @@ Send `magpie-<your-app-id>` (`Authorization: Bearer magpie-acme`, or
 log and the routing rules that match on agents. Without it, magpie counts
 the call by the first word of your `User-Agent` (`Acme/1.4 (darwin)` is
 `Acme`); an SDK's own User-Agent (`OpenAI/JS …`, `ai-sdk/…`) would count it
-as that SDK. From another computer (Settings → Share on local network) the
+as that SDK. From another computer (Settings → Network and sharing → Share on local network) the
 key must be one of the user's gateway keys, and the User-Agent names your
 app.
 
@@ -141,7 +141,7 @@ kinds ([plugin guide](https://usemagpie.ai/docs/plugins)):
   source of models, such as a subscription magpie doesn't sign in to
   itself. They sign in, list models and make requests.
 - **Gateway middleware**: rewrites requests and replies as they pass
-  (`onRequest`, `onProvider`, `onEvent`, `onResponse`).
+  (`onRequest`, `onAccount`, `onProvider`, `onEvent`, `onResponse`).
 
 A plugin can't add a row to the Agents page or write another app's
 config, so it is not how an app registers itself.

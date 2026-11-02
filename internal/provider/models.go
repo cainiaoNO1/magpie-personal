@@ -3,6 +3,7 @@ package provider
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/probelog"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -32,7 +34,8 @@ func (p Provider) Available() []catalog.Model {
 	if p.DecideOnly() {
 		return p.decideModels()
 	}
-	ms := p.available()
+	// by the ids the user lists them by (SetModelID)
+	ms := p.ids().list(p.available())
 	if p.Decides() {
 		// a gateway's Jev among its chat models, with its window and input
 		ms = slices.Clone(ms)
@@ -133,7 +136,13 @@ func (p Provider) Fetched() (time.Time, bool) {
 // for a built-in, listed by its plugin for a plugin's.
 func (p Provider) Listed() (time.Time, bool) {
 	if p.IsPlugin() {
-		return plugin.ListedAt()
+		// one look at the plugins' list a request, not one a provider
+		type listed struct {
+			at time.Time
+			ok bool
+		}
+		l := heldOf("plugin-listed", func() listed { at, ok := plugin.ListedAt(); return listed{at, ok} })
+		return l.at, l.ok
 	}
 	return p.Fetched()
 }
@@ -157,11 +166,23 @@ func (p Provider) live() ([]catalog.Model, time.Time, bool) {
 
 // liveByID are the models of live with this id: what a look at one
 // model, asked for each of a list's, reads instead of the whole list.
+// They are the list read, not a copy: a caller only reads them.
 func (p Provider) liveByID(model string) []catalog.Model {
 	if !p.lists() {
 		return nil
 	}
-	return catalog.LiveByID(p.ID, model)
+	// a model listed by an id the user gave it is in the vendor's list
+	// under its own (SetModelID)
+	own := p.OwnModelID(model)
+	ms := catalog.LiveByIDShared(p.ID, own)
+	if own == model {
+		return ms
+	}
+	out := slices.Clone(ms)
+	for i := range out {
+		out[i].ID = model
+	}
+	return out
 }
 
 // lists says whether the provider's fetched list is its own to read: not
@@ -171,7 +192,9 @@ func (p Provider) lists() bool {
 		return false
 	}
 	pr := Preset(p.Preset)
-	return p.Account != nil || pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr)
+	// keys on plans of their own each have a list (fetchPerKey), the
+	// plans' own and the pay as you go's
+	return p.Account != nil || pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr) || p.plansMixed()
 }
 
 // listsRead counts liveAll's reads (ListsRead).
@@ -235,6 +258,7 @@ func (p Provider) RefetchTaking(ctx context.Context) (ms []catalog.Model, droppe
 // refetch is Refetch, with the ids the provider's list had before it
 // (none for an account's, a plugin's or a decision-only provider's).
 func (p Provider) refetch(ctx context.Context) ([]catalog.Model, []string, map[string]bool, error) {
+	ctx = p.ownRequests(ctx, probelog.KindList)
 	if p.IsPlugin() {
 		// its plugin's list, read again: a pick it had and has no more
 		// goes as a built-in's does (plugin_relist.go)
@@ -289,7 +313,8 @@ func liveIDs(id string) map[string]bool {
 	for _, m := range ms {
 		out[m.ID] = true
 	}
-	return out
+	// picks are of the ids the user lists them by (SetModelID)
+	return modelIDsOf(id).ids(out)
 }
 
 // dropGonePicks takes out of the saved provider's picks those before had
@@ -357,7 +382,7 @@ func relistPicks(q *Provider, now map[string]bool) bool {
 
 // fetch is Fetch without the picks looked after.
 func (p Provider) fetch(ctx context.Context) ([]catalog.Model, error) {
-	ctx = p.Via(ctx)
+	ctx = p.ownRequests(p.Via(ctx), probelog.KindList)
 	if p.DecideOnly() {
 		return p.fetchDecide(ctx)
 	}
@@ -372,8 +397,14 @@ func (p Provider) fetch(ctx context.Context) ([]catalog.Model, error) {
 	// a vendor with no list to ask (Bedrock's runtime): the preset's
 	// models are it, unless the user said where one is or the provider
 	// sits at a region that serves one after all
-	if pr := Preset(p.Preset); pr != nil && pr.NoList && strings.TrimSpace(p.ModelsURL) == "" && !p.listRegion(pr) {
+	if pr := Preset(p.Preset); pr != nil && pr.NoList && strings.TrimSpace(p.ModelsURL) == "" && !p.listRegion(pr) && !p.plansMixed() {
 		return catalog.Chat(p.planModels(nil)), nil
+	}
+	// keys on plans of their own (KeyAccount.Plan): each key's plan's
+	// list, at its own endpoints, merged and marked with the keys that
+	// see each model, as keys of one plan whose lists differ are
+	if p.plansMixed() {
+		return p.fetchPerKey(ctx, p.KeysOn())
 	}
 	// Cline's plan and free models, from the list its own clients take
 	// theirs from; the API's list has neither, and is asked if that fails
@@ -407,7 +438,7 @@ func (p Provider) fetch(ctx context.Context) ([]catalog.Model, error) {
 // nothing: a provider still being added (#578, the add form's Fetch models)
 // is shown its vendor's list to pick from before it is saved.
 func (p Provider) List(ctx context.Context) ([]catalog.Model, error) {
-	ctx = p.Via(ctx)
+	ctx = p.ownRequests(p.Via(ctx), probelog.KindList)
 	if pr := Preset(p.Preset); pr != nil && pr.NoList && strings.TrimSpace(p.ModelsURL) == "" && !p.listRegion(pr) {
 		return catalog.Chat(p.planModels(nil)), nil
 	}
@@ -428,6 +459,20 @@ func (p Provider) List(ctx context.Context) ([]catalog.Model, error) {
 		return nil, err
 	}
 	return catalog.Chat(l.models), nil
+}
+
+// ListAsks says List asks a vendor over the network, with p's own key,
+// what p serves: a key's provider, not a subscription's account, a
+// plugin's or a decision API, nor a preset with no list to ask, whose List
+// answers the preset's models without asking anyone. The gateway asks it
+// of a key resting after an outage, to tell whether it is back
+// (gateway/rest_probe.go).
+func (p Provider) ListAsks() bool {
+	if p.Account != nil || p.DecideOnly() {
+		return false
+	}
+	pr := Preset(p.Preset)
+	return pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr)
 }
 
 // newFetches is when each account with no list from its vendor yet was
@@ -611,7 +656,7 @@ func fetchDue(due []newFetch, timeout time.Duration) (failed bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		var err error
 		if f.decide && p.Account == nil {
-			_, err = p.fetchDecide(p.Via(ctx))
+			_, err = p.fetchDecide(p.ownRequests(p.Via(ctx), probelog.KindList))
 		} else {
 			_, err = p.Fetch(ctx)
 		}
@@ -642,6 +687,7 @@ type fetched struct {
 // answered left every other endpoint's models out of the catalog, and so out
 // of the agents' model lists and of a model's own protocol setting.
 func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
+	ctx = p.ownRequests(ctx, probelog.KindList) // a detection's list too
 	if u := strings.TrimSpace(p.ModelsURL); u != "" {
 		// asked where the user said, and nowhere else: the base URLs
 		// list nothing, or the wrong thing
@@ -691,6 +737,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 	// the lists already fetched for this key, by the URL each answered at:
 	// two of the provider's bases that are one list are one request (#1006)
 	listed := catalog.NewListed()
+	codexAt := "" // the list URL the Responses base answered at
 	for _, proto := range p.Speaks() {
 		protoBase := p.Base(proto)
 		if proto == Gemini {
@@ -771,6 +818,9 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			dead = append(dead, protoBase)
 			continue
 		}
+		if proto == Responses {
+			codexAt = u // asked again as Codex asks it (codexEntries)
+		}
 		if got[u] {
 			// one list, already asked and merged under another base's
 			// spelling of the same URL: not a second endpoint (#1006)
@@ -809,6 +859,9 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			add(m)
 		}
 		sides = append(sides, saved...)
+	}
+	if codexAt != "" {
+		out = p.codexEntries(ctx, codexAt, out)
 	}
 	// the image models its list leaves out (AIHubMix's gpt-image-2)
 	// the parts are kept only where several bases were asked: a single one
@@ -964,6 +1017,17 @@ func (p Provider) keepDeadSides(dead []string, answered []side) (kept []catalog.
 	return kept, out
 }
 
+// planOnly is the models of the plan p is at, when it is one of a preset
+// that lists nothing at a region that doesn't either: its models are the
+// plan's, and no list is asked for.
+func (p Provider) planOnly() ([]catalog.Model, bool) {
+	pr := Preset(p.Preset)
+	if pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr) {
+		return nil, false
+	}
+	return p.planModels(nil), true
+}
+
 // listRegion reports whether the provider sits at one of its preset's
 // regions that serves a model list although the preset as a whole has
 // none (Region.Lists): Qianfan's pay as you go at the v2 root answers
@@ -1059,8 +1123,16 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 		}
 	}
 	if len(out) == 0 {
+		var images map[string]bool
+		if r := p.regionOf(pr); r != nil {
+			images = r.Images
+		}
 		for _, id := range models {
-			out = append(out, catalog.Model{ID: id, Name: id})
+			m := catalog.Model{ID: id, Name: id}
+			if v, ok := images[id]; ok {
+				m.ImageInput, m.Images = &v, v
+			}
+			out = append(out, m)
 		}
 	}
 	if len(free) == 0 && p.IsCline() {
@@ -1111,14 +1183,24 @@ func (p Provider) planMedia(ids func(*Region) []string, draws, films bool) []cat
 	if pr == nil {
 		return nil
 	}
-	r := p.regionOf(pr)
-	if r == nil {
-		return nil
+	// keys on plans of their own (KeyAccount.Plan): each plan's, once
+	views := []Provider{p}
+	if p.plansMixed() {
+		views = planViews(views)
 	}
-	models := ids(r)
-	out := make([]catalog.Model, 0, len(models))
-	for _, id := range models {
-		out = append(out, catalog.Model{ID: id, Name: id, Provider: p.ID, Draws: draws, Films: films})
+	var out []catalog.Model
+	seen := map[string]bool{}
+	for _, v := range views {
+		r := v.regionOf(pr)
+		if r == nil {
+			continue
+		}
+		for _, id := range ids(r) {
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, catalog.Model{ID: id, Name: id, Provider: p.ID, Draws: draws, Films: films})
+			}
+		}
 	}
 	return out
 }
@@ -1214,7 +1296,15 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 	for _, k := range keys {
 		id := keyID(k.Key)
 		q := p.WithKey(k)
-		l, err := q.fetchOne(ctx)
+		var l fetched
+		var err error
+		if ms, ok := q.planOnly(); ok {
+			// a key at a plan with no list to ask (Volcengine's Agent
+			// Plan beside its pay as you go): the plan's models, unasked
+			l = fetched{models: ms, base: cmp.Or(q.Base(Chat), q.Base(Anthropic))}
+		} else {
+			l, err = q.fetchOne(ctx)
+		}
 		if err != nil {
 			lastErr = err
 			if oldOf == nil {
@@ -1374,10 +1464,13 @@ func (p Provider) Serves(k KeyAccount, model string) bool { return p.Serving(mod
 // thousand keys (@NetRozee on X).
 func (p Provider) Serving(model string) func(KeyAccount) bool {
 	x, ok := p.keyLists()
-	if !ok {
+	if !ok || len(x.listed) == 0 {
+		// no key is listed to any model: every key serves it, and the
+		// model's own id needn't be looked up
 		return func(KeyAccount) bool { return true }
 	}
-	keys, found := x.of[model]
+	// the vendor's lists name the model by its own id (SetModelID)
+	keys, found := x.of[p.OwnModelID(model)]
 	return func(k KeyAccount) bool {
 		id := keyID(k.Key)
 		return !found || len(keys) == 0 || !x.listed[id] || keys[id]
@@ -1434,13 +1527,23 @@ func (p Provider) ServesNone() bool { return p.NoModels && len(p.Models) == 0 }
 func (p Provider) waitsForPicks() bool { return len(p.Models) == 0 && len(p.Delisted) > 0 }
 
 // Exposed lists the models magpie offers to agents for this provider: the
-// user's picks; else the preset's; else everything, when that is few; none
-// after Select none (ServesNone).
+// user's picks; else the preset's; else everything, when that is few, the
+// newest of each family only under Best in family; none after Select none
+// (ServesNone).
 func (p Provider) Exposed() []catalog.Model {
 	if p.ServesNone() || p.waitsForPicks() {
 		return nil
 	}
-	avail := p.Available()
+	return p.ExposedOf(p.Available())
+}
+
+// ExposedOf is Exposed of avail, p.Available() as the caller has already
+// read it: an editor's look at a provider read the vendor's list four
+// times over, each built afresh with its names and levels.
+func (p Provider) ExposedOf(avail []catalog.Model) []catalog.Model {
+	if p.ServesNone() || p.waitsForPicks() {
+		return nil
+	}
 	byID := make(map[string]catalog.Model, len(avail))
 	for _, m := range avail {
 		byID[m.ID] = m
@@ -1471,11 +1574,14 @@ func (p Provider) Exposed() []catalog.Model {
 		return out
 	}
 	picks := p.Models
-	if _, _, ok := p.live(); ok && p.Account != nil && p.Account.unusable != nil {
+	if _, _, ok := p.live(); ok && p.Account != nil && (p.Account.unusable != nil || p.Account.listedOnly) {
 		// A Copilot account is served what its list offers it, less what
 		// it was refused: a pick its list doesn't have (#371: gpt-6-luna,
 		// not in a Student plan's) or that it was refused is left out;
-		// with none left, as if none were picked.
+		// with none left, as if none were picked. A ChatGPT account's
+		// too: a pick made while its list had gpt-5.5 stayed offered after
+		// the list dropped it, and the backend refused every request for
+		// it (#4772). It comes back when the list has it again.
 		picks = slices.DeleteFunc(slices.Clone(picks), func(id string) bool { _, ok := byID[id]; return !ok })
 	} else if p.Account != nil && p.Account.unusable != nil {
 		// with no list fetched, a pick the account can't be served (a
@@ -1483,11 +1589,16 @@ func (p Provider) Exposed() []catalog.Model {
 		picks = slices.DeleteFunc(slices.Clone(picks), p.Account.unusable)
 	}
 	if len(picks) > 0 {
-		return slices.DeleteFunc(pick(p.withNewlyListed(picks, avail)), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+		noAPI := p.NoAPI()
+		return slices.DeleteFunc(pick(p.withNewlyListed(picks, avail)), func(m catalog.Model) bool { return noAPI(m.ID) })
 	}
 	// a model listed on none of the APIs the provider has a URL for is
 	// left out before the first 24 are taken (#2094)
-	avail = slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+	avail = p.servable(avail)
+	// Best in family: the newest of each family the list has
+	if p.BestInFamily {
+		avail = catalog.BestInFamily(avail)
+	}
 	// another magpie's list is already the models its user exposed
 	if len(avail) <= manyModels || p.IsRemoteMagpie() {
 		return avail
@@ -1498,6 +1609,47 @@ func (p Provider) Exposed() []catalog.Model {
 	return avail[:manyModels]
 }
 
+// servable is avail less the models NoAPIFor leaves out.
+func (p Provider) servable(avail []catalog.Model) []catalog.Model {
+	noAPI := p.NoAPI()
+	return slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return noAPI(m.ID) })
+}
+
+// NewestInFamily is the models Best in family would serve of avail, the
+// vendor's list (Available), before the first 24 are taken: the newest of
+// each family among those it can be asked for (catalog.BestInFamily),
+// whichever mode is on, so the editor can draw them before it is saved.
+func (p Provider) NewestInFamily(avail []catalog.Model) []catalog.Model {
+	return catalog.BestInFamily(p.servable(avail))
+}
+
+// Listing is a provider's models as the Providers page draws them: the
+// vendor's list (Available), what of it is exposed (ExposedOf) and the
+// newest of each family (NewestInFamily).
+type Listing struct{ Available, Exposed, Newest []catalog.Model }
+
+// Listing is p's Listing, built afresh.
+func (p Provider) Listing() Listing {
+	avail := p.Available()
+	return Listing{avail, p.ExposedOf(avail), p.NewestInFamily(avail)}
+}
+
+// KeptListing is the Listing of a provider All gave, kept across requests
+// with the catalog (keptOf) while nothing it is built from changed: each
+// poll of the Providers page built every provider's list and its newest
+// of each family again, 9 MB a poll in a real setup. What it gives is
+// shared, so read only.
+func KeptListing(p Provider) Listing {
+	return keptOf("listing:"+p.ID, func() Listing {
+		listingsBuilt.Add(1)
+		l := p.Listing()
+		return Listing{slices.Clip(l.Available), slices.Clip(l.Exposed), slices.Clip(l.Newest)}
+	})
+}
+
+// listingsBuilt counts the Listings KeptListing built, for a test.
+var listingsBuilt atomic.Int64
+
 // NoAPIFor says the provider has a URL for none of the APIs the vendor's
 // list serves model on (or the one the user set for it): a relay's Claude
 // listed on /messages alone, at a provider given only a chat URL. Agents
@@ -1505,16 +1657,23 @@ func (p Provider) Exposed() []catalog.Model {
 // a provider of keys, whose URLs the user typed: a sign-in's APIs are
 // magpie's own. A model whose list says no API, and a provider with no URL
 // at all, are never left out here.
-func (p Provider) NoAPIFor(model string) bool {
+func (p Provider) NoAPIFor(model string) bool { return p.NoAPI()(model) }
+
+// NoAPI is NoAPIFor for each model of a list: the APIs the provider has a
+// URL for are found once for the list, not once for each model (they were
+// most of what NoAPIFor allocated, 16 MB of twenty window polls).
+func (p Provider) NoAPI() func(model string) bool {
 	if p.Account != nil {
-		return false
-	}
-	apis := p.APIs(model)
-	if len(apis) == 0 {
-		return false
+		return func(string) bool { return false }
 	}
 	speaks := p.Speaks()
-	return len(speaks) > 0 && !slices.ContainsFunc(speaks, func(s Protocol) bool { return slices.Contains(apis, s) })
+	if len(speaks) == 0 {
+		return func(string) bool { return false }
+	}
+	return func(model string) bool {
+		apis := p.apisAmong(speaks, model)
+		return len(apis) > 0 && !slices.ContainsFunc(speaks, func(s Protocol) bool { return slices.Contains(apis, s) })
+	}
 }
 
 // Picks are the models the user picked, with those the vendor has listed
@@ -1526,6 +1685,15 @@ func (p Provider) Picks() []string {
 		return p.Models
 	}
 	return p.withNewlyListed(p.Models, p.Available())
+}
+
+// PicksOf is Picks of avail, p.Available() as the caller has already read
+// it (ExposedOf).
+func (p Provider) PicksOf(avail []catalog.Model) []string {
+	if len(p.Models) == 0 {
+		return p.Models
+	}
+	return p.withNewlyListed(p.Models, avail)
 }
 
 // withNewlyListed is picks with the models the vendor has listed since
@@ -1594,7 +1762,10 @@ func (p Provider) RejectsTemperature(model string) bool {
 }
 
 // Efforts are the reasoning levels the model takes, when known: its own,
-// or those the user gave it when it has none known.
+// or those the user gave it when it has none known (magpie model spec
+// --reasoning on a custom provider's model). The gateway fits a request
+// to these. Levels the user kept of a model's own only narrow what is
+// offered (#92): the vendor is still asked at any level it has.
 func (p Provider) Efforts(model string) []string {
 	if Reasonless(p.ID, model) {
 		return nil
@@ -1650,8 +1821,12 @@ func (p Provider) PaidBesideFree(model string) bool {
 //
 // A model neither listed free nor priced is not free: nothing says it costs
 // nothing, and the routes that go by this put it with the paid ones, so a
-// pool without free models behaves as In order.
+// pool without free models behaves as In order. The user's word is
+// something: every model of a provider they count free is (CountFree).
 func (p Provider) FreeModel(model string) bool {
+	if p.CountFree {
+		return true
+	}
 	for _, m := range p.Available() {
 		if strings.EqualFold(m.ID, model) {
 			if m.Free {
@@ -1739,8 +1914,17 @@ func borrowedEfforts(id string) []string {
 	}
 	// one newer than this machine's catalog: its maker's line's levels
 	// (gpt-6.1-sol, NextCommit on Discord)
-	e, _ := catalog.KinEfforts(makerCatalogs(), id)
-	return e
+	if e, ok := catalog.KinEfforts(makerCatalogs(), id); ok {
+		return e
+	}
+	// a proxy's variant of a known model, named for the level or speed
+	// it is served at (CLIProxyAPI's gemini-3.8-flash-high,
+	// claude-opus-5-5-high, grok-3-mini-fast; nianshou5 on Discord): the
+	// model's own levels, which the proxy fits a request's effort to
+	if base, ok := catalog.Unsuffixed(id); ok {
+		return borrowedEfforts(base)
+	}
+	return nil
 }
 
 // makerCatalogs are the models.dev ids of the vendors among the presets
@@ -1766,13 +1950,24 @@ var makerCatalogs = sync.OnceValue(func() []string {
 // at gpt-6-astra's or gemini-3.8-flash's maker's price, as a Claude
 // account is at Anthropic's. A remote magpie's is what that magpie counts
 // the model at, as its list says (remotePrice). A model no catalog prices
-// is at the price its plugin lists it at (pluginListPrice), else, when the
-// plugin says the plan serves it free, costs nothing (pluginFree).
+// is at its vendor's own list price where a moved built-in's plugin serves
+// it (vendorListPrice), else at the price its plugin lists it at
+// (pluginListPrice), else, when the
+// plugin says the plan serves it free, costs nothing (pluginFree). Codex's
+// auto-review through the Codex subscription costs nothing too, as OpenAI
+// serves it a ChatGPT sign-in (codexReviewFree).
 func (p Provider) ListPrice(model string) (catalog.Price, bool) {
+	if own := p.OwnModelID(model); own != model {
+		// a model listed by an id the user gave it is priced as the
+		// provider's own id of it first, then as the id it is listed by
+		if pr, ok := p.ListPrice(own); ok {
+			return pr, true
+		}
+	}
 	if pr, ok := p.remotePrice(model); ok {
 		return pr, true
 	}
-	if p.clineFreeModel(model) || p.kiloFreeModel(model) {
+	if p.clineFreeModel(model) || p.kiloFreeModel(model) || p.codexReviewFree(model) {
 		// served at no cost: not at the price of the model it is free of
 		return catalog.Price{}, true
 	}
@@ -1799,9 +1994,19 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		if pr, ok := catalog.PricedBy(priceCatalogs(cats), m); ok {
 			return pr, true
 		}
-		if pr, ok := catalog.PricedBy(makerPriceCatalogs(), m); ok {
+		if pr, ok := makerListPrice(m); ok {
 			return pr, true
 		}
+	}
+	if slices.Contains(cats, "anthropic") {
+		// a gated Claude model models.dev prices nowhere (Claude Mythos
+		// 5.1): Anthropic's price, as it told Claude Code
+		if pr, ok := claudeCodePrice(model); ok {
+			return pr, true
+		}
+	}
+	if pr, ok := p.vendorListPrice(model); ok {
+		return pr, true
 	}
 	if pr, ok := p.pluginListPrice(model); ok {
 		return pr, true
@@ -1810,6 +2015,26 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		return catalog.Price{}, true
 	}
 	return catalog.Price{}, false
+}
+
+// vendorCatalogs are the models.dev catalogs of the vendors a moved
+// built-in's plugin sends its calls to, by the subscription's id: what
+// the vendor's own API lists a model at, as its preset is priced
+// (EndpointCatalog). A plugin's provider has no such catalog of its own.
+var vendorCatalogs = map[string]string{CommandCodePlanID: "commandcode"}
+
+// vendorListPrice is model's price in its vendor's own catalog
+// (vendorCatalogs), for a model no maker's price is found for: Command
+// Code's deepseek/deepseek-v4.1-flash, which models.dev's DeepSeek lists
+// only as deepseek-flash, a canonical of deepseek-v4.1-flash-1017, so its
+// calls on the plan were counted at no price at all (treeman on Discord).
+// Only after the maker's, so a model its maker prices keeps that price.
+func (p Provider) vendorListPrice(model string) (catalog.Price, bool) {
+	c, ok := vendorCatalogs[p.ID]
+	if !ok {
+		return catalog.Price{}, false
+	}
+	return catalog.PricedBy([]string{c}, model)
 }
 
 // pluginListPrice is the price the plugin serving p lists model at
@@ -2045,16 +2270,21 @@ func (p Provider) kimiCodeMember() bool {
 }
 
 // kimiCodeAPI is the Kimi API model a Kimi Code model id is, as Kimi
-// Code's docs name it (https://www.kimi.com/code/docs/en/, 2026-10-09):
+// Code's docs name it (https://www.kimi.com/code/docs/en/, 2026-11-01):
 // k3 is K3, k3-256k "K3 256K context version … the same results as K3",
-// kimi-for-coding-highspeed "K2.7 Code HighSpeed". Kimi's API prices both
-// per token (https://platform.kimi.ai/docs/pricing/chat: kimi-k3 $3 in,
-// $15 out, $0.30 cached; kimi-k2.7-code-highspeed $1.90, $8, $0.38).
+// k3.1-pro "K3.1 Pro", k3.1-pro-highspeed "K3.1 Pro Highspeed", and
+// kimi-for-coding-highspeed "K2.7 Code HighSpeed". Kimi's API prices them
+// per token (https://platform.kimi.ai/docs/pricing/chat, as models.dev's
+// moonshotai entry lists them, read 2026-10-31: kimi-k3 $3 in, $15 out,
+// $0.30 cached; kimi-k3.1-pro $2, $10, $0.20; kimi-k3.1-pro-highspeed
+// $4, $20, $0.20; kimi-k2.7-code-highspeed $1.90, $8, $0.38).
 // kimi-for-coding is "K2.8 Preview", which the API doesn't sell, so it has
 // no API price and stays unpriced.
 var kimiCodeAPI = map[string]string{
 	"k3":                        "kimi-k3",
 	"k3-256k":                   "kimi-k3",
+	"k3.1-pro":                  "kimi-k3.1-pro",
+	"k3.1-pro-highspeed":        "kimi-k3.1-pro-highspeed",
 	"kimi-for-coding-highspeed": "kimi-k2.7-code-highspeed",
 }
 
@@ -2063,11 +2293,25 @@ var kimiCodeAPI = map[string]string{
 // gone since.
 func MakerPrice(model string) (catalog.Price, bool) {
 	for _, m := range pricedNames(model) {
-		if pr, ok := catalog.PricedBy(makerPriceCatalogs(), m); ok {
+		if pr, ok := makerListPrice(m); ok {
 			return pr, true
 		}
 	}
 	return catalog.Price{}, false
+}
+
+// makerListPrice is a model id's list price at its maker: the price of
+// the models.dev provider that lists it as its own model
+// (catalog.MakerPriced), else the first maker preset's that lists it. The
+// lab's own comes first, so a model a maker preset resells (Mistral's
+// DeepSeek V4.1 Flash) is costed at what its lab charges, the official
+// price a subscription's call is estimated at (bestony on Discord, on
+// Command Code).
+func makerListPrice(m string) (catalog.Price, bool) {
+	if pr, ok := catalog.MakerPriced(makerPriceCatalogs(), m); ok {
+		return pr, true
+	}
+	return catalog.PricedBy(makerPriceCatalogs(), m)
 }
 
 // SamePriceIn is the maker's list price of the model the user said
@@ -2089,7 +2333,11 @@ func SamePriceIn(s settings.Settings, providerID, model string) (catalog.Price, 
 // price they set for that model, or for every model of that provider, or for
 // that model from any provider (settings' ModelPrices), else the provider's own list price, else its
 // maker's, else the maker's of the model the user said it is the same as
-// (SamePriceIn), each at the provider's price rate (PriceRate). The second return is false only when no price is known at all,
+// (SamePriceIn), each at the provider's price rate (PriceRate), and again
+// at the rate of the time-of-day window the call falls in (RateWindows,
+// #2463) — the window's rate on a price the user set as well, the price
+// rate alone leaving it as set. The second return is false only when no
+// price is known at all,
 // which is not the same as a price of zero: that one is set, deliberately.
 //
 // A price here is the provider's tariff, not the model's: the same model
@@ -2104,23 +2352,83 @@ func EffectivePrice(providerID, model string) (catalog.Price, bool) {
 // the list is one snapshot of the prices rather than a reading per row, and
 // a price changed while it is read takes effect in the next call.
 func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Price, bool) {
+	return EffectivePriceAt(s, providerID, model, time.Now())
+}
+
+// EffectivePriceAt is EffectivePriceIn at the time given: a record's own
+// time when one is priced, now for a price shown before a call. A caller
+// pricing many records takes BasePriceIn once per model and multiplies
+// each record's window rate on itself, so one read of the prices serves
+// every time of day.
+func EffectivePriceAt(s settings.Settings, providerID, model string, at time.Time) (catalog.Price, bool) {
 	// A price is keyed by the id the provider has now, so one written before
 	// a rename is read under the id it has. Only an id, or one the provider
 	// was renamed from, resolves; anything else is looked up as given, so a
 	// key under a display name counts only for a caller naming that name
 	// too. Nothing writes such a key — SetModelPrice re-keys the way
 	// SetModelName does — which is what keeps the two from drifting.
+	return priceIn(s, All(), providerID, model, at)
+}
+
+// priceIn is EffectivePriceIn with the providers read already, for a
+// caller pricing many models at once: All() copies every provider each
+// time it is read, so a list read it once a model, 30 providers' copies
+// for each of hundreds of models (EntryPricer).
+func priceIn(s settings.Settings, all []Provider, providerID, model string, at time.Time) (catalog.Price, bool) {
+	p, known := byIDOrWasIn(all, providerID)
+	if !known {
+		p = Provider{ID: providerID}
+	}
+	return priceOf(s, p, known, model, at)
+}
+
+// BasePriceIn is EffectivePriceAt without a rate window's rate: what the
+// provider bills outside every window, and the third return is its
+// windows, for RateAt to read each record's time against. A caller
+// pricing many records holds both and multiplies the rates itself, as
+// the usage ledger's Pricer does, so one read serves every time of day.
+func BasePriceIn(s settings.Settings, providerID, model string) (catalog.Price, bool, []RateWindow) {
 	p, known := byIDOrWas(providerID)
 	if !known {
 		p = Provider{ID: providerID}
 	}
-	return priceOf(s, p, known, model)
+	pr, ok := priceOf(s, p, known, model, time.Time{})
+	return pr, ok, p.RateWindows
 }
 
-// priceOf is EffectivePriceIn for a provider already looked up, for a
+// priceOf is EffectivePriceAt for a provider already looked up, for a
 // caller pricing many models at once: byIDOrWas reads every provider's
-// accounts each time.
-func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog.Price, bool) {
+// accounts each time. The window's rate scales every price the call is
+// counted at, a price the user set for the model included (#2463); the
+// price rate alone leaves that price as set. A zero at prices without a
+// rate window's rate, as BasePriceIn asks for.
+func priceOf(s settings.Settings, p Provider, known bool, model string, at time.Time) (catalog.Price, bool) {
+	pr, ok := tariffOf(s, p, known, model)
+	if ok && !at.IsZero() {
+		if w := p.RateAt(at); w > 0 && w != 1 {
+			pr = pr.Times(w)
+		}
+	}
+	return pr, ok
+}
+
+// PriceAt is what a call to model at p costs when made at at, as Usage
+// counts one made then: EffectivePriceAt for p as the caller holds it (a
+// routing group's member), its Peak still set, for the caller to apply
+// with Price.In and tell whether it did. A model served at no cost there
+// (FreeModel) costs nothing.
+func (p Provider) PriceAt(s settings.Settings, model string, at time.Time) (catalog.Price, bool) {
+	if p.FreeModel(model) {
+		return catalog.Price{}, true
+	}
+	return priceOf(s, p, true, model, at)
+}
+
+// tariffOf is a price without a rate window's rate: what the user set
+// for the model as they set it, else the provider's list price, else its
+// maker's, each at the price rate. Either is doubled in the peak hours of
+// a vendor that bills by the hour (PeakOf).
+func tariffOf(s settings.Settings, p Provider, known bool, model string) (catalog.Price, bool) {
 	id := p.ID
 	// then what they said the model costs from any provider (*/model):
 	// still the user's word, so before any list price
@@ -2129,12 +2437,23 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 			if pr, bad := m.Price(); bad == "" {
 				// a Claude model's 1-hour cache write left out: 2× input
 				catalog.OneHourFor(model, &pr)
+				// a vendor that bills by the hour doubles any price in its
+				// peak hours: the user's is the off-peak one, as its list
+				// price is, so setting one keeps the split (treeman on
+				// Discord)
+				pr.Peak = p.PeakOf(model)
 				return pr, true
 			}
 		}
 	}
 	if !known {
+		if p.codexReviewFree(model) { // signed out since: still a ChatGPT sign-in's
+			return catalog.Price{}, true
+		}
 		if pr, ok := MakerPrice(model); ok {
+			if k := p.PeakOf(model); k != "" {
+				pr.Peak = k
+			}
 			return pr, true
 		}
 		return SamePriceIn(s, id, model)
@@ -2145,6 +2464,10 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 	}
 	if !ok {
 		pr, ok = SamePriceIn(s, id, model)
+	} else if k := p.PeakOf(model); k != "" {
+		// billed by the hour it is made at (PeakOf), as a price the user
+		// set above is, never the one of the model they said it is
+		pr.Peak = k
 	}
 	// what the provider bills against it (#819)
 	if ok && p.PriceRate > 0 {
@@ -2158,22 +2481,71 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 // when every member costs the same, none in a fast mode, since which of
 // them answers isn't known beforehand. find is GroupFinder's.
 func EntryPriceIn(st settings.Settings, find func(string) (Group, []Member, bool), e Entry) (catalog.Price, bool) {
-	if e.Group == "" {
-		return EffectivePriceIn(st, e.Provider.ID, e.Model)
-	}
-	_, ms, ok := find(e.ID)
-	if !ok || len(ms) == 0 {
-		return catalog.Price{}, false
-	}
-	var first catalog.Price
-	for i, m := range ms {
-		pr, ok := EffectivePriceIn(st, m.Provider.ID, m.Model)
-		if !ok || m.Fast || i > 0 && !pr.Same(first) {
+	return EntryPricer(st, find)(e)
+}
+
+// EntryPricer is EntryPriceIn for a whole list of entries, at the one
+// read of the providers it makes: what a /v1/models or an agent's model
+// file prices row by row.
+func EntryPricer(st settings.Settings, find func(string) (Group, []Member, bool)) func(Entry) (catalog.Price, bool) {
+	// one time for the whole list, as the providers are one read too:
+	// a rate window (#2463) holds or not for every row alike
+	return entryPricerAt(st, find, time.Now())
+}
+
+// entryPricerAt is EntryPricer with a provider's rate window taken at
+// now, or left out for a zero now.
+func entryPricerAt(st settings.Settings, find func(string) (Group, []Member, bool), now time.Time) func(Entry) (catalog.Price, bool) {
+	all := All()
+	return func(e Entry) (catalog.Price, bool) {
+		if e.Group == "" {
+			return priceIn(st, all, e.Provider.ID, e.Model, now)
+		}
+		_, ms, ok := find(e.ID)
+		if !ok || len(ms) == 0 {
 			return catalog.Price{}, false
 		}
-		first = pr
+		var first catalog.Price
+		for i, m := range ms {
+			pr, ok := priceIn(st, all, m.Provider.ID, m.Model, now)
+			if !ok || m.Fast || i > 0 && !pr.Same(first) {
+				return catalog.Price{}, false
+			}
+			first = pr
+		}
+		return first, true
 	}
-	return first, true
+}
+
+// AgentPricer is EntryPricer for the model list magpie writes into an
+// agent's own config (Pi's, omp's, OpenCode's cost): a group whose
+// members cost the same is priced as EntryPricer prices it, and one whose
+// members differ at the member it sends to first — a manual group's pick,
+// else its first member not switched off — since that is the member a
+// request goes to while it answers, and an agent that prices calls by its
+// config (omp's custom provider, taotao7 on Discord) otherwise counts
+// every call to the group at 0. A first member in a fast mode, or with no
+// known price, leaves the group unpriced, as before. The list is read
+// afresh at each Sync, so the price follows the group's members.
+//
+// A provider's rate window (#2463) is left out: the file holds whatever
+// was written at the last Sync, which nothing rewrites when a window
+// opens or closes, so a window's price taken then would stay on through
+// the hours outside it. magpie's own count (Usage, a key's budget) takes
+// each call's window.
+func AgentPricer(st settings.Settings, find func(string) (Group, []Member, bool)) func(Entry) (catalog.Price, bool) {
+	var base time.Time
+	same, all := entryPricerAt(st, find, base), All()
+	return func(e Entry) (catalog.Price, bool) {
+		if pr, ok := same(e); ok || e.Group == "" {
+			return pr, ok
+		}
+		_, ms, ok := find(e.ID)
+		if !ok || len(ms) == 0 || ms[0].Fast {
+			return catalog.Price{}, false
+		}
+		return priceIn(st, all, ms[0].Provider.ID, ms[0].Model, base)
+	}
 }
 
 // PriceRateOK says what is wrong with a provider's price rate, "" when
@@ -2194,7 +2566,11 @@ func PriceRateOK(r float64) string {
 // both outlive the provider they were set for, so the spelling the user typed
 // is the one that has to be checked before a name is resolved at all.
 func byIDOrWas(id string) (Provider, bool) {
-	all := All()
+	return byIDOrWasIn(All(), id)
+}
+
+// byIDOrWasIn is byIDOrWas among the providers given.
+func byIDOrWasIn(all []Provider, id string) (Provider, bool) {
 	if p, ok := find(all, id); ok {
 		return p, true
 	}
@@ -2235,10 +2611,16 @@ func pricedNames(model string) []string {
 	if model == "codex-auto-review" {
 		out = append(out, "gpt-5.6-luna")
 	}
-	if m := grokWindow.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
+	// both patterns name grok-: every other model of every provider's list
+	// went through two regexps on each Providers poll
+	l := strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(l, "grok-") {
+		return out
+	}
+	if m := grokWindow.FindStringSubmatch(l); m != nil {
 		out = append(out, m[1])
 	}
-	if m := grokEffort.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
+	if m := grokEffort.FindStringSubmatch(l); m != nil {
 		out = append(out, m[1])
 	}
 	return out
@@ -2249,7 +2631,7 @@ func pricedNames(model string) []string {
 func PricedName(model string) string {
 	n := pricedNames(model)
 	for _, name := range n {
-		if _, ok := catalog.PricedBy(makerPriceCatalogs(), name); ok {
+		if _, ok := makerListPrice(name); ok {
 			return name
 		}
 	}
@@ -2259,7 +2641,14 @@ func PricedName(model string) string {
 // PricedNameFor is PricedName for a call to that provider: a Kimi Code
 // membership's k3 is priced as the API's kimi-k3 (kimiCodeAPI).
 func PricedNameFor(providerID, model string) string {
-	if p, ok := byIDOrWas(providerID); ok && p.kimiCodeMember() {
+	p, ok := byIDOrWas(providerID)
+	if !ok {
+		p = Provider{ID: providerID}
+	}
+	if p.codexReviewFree(model) {
+		return model // free, not priced as another model (codexReviewFree)
+	}
+	if ok && p.kimiCodeMember() {
 		if id, ok := kimiCodeAPI[strings.ToLower(strings.TrimSpace(model))]; ok {
 			return id
 		}
@@ -2351,16 +2740,73 @@ type Entry struct {
 	// models.dev says it, "" when neither does: what a group's template
 	// weighs a newer model by (grouptemplate.go)
 	Released string `json:"-"`
+	// Codex is the entry the provider's own list gives the model in
+	// Codex's shape (catalog.Model's), handed to Codex as it is
+	Codex json.RawMessage `json:"-"`
+	// AlwaysThinks, DynamicTools and DefaultEffort are what the provider's
+	// own list says of the model (catalog.Model's): it always thinks, it
+	// loads tools mid-conversation, it thinks at this effort unasked.
+	// Kimi Code's list says them, and Kimi Code is told them. A group
+	// has each one its members all share (groupSharedKimi)
+	AlwaysThinks  bool   `json:"-"`
+	DynamicTools  bool   `json:"-"`
+	DefaultEffort string `json:"-"`
 }
 
 // Catalog lists the routing groups, then every exposed model of every ready
 // provider not kept unlisted. A provider switched off has none in it.
-func Catalog() []Entry {
+func Catalog() []Entry { return catalogKeeping(nil) }
+
+// catalogOf is the catalog agent's lists start from: Catalog, with the
+// models of the user's signed-in subscriptions (SubscriptionKept) that a
+// group listing alone (Group.Unlists) keeps out of it. A group is added
+// on top of what the agents had: switching one on that names a ChatGPT
+// account's GPT models took its Codex section out of every agent's list,
+// Hermes Agent's and WorkBuddy's among them, and switched off they were
+// back (士奇 on Discord, a third time: a3ee00c05 kept them in Codex's list
+// alone). The gateway's /v1/models for a client that is no agent ("")
+// still lists the group alone, as #1783 asked.
+//
+// For Codex, the ChatGPT accounts' own models are kept too when the
+// codex provider is used only through routing groups (Provider.Unlisted):
+// Codex reaches those on its own sign-in, its app lists them from the
+// ChatGPT backend, and the codex provider's switch is about magpie's
+// offer to the other agents and /v1/models. The user takes them out of
+// Codex's list there (HiddenModels, PickedModels), which the gateway
+// follows (CodexNativeHidden).
+func catalogOf(agent string) []Entry {
+	if agent == "" {
+		return Catalog()
+	}
+	codex := strings.EqualFold(agent, "codex")
+	return catalogKeeping(func(e Entry) bool { return SubscriptionKept(e) || codex && CodexOwn(e) })
+}
+
+// CatalogOf is the catalog agent's lists start from, before its
+// visibility and picks narrow it (CatalogFor): every model that agent may
+// be given by name.
+func CatalogOf(agent string) []Entry { return catalogOf(agent) }
+
+// SubscriptionKept reports whether e is one of a signed-in subscription's
+// own models (a ChatGPT, Claude, Copilot or plugin account's) that only a
+// group listing alone could keep out: such a group doesn't take it from
+// the agents' lists. A provider the user keeps for routing groups itself
+// (Provider.Unlisted, "Only through routing groups") still keeps it out.
+func SubscriptionKept(e Entry) bool {
+	return e.Group == "" && e.Provider.Account != nil && !e.Provider.Unlisted
+}
+
+// catalogKeeping is Catalog with the unlisted models keep says, too.
+func catalogKeeping(keep func(Entry) bool) []Entry {
 	entries := providerEntries()
-	out := slices.Clone(groupEntries(entries)) // held: the caller's to change
+	groups := groupEntries(entries) // held: copied into the caller's own
+	// made once with room for every entry: cloned at the groups' size and
+	// grown by append for the providers' models, it was 29 MB of what forty
+	// polls of the Providers page allocated with real accounts
+	out := append(make([]Entry, 0, len(groups)+len(entries)), groups...)
 	kept := unlistedByGroups(entries)
 	for _, e := range entries {
-		if !e.Provider.Unlisted && !kept[e.ID] {
+		if !e.Provider.Unlisted && len(kept[e.ID]) == 0 || keep != nil && keep(e) {
 			out = append(out, e)
 		}
 	}
@@ -2368,13 +2814,14 @@ func Catalog() []Entry {
 }
 
 // unlistedByGroups are the models, by "provider/model", that a group
-// keeps out of the lists (Group.Unlists): those it names, a member fixed
-// at an effort counting as its model, and those its patterns match.
-func unlistedByGroups(entries []Entry) map[string]bool {
+// keeps out of the lists (Group.Unlists), with the names of the groups
+// that do: those it names, a member fixed at an effort counting as its
+// model, and those its patterns match.
+func unlistedByGroups(entries []Entry) map[string][]string {
 	if !slices.ContainsFunc(heldOf("file", load).Groups, func(g Group) bool { return g.Unlists }) {
 		return nil
 	}
-	out := map[string]bool{}
+	out := map[string][]string{}
 	for _, g := range groupsIn(entries) {
 		if !g.Unlists || g.Hidden || g.Disabled {
 			continue
@@ -2384,30 +2831,59 @@ func unlistedByGroups(entries []Entry) map[string]bool {
 				continue
 			}
 			model, _ := memberEffortIn(entries, id)
-			if p, m, ok := resolveIn(entries, model); ok {
-				out[p.ID+"/"+m] = true
+			if p, m, ok := resolveIn(entries, model); ok && !slices.Contains(out[p.ID+"/"+m], cmp.Or(g.Name, g.ID)) {
+				out[p.ID+"/"+m] = append(out[p.ID+"/"+m], cmp.Or(g.Name, g.ID))
 			}
 		}
 	}
 	return out
 }
 
-// Served is the catalog with the unlisted providers' models as well: every
-// model a routing group can be made of, or a request can name.
-func Served() []Entry {
-	entries := providerEntries()
-	return append(slices.Clone(groupEntries(entries)), entries...)
+// GroupKept is the models, by "provider/model", that a group listing
+// alone (Group.Unlists) keeps out of agents' lists, with those groups'
+// names: a provider's editor names them, as a model its own switch put
+// back for agents is still left out by them. A signed-in subscription's
+// models, which agents keep (SubscriptionKept), aren't among them.
+// Held as MemberGroups is: shared, only for reading.
+func GroupKept() map[string][]string {
+	return heldFrom("group-kept", providerEntries(), groupKeptIn)
 }
 
-// Unlisted are the models Served has and Catalog doesn't: those of the
-// providers kept for routing groups (Provider.Unlisted), and those a group
-// keeps out of the lists (Group.Unlists), which agents aren't offered.
+func groupKeptIn(entries []Entry) map[string][]string {
+	kept := unlistedByGroups(entries)
+	if len(kept) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, e := range entries {
+		if gs := kept[e.ID]; len(gs) > 0 && !SubscriptionKept(e) {
+			out[e.ID] = slices.Clone(gs)
+		}
+	}
+	return out
+}
+
+// Served is the catalog with the unlisted providers' models as well: every
+// model a routing group can be made of, or a request can name. Like
+// providerEntries it is shared, only for reading: a request asks it for
+// each model it may go to, and a copy each time was ~380KB with 12
+// providers of 20 models (#3725).
+func Served() []Entry {
+	return heldFrom("served", providerEntries(), func(entries []Entry) []Entry {
+		return slices.Clip(append(slices.Clone(groupEntries(entries)), entries...))
+	})
+}
+
+// Unlisted are the models Served has and agents aren't offered: those of
+// the providers kept for routing groups (Provider.Unlisted), and those a
+// group keeps out of the lists (Group.Unlists) but a signed-in
+// subscription's, which agents keep (SubscriptionKept).
 func Unlisted() []Entry {
 	var out []Entry
 	entries := providerEntries()
 	kept := unlistedByGroups(entries)
 	for _, e := range entries {
-		if e.Provider.Unlisted || kept[e.ID] {
+		if e.Provider.Unlisted || len(kept[e.ID]) > 0 && !SubscriptionKept(e) {
 			out = append(out, e)
 		}
 	}
@@ -2432,7 +2908,7 @@ func entriesOff(off func(pid, model string) bool) []Entry {
 func heldOffEntries() []Entry {
 	return heldOf("off entries", func() []Entry {
 		return keptOf("off entries", func() []Entry {
-			return slices.Clip(entriesOf(func(p Provider) bool { return p.Ready() && p.Off }, disabledNow()))
+			return slices.Clip(entriesOf(func(p Provider) bool { return p.Ready() && (p.Off || p.KeptToAgent()) }, disabledNow()))
 		})
 	})
 }
@@ -2477,7 +2953,13 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	name := cmp.Or(m.Name, m.ID)
 	e := Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Family: p.Family, Name: name, Efforts: effortsOf(m), Provider: p,
 		Images: images, ImageInput: imageInput, Context: ctx, WindowSet: p.ContextOf(m.ID) > 0, Output: output, OutputSet: outputOf(s, p.ID, m.ID) > 0, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Tiers: m.Tiers, Released: m.Released,
-		Inputs: m.InputModalities, Outputs: m.OutputModalities}
+		Inputs: m.InputModalities, Outputs: m.OutputModalities, Codex: m.Codex,
+		AlwaysThinks: m.AlwaysThinks, DynamicTools: m.DynamicTools, DefaultEffort: m.DefaultEffort}
+	if lv, ok := catalog.CodexLevels(m.Codex); ok {
+		// the levels the vendor lists the model at in Codex's shape are
+		// its word, over models.dev's for the same id (Decorate)
+		e.Efforts = lv
+	}
 	if n, ok := modelNameIn(s.ModelNames, p.ID, m.ID); ok {
 		e.Name, e.Default = n, name
 	} else {
@@ -2486,14 +2968,17 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	// a model that thinks still does with the levels the user kept or
 	// none at all; one its source says nothing of thinks as most of the
 	// providers serving it say (#402)
-	e.Reasoning = m.Reasoning || len(e.Efforts) > 0 || catalog.Thinks(m.ID)
+	e.Reasoning = m.Reasoning || m.AlwaysThinks || len(e.Efforts) > 0 || catalog.Thinks(m.ID)
 	e.Efforts = effortsKept(e.Efforts, s.ModelEfforts[e.ID])
+	// levels the user gave a model with none known say it thinks too, so
+	// an agent told its levels isn't told it doesn't reason
+	e.Reasoning = e.Reasoning || len(e.Efforts) > 0
 	// Codex's Ultra on a model OpenAI offers it on, served by another
 	// vendor (Copilot's gpt-6.1-sol, #656): a ChatGPT account's list says it
 	// already. Its subagents take their tasks as text from a magpie-served
 	// lead, so Codex is told V2 for it, where Ultra hands work to them
 	// (codexcat.Entries).
-	if p.Account == nil || p.Account.Agent != "codex" {
+	if (p.Account == nil || p.Account.Agent != "codex") && len(m.Codex) == 0 {
 		e.Efforts = withUltra(m.ID, e.Efforts)
 		e.AgentsV2 = slices.Contains(e.Efforts, "ultra")
 	}
@@ -2501,6 +2986,7 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	// none (SetModelReasonless), whatever its list says
 	if s.ModelReasonless[e.ID] {
 		e.Efforts, e.Reasoning, e.AgentsV2, e.Reasonless = nil, false, false, true
+		e.AlwaysThinks, e.DefaultEffort = false, ""
 	}
 	return e
 }
@@ -2595,6 +3081,13 @@ func Resolve(id string) (Provider, string, bool) {
 	// asking, but a value in its settings still has it
 	id = strings.TrimSuffix(strings.TrimSpace(id), "[1m]")
 	if IsGroupRef(id) {
+		// the groups' entries first: Catalog copies every entry, and was
+		// built for each group an agent's settings name (the window's drift
+		// poll, every 15s)
+		entries := providerEntries()
+		if e, ok := entryIn(groupEntries(entries), id); ok {
+			return e.Provider, e.Model, true
+		}
 		if e, ok := entryIn(Catalog(), id); ok {
 			return e.Provider, e.Model, true
 		}
@@ -2614,7 +3107,7 @@ func resolveIn(entries []Entry, id string) (Provider, string, bool) {
 	if pid, model, ok := strings.Cut(id, "/"); ok {
 		// the providers a request holds (All): an agent's value of a
 		// model not listed lands here
-		if p, err := findIn(All(), pid); err == nil && p.On() && !p.ServesNone() {
+		if p := lookIn(All(), pid); p != nil && p.On() && !p.ServesNone() {
 			return *p, model, true
 		}
 	}
@@ -2625,7 +3118,10 @@ func resolveIn(entries []Entry, id string) (Provider, string, bool) {
 	}
 	// not exposed, but some provider lists it
 	var found []Provider
-	for _, p := range heldOf("listed", listedBy)[id] {
+	// kept across requests, as the catalog is: built again for each model
+	// value no entry has (an agent's bare "gpt-5.5"), every provider's whole
+	// list was 835 MB of a live magpie's 33 GB in 53 minutes
+	for _, p := range heldOf("listed", func() map[string][]Provider { return keptOf("listed", listedBy) })[id] {
 		if !p.DecidesModel(id) {
 			found = append(found, p)
 		}
@@ -2681,24 +3177,28 @@ func ListedWindow(m catalog.Model) int {
 // WindowOf is the window one of the provider's models takes, as agents are
 // told it and requests are routed on it: the one the user set for the
 // model over ListedWindow. The one set for all of the provider's models
-// ("*") is no larger than a model's own, where that is known (its listed
-// window, or the most it may be asked for, MaxContext): set to 512K to
-// spend less, it told opencode-go's cat-jam-free, which takes 262K, 512K
-// (#2112). One set for the model itself is the user's word on it, larger
-// or not. The catalog's entries and the Providers page's model lists both
-// read it, so the page shows the window agents are told.
+// ("*") is no larger than a model's own, where the provider says it (the
+// window its list or its models.dev catalog gives, or the most it may be
+// asked for, MaxContext): set to 512K to spend less, it told opencode-go's
+// cat-jam-free, which takes 262K, 512K (#2112). The window models.dev
+// gives the id under other vendors (catalog.ContextOf) is not the
+// provider's word but magpie's guess, and never caps what the user set: a
+// custom OpenAI-compatible relay set to 1M told its claude-sonnet-4-5
+// 200K (MisakaNatsuxun on Discord, 10-23). One set for the model itself
+// is the user's word on it, larger or not. The catalog's entries and the
+// Providers page's model lists both read it, so the page shows the window
+// agents are told.
 func (p Provider) WindowOf(m catalog.Model) int {
 	if n := p.Contexts[m.ID]; n > 0 {
 		return n
 	}
-	listed := ListedWindow(m)
 	if n := p.Contexts["*"]; n > 0 {
-		if most := max(listed, m.MaxContext); most > 0 && most < n {
+		if most := max(catalog.Window(m.Context), m.MaxContext); most > 0 && most < n {
 			return most
 		}
 		return n
 	}
-	return listed
+	return ListedWindow(m)
 }
 
 // ContextOf is the context the user set for the provider's model: its own,
@@ -2830,7 +3330,7 @@ func SetModelOutput(id string, n int) error {
 // model id, "*" for all of them: what its editor's Max output shows.
 func OutputsOf(providerID string) map[string]int {
 	out := map[string]int{}
-	for k, n := range settings.Load().ModelOutputs {
+	for k, n := range settings.Shared().ModelOutputs {
 		if model, ok := strings.CutPrefix(k, providerID+"/"); ok && model != "" && n > 0 {
 			out[model] = n
 		}
@@ -2841,14 +3341,21 @@ func OutputsOf(providerID string) map[string]int {
 // SetModelOutputs makes a provider's reply limits outs, by model id, "*"
 // for all of them, as its editor's Max output says (ARNO on Discord: a
 // model's maxTokens was wrong, and only the context window could be set in
-// the editor): those it leaves out are taken away, and every one set has
-// to be a model the provider serves, as for SetModelOutput. Nothing is
-// saved, nor the agents told, when nothing changed.
+// the editor): those it leaves out are taken away, and every one set or
+// changed has to be a model the provider serves, as for SetModelOutput.
+// One the user set for a model the provider has since stopped listing,
+// sent back as it is, is kept and not refused: the editor is given it
+// (OutputsOf) and sends it again on every Save, so refusing it stopped
+// each Save of that provider, whatever else changed, and the model may be
+// listed again at the next refresh (#3305, LoKi). Taking it out of Max
+// output clears it. Nothing is saved, nor the agents told, when nothing
+// changed.
 func SetModelOutputs(providerID string, outs map[string]int) error {
 	p, err := Find(providerID)
 	if err != nil {
 		return err
 	}
+	s := settings.Load()
 	for model, n := range outs {
 		if n < 0 {
 			return errorf("an output limit is a number of tokens, not %d", n)
@@ -2856,11 +3363,10 @@ func SetModelOutputs(providerID string, outs map[string]int) error {
 		if err := settings.CheckModelKey("an output limit", p.ID+"/"+model); err != nil {
 			return err
 		}
-		if model != "*" && n > 0 && !p.serves(model) {
+		if model != "*" && n > 0 && s.ModelOutputs[p.ID+"/"+model] != n && !p.serves(model) {
 			return errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
 		}
 	}
-	s := settings.Load()
 	changed := false
 	for k := range s.ModelOutputs {
 		if model, ok := strings.CutPrefix(k, p.ID+"/"); ok && outs[model] <= 0 {

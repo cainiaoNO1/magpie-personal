@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -107,4 +109,139 @@ func TestCodexKeptOnChatGPT(t *testing.T) {
 	if cfg := read(); !strings.Contains(cfg, `model_provider = "magpie"`) {
 		t.Fatalf("ChatGPT again, used up:\n%s", cfg)
 	}
+}
+
+// The same on one of Codex's own models picked beside the sign-in
+// (MasterYi on Discord: the Codex app greyed Send on a used-up account,
+// and the third-party models it was joined with couldn't be used either).
+// Sync makes magpie Codex's provider on that model as magpie serves it,
+// and once the account has room puts Codex back on the one picked, beside
+// its sign-in.
+func TestCodexOwnModelGoesThroughMagpieWhileUsedUp(t *testing.T) {
+	home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-a\"\n")
+	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"),
+		[]byte(`{"models":[{"slug":"gpt-a","display_name":"A","priority":1}]}`), 0o644)
+	cx := codex(home)
+	if ok, err := cx.Join(); err != nil || !ok {
+		t.Fatalf("join: %v %v", ok, err)
+	}
+	if cfg := read(); strings.Contains(cfg, "model_provider =") || !strings.Contains(cfg, `model = "gpt-a"`) {
+		t.Fatalf("joined:\n%s", cfg)
+	}
+	if cx.AppOut() {
+		t.Fatal("joined with room: AppOut")
+	}
+	codexUsedUp = func() bool { return true }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `model_provider = "magpie"`) || !strings.Contains(cfg, `model = "codex/gpt-a"`) {
+		t.Fatalf("used up:\n%s", cfg)
+	}
+	if !cx.AppOut() {
+		t.Fatal("used up, magpie its provider: not AppOut")
+	}
+	if err := cx.Sync(); err != nil { // still out: stays
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `model = "codex/gpt-a"`) {
+		t.Fatalf("used up, synced again:\n%s", cfg)
+	}
+	codexUsedUp = func() bool { return false }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); strings.Contains(cfg, "model_provider =") || strings.Contains(cfg, "model_catalog_json") ||
+		!strings.Contains(cfg, "openai_base_url") || !strings.Contains(cfg, `model = "gpt-a"`) {
+		t.Fatalf("allowance back:\n%s", cfg)
+	}
+	if cx.AppOut() || !cx.Joined() {
+		t.Fatalf("allowance back: AppOut %v, Joined %v", cx.AppOut(), cx.Joined())
+	}
+
+	// a model the user picked while out stays theirs when room comes back
+	codexUsedUp = func() bool { return true }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cx.Fields[0].Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	codexUsedUp = func() bool { return false }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `model = "fake/m1"`) {
+		t.Fatalf("picked while out, allowance back:\n%s", cfg)
+	}
+}
+
+// Kept on ChatGPT, a used-up account on one of Codex's own models leaves
+// Codex as it is: the user chose the sign-in.
+func TestCodexOwnModelKeptOnChatGPT(t *testing.T) {
+	home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-a\"\n")
+	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"),
+		[]byte(`{"models":[{"slug":"gpt-a","display_name":"A","priority":1}]}`), 0o644)
+	cx := codex(home)
+	if ok, err := cx.Join(); err != nil || !ok {
+		t.Fatalf("join: %v %v", ok, err)
+	}
+	if err := cx.Field("login").Set("chatgpt"); err != nil {
+		t.Fatal(err)
+	}
+	codexUsedUp = func() bool { return true }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); strings.Contains(cfg, "model_provider =") || !strings.Contains(cfg, `model = "gpt-a"`) {
+		t.Fatalf("kept on ChatGPT, used up:\n%s", cfg)
+	}
+	if cx.AppOut() {
+		t.Fatal("kept on ChatGPT: AppOut")
+	}
+}
+
+// Moved onto magpie on one of Codex's own models while the account is
+// used up, then kept on ChatGPT from the Agents row's takeover line
+// (eddie.zhan on Discord: the Codex app's browser use said it had no
+// permission): Codex goes back on its sign-in at once, on the model it
+// picked, beside it as joined, and no later Sync moves it again.
+func TestCodexOwnModelOutThenKeptOnChatGPT(t *testing.T) {
+	home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-a\"\n")
+	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"),
+		[]byte(`{"models":[{"slug":"gpt-a","display_name":"A","priority":1}]}`), 0o644)
+	cx := codex(home)
+	if ok, err := cx.Join(); err != nil || !ok {
+		t.Fatalf("join: %v %v", ok, err)
+	}
+	codexUsedUp = func() bool { return true }
+	t.Cleanup(func() { codexUsedUp = func() bool { return false } })
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if !cx.AppOut() {
+		t.Fatalf("used up: not AppOut:\n%s", read())
+	}
+	if err := cx.Field("login").Set("chatgpt"); err != nil {
+		t.Fatal(err)
+	}
+	onSignIn := func(when string) {
+		t.Helper()
+		if cfg := read(); strings.Contains(cfg, "model_provider =") || strings.Contains(cfg, "model_catalog_json") || !strings.Contains(cfg, `model = "gpt-a"`) {
+			t.Fatalf("%s:\n%s", when, cfg)
+		}
+		if cx.AppOut() {
+			t.Fatalf("%s: AppOut", when)
+		}
+	}
+	onSignIn("kept on ChatGPT while used up")
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	onSignIn("kept on ChatGPT, synced")
+	codexUsedUp = func() bool { return false }
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	onSignIn("kept on ChatGPT, allowance back")
 }

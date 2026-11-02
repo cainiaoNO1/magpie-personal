@@ -7,6 +7,9 @@ let gatewayOwnDraft = "";
 // #905) to how it is shown; what no provider has now is shown as it is kept
 let gatewayAccountNames = {};
 let gatewayKeysRead = 0;
+// gatewayKeysErr is why the list couldn't be read, said in its place until
+// a read works: a redraw of the page (the providers' poll) keeps it
+let gatewayKeysErr = "";
 // gatewayLimit is the key whose limit editor is open, and its draft
 // (#585): what is picked in it is sent only by its Save.
 let gatewayLimit = null;
@@ -59,12 +62,47 @@ async function loadGatewayKeys() {
     // A fresh list also refreshes a selected credential, which may have rotated.
     connectSecret = null;
     gatewayKeys = out.keys || [];
+    gatewayKeysErr = "";
     renderGatewayKeys();
     if (view === "gateway" && providers) selectConnectKey(connectKeyID);
   } catch (e) {
     if (read !== gatewayKeysRead) return;
-    $("#gatewayKeys").replaceChildren(el("div", "none", t(e.message)));
+    // a list read before stays: only one never read is said unreadable
+    if (gatewayKeys !== null) return status(t(e.message), "err");
+    gatewayKeysErr = e.message;
+    renderGatewayKeys();
   }
+}
+
+// refreshGatewayKeys reads the keys again for what each has used of its
+// limits, which only a visit to the page read before: left open, a reset
+// key's line said $0.00 however much was spent after it (Young on Discord).
+// It runs as the page is drawn again (the window back, a Refresh) and on
+// a timer while the page is in sight; the list is drawn again only when
+// it changed, and not while a key is being added, renamed or its limit
+// edited, nor while an action is on its way.
+async function refreshGatewayKeys() {
+  if (gatewayKeys === null || gatewayKeysBusy) return;
+  const read = ++gatewayKeysRead;
+  let out;
+  try { out = await api("caller-keys"); } catch { return; }
+  if (read !== gatewayKeysRead || gatewayKeysBusy) return;
+  const keys = out.keys || [];
+  if (JSON.stringify(keys) === JSON.stringify(gatewayKeys)) return;
+  gatewayKeys = keys;
+  gatewayAccountNames = out.accountNames || gatewayAccountNames;
+  if (gatewayKeyDraft === null && gatewayLimit === null && !$("#gatewayKeys .rename-in")) renderGatewayKeys();
+}
+// the timer: only while the Gateway page is in sight, as a look with
+// nothing to do wakes the web content process all the same (#3185)
+let gatewayKeysTick = 0;
+function gatewayKeysTicks() {
+  const page = $("#view-gateway");
+  if (!page || page.hidden || document.hidden) { clearInterval(gatewayKeysTick); gatewayKeysTick = 0; return; }
+  gatewayKeysTick ||= setInterval(() => {
+    if ($("#view-gateway").hidden || document.hidden) return gatewayKeysTicks();
+    if (view === "gateway" && gatewayKeys?.some((k) => !k.off && keyUsed(k).length)) refreshGatewayKeys();
+  }, 15e3);
 }
 
 async function gatewayKeyAction(action, body) {
@@ -163,25 +201,32 @@ function copyCallerKeyBtn(k) {
 }
 
 function renderGatewayKeys() {
+  // a drag in progress keeps its rows: the list is drawn when it ends
+  if (gatewayKeysArranging) { gatewayKeysRenderPending = true; return; }
   const box = $("#gatewayKeys");
   $("#gatewayKeysBlock").hidden = !providers?.gateway.lan;
   box.replaceChildren();
   $("#addGatewayKey").onclick = () => { gatewayKeyDraft = ""; renderGatewayKeys(); };
-  if (gatewayKeys === null) return;
-  const list = el("div", "accts");
+  // keys: a badge left unset folds away until the row is pointed at, as
+  // on a provider's keys, so nothing invisible holds a place in the row
+  const list = el("div", "accts gw-keys");
+  if (gatewayKeys === null) {
+    if (gatewayKeysErr) list.append(el("div", "none", t(gatewayKeysErr))), box.append(list);
+    return;
+  }
+  const rows = [];
   for (const k of gatewayKeys) {
     const row = el("div", "acc" + (k.off ? " off" : " in-use"));
+    rows.push(row);
     row.dataset.key = k.id;
     const tick = el("button", "dot tick");
     tick.title = t(k.off ? "Enable key" : "Disable key");
     tick.setAttribute("aria-label", tick.title);
     if (!k.off) tick.append(svg(CHECK, 10, 2.2));
     tick.onclick = () => gatewayKeyAction(k.off ? "on-key" : "off-key", { key: k.id });
-    const rm = el("button", "text quiet", t("Remove"));
-    rm.onclick = () => askGatewayKey(k, false);
-    const rotate = el("button", "text quiet", t("Rotate key"));
-    rotate.onclick = () => askGatewayKey(k, true);
-    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), el("span", "grow"), gatewayModelsBadge(k), gatewayQuotasBadge(k), gatewayLimitBadge(k), copyCallerKeyBtn(k), rotate, rm);
+    // the copy sits by the key it copies (the owner: stranded among the
+    // badges it read as nobody's); Rotate and Remove wait in the row's menu
+    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), copyCallerKeyBtn(k), el("span", "grow"), ...(k.readOnly ? [gatewayReadOnlyTag()] : []), gatewayModelsBadge(k), gatewayQuotasBadge(k), gatewayLimitBadge(k), gatewayKeyMore(k));
     const under = gatewayLimit?.id === k.id ? [gatewayLimitEditor(k)] : keyUsed(k).map((u) => gatewayLimitLine(k, u));
     if (under.length) row.classList.add("with-limit"), row.append(...under);
     list.append(row);
@@ -189,6 +234,119 @@ function renderGatewayKeys() {
   if (gatewayKeyDraft !== null) list.append(gatewayKeyForm());
   else if (!gatewayKeys.length) list.append(el("div", "none", t("No gateway keys yet")));
   box.append(list);
+  gatewayKeysArrange(list, rows);
+  const page = gatewayKeyPage();
+  if (page) box.append(page);
+}
+
+// gatewayKeysArrange: the keys are listed in the order the user puts them
+// in (alextjy on Discord), dragged by a row anywhere off its buttons, or
+// moved with Alt+↑/↓ on it, as the search APIs are (searchArrange); the
+// grip that says so shows on the row under the pointer. The order is kept
+// with the keys (move-key), so `magpie gateway-key list`, Connect's key
+// picker and the Requests page's key filter list them the same way. The
+// new order shows at once, and the list is read again when it can't be
+// saved.
+let gatewayKeysArranging = false, gatewayKeysRenderPending = false;
+function gatewayKeysArranged() {
+  gatewayKeysArranging = false;
+  if (gatewayKeysRenderPending) { gatewayKeysRenderPending = false; renderGatewayKeys(); }
+}
+function gatewayKeysArrange(list, rows) {
+  if (rows.length < 2) return;
+  list.classList.add("reorderable");
+  const move = async (row, to) => {
+    const from = rows.indexOf(row);
+    if (gatewayKeysBusy || to < 0 || to >= rows.length || to === from) return;
+    const id = row.dataset.key, focus = document.activeElement === row;
+    const next = [...gatewayKeys];
+    next.splice(to, 0, ...next.splice(from, 1));
+    gatewayKeys = next;
+    renderGatewayKeys();
+    const refocus = () => { if (focus) $(`#gatewayKeys .acc[data-key="${CSS.escape(id)}"]`)?.focus({ preventScroll: true }); };
+    refocus();
+    if (await gatewayKeyAction("move-key", { key: id, index: to })) status(t("Gateway key order saved"), "ok");
+    else await loadGatewayKeys(); // not saved: the order as it is kept
+    refocus();
+  };
+  for (const row of rows) {
+    const name = row.querySelector(".n")?.textContent || "";
+    row.tabIndex = 0;
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", name + " · " + t("Drag to reorder · Alt+↑/↓ to move"));
+    row.title = t("Drag to reorder · Alt+↑/↓ to move");
+    row.prepend(el("span", "grip"));
+    row.addEventListener("click", (e) => {
+      if (row.dataset.dragged) { e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+    row.onkeydown = (e) => {
+      if (e.target !== row || !e.altKey || !["ArrowUp", "ArrowDown"].includes(e.key) || gatewayKeysArranging) return;
+      e.preventDefault(); e.stopPropagation();
+      move(row, rows.indexOf(row) + (e.key === "ArrowUp" ? -1 : 1));
+    };
+    row.onpointerdown = (e) => {
+      if (gatewayKeysArranging || gatewayKeysBusy || e.target.closest("input, textarea, select, a, button, .key-limit-ed")) return;
+      gatewayKeysArranging = dragRows(e, row, row, list, rows, (to) => move(row, to), () => { closeProtoMenu(); closeAgentMenu(); },
+        gatewayKeysArranged);
+    };
+  }
+}
+
+// the key page (the gateway's /me): where a key's holder, with their key
+// alone, sees what it has used and may use and the setup for their agents
+// (zytszone on X: a department shares one magpie, whose app its people
+// can't be given). Its address is the one other machines reach.
+function gatewayKeyPage() {
+  const g = providers?.gateway, lan = g?.lanURLs || [];
+  const at = g?.publicURL || (lan.includes(connectURL) ? connectURL : lan[0]);
+  if (!at || !gatewayKeys?.length) return null;
+  const url = at.replace(/\/+$/, "") + "/me";
+  const p = el("div", "usage-note gw-key-page");
+  p.append(el("span", "", t("Key holders see their usage and setup at")), " ", el("code", "", url), copyBtn(url, t("Key page")));
+  return p;
+}
+
+const ROTATE_GLYPH = "M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3.25h-3.25";
+const REMOVE_GLYPH = "M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5M7 7v4M9 7v4";
+const POWER_GLYPH = "M8 2.5v5M4.8 4.6a4.75 4.75 0 1 0 6.4 0";
+function gatewayKeyMore(k) {
+  const more = el("button", "copy gw-key-more");
+  more.type = "button";
+  more.title = t("Key actions");
+  more.setAttribute("aria-label", t("Key actions"));
+  more.setAttribute("aria-haspopup", "menu");
+  more.append(svg(DOTS, 14, 2));
+  more.onclick = (e) => {
+    e.stopPropagation();
+    if (more.classList.contains("open")) return closeAgentMenu();
+    // off and on again here too, by name, beside Remove (wei_VC on X:
+    // the tick alone wasn't seen as a switch, so a key was removed and
+    // added again)
+    openRowMenu(more, [
+      { name: k.off ? "Enable key" : "Disable key", icon: POWER_GLYPH, run: () => gatewayKeyAction(k.off ? "on-key" : "off-key", { key: k.id }) },
+      // read-only (Steven on Discord: a desk display's key reads quotas
+      // and usage, and uses nothing); the sharing key is given to agents
+      k.readOnly
+        ? { name: "Give full access", icon: EYE_GLYPH, run: () => gatewayKeyAccess(k, false) }
+        : { name: "Make read-only", icon: EYE_GLYPH, run: () => gatewayKeyAccess(k, true), off: k.lan, why: k.lan ? t("The sharing key is given to agents, so it can't be read-only") : "" },
+      { name: "Rotate key", icon: ROTATE_GLYPH, run: () => askGatewayKey(k, true) },
+      { name: "Remove", icon: REMOVE_GLYPH, sep: true, run: () => askGatewayKey(k, false) },
+    ]);
+  };
+  return more;
+}
+
+const EYE_GLYPH = "M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8zM8 9.9a1.9 1.9 0 1 0 0-3.8 1.9 1.9 0 0 0 0 3.8z";
+async function gatewayKeyAccess(k, readOnly) {
+  const out = await gatewayKeyAction("access-key", { key: k.id, readOnly });
+  if (out) status(t(readOnly ? "{name} is read-only" : "{name} has full access", { name: k.name }), "ok");
+}
+// a read-only key says so in its row, always: it reads quotas and usage
+// and uses no model
+function gatewayReadOnlyTag() {
+  const tag = el("span", "amodels key-readonly set", t("Read only"));
+  tag.title = t("This key only reads quotas and usage. It can't use models or MCP servers, or change anything.");
+  return tag;
 }
 
 function askGatewayKey(k, rotate) {
@@ -241,9 +399,13 @@ function gatewayModelsBadge(k) {
   b.textContent = !ms.length && !as.length ? t("All models")
     : ms.length ? (ms.length === 1 && !as.length ? ms[0] : t("{n} models", { n: ms.length }))
       : (as.length === 1 ? accountShown(as[0]) : t("{n} accounts", { n: as.length }));
+  // an account picked and no model holds the key to the accounts'
+  // providers' models (access.HeldModels, Linka on Discord): it is not
+  // let off to every other provider's
   b.title = (ms.length ? t("Only these models: {list}", { list: ms.join(", ") }) : t("Pick the models this key may use"))
     + (as.length ? "\n" + t("Only these accounts: {list}", { list: as.map(accountShown).join(", ") })
-      + "\n" + t("A provider with no account picked is used on every account; to keep the key off it, pick only other providers' models") : "");
+      + "\n" + (ms.length ? t("A provider with no account picked is used on every account; to keep the key off it, pick only other providers' models")
+        : t("No model is picked, so this key may use only the picked accounts' providers' models")) : "");
   b.setAttribute("aria-label", t("Models this key may use"));
   b.setAttribute("aria-haspopup", "menu");
   b.setAttribute("aria-expanded", "false");
@@ -261,10 +423,20 @@ function gatewayModelsBadge(k) {
     // every one, and its unticked accounts say so (#2077: unticking all of
     // Codex's left Codex's models served)
     const named = new Set(as.map((v) => v.split("/")[0].toLowerCase()));
+    // a provider the key's models leave out is used on none of its
+    // accounts: with no model picked, every provider no account is
+    // picked of (access.HeldModels)
+    const modelsReach = (pid) => ms.some((m) => {
+      const head = m.split("/")[0].toLowerCase();
+      return head === pid || head.includes("*");
+    });
     for (const a of accounts || []) {
       accountsSet.add(a.id);
-      const note = as.length && !named.has(String(a.provider).toLowerCase())
-        ? t("Used: no {provider} account is picked", { provider: a.providerName })
+      const pid = String(a.provider).toLowerCase();
+      const note = as.length && !named.has(pid)
+        ? (ms.length && modelsReach(pid)
+          ? t("Used: no {provider} account is picked", { provider: a.providerName })
+          : t("Not used: no {provider} model or account is picked", { provider: a.providerName }))
         : a.plan ? a.providerName + " · " + a.plan : a.providerName;
       const o = { v: a.id, name: a.name, note, literalName: true };
       ofProvider.set(a.provider, [...(ofProvider.get(a.provider) || []), o]);
@@ -295,7 +467,11 @@ function gatewayModelsBadge(k) {
         seen.add(m.provider);
         opts.push({ v: m.provider + "/*", name: t("Every {provider} model", { provider: m.providerName }), note: m.provider + "/*", literalName: true });
       }
-      opts.push({ v: m.id, name: m.name, note: m.id, literalName: true });
+      // a decision model (Jev, Clef…) no agent lists: a routing group
+      // asks it whatever the key may use, and the key may ask it itself
+      // (/v1/systemone, another magpie's list) only when it is picked
+      // (Kautism on Discord)
+      opts.push({ v: m.id, name: m.name, note: m.decides ? m.id + " · " + t("Decision model: a routing group asks it whatever this key may use; pick it so the key may ask it itself") : m.id, literalName: true });
     }
     endBlock();
     // a provider with accounts and no model in the list (one kept
@@ -314,7 +490,10 @@ function gatewayModelsBadge(k) {
         const pickedModels = picked.filter((v) => !accountsSet.has(v));
         const pickedAccounts = picked.filter((v) => accountsSet.has(v));
         const out = await gatewayKeyAction("models-key", { key: k.id, models: pickedModels });
-        if (out) status(t(pickedModels.length ? "{name} may use only the models picked" : "{name} may use every model", { name: k.name }), "ok");
+        if (out) {
+          status(t(pickedModels.length ? "{name} may use only the models picked"
+            : pickedAccounts.length ? "{name} may use only the picked accounts' models" : "{name} may use every model", { name: k.name }), "ok");
+        }
         if (pickedAccounts.length !== as.length || pickedAccounts.some((v) => !as.includes(v))) {
           await gatewayKeyAction("accounts-key", { key: k.id, accounts: pickedAccounts });
         }

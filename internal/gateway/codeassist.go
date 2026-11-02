@@ -2,10 +2,13 @@ package gateway
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -45,15 +48,130 @@ func accountAgent(p provider.Provider) string {
 }
 
 // antigravityTurnsAway: a system prompt Antigravity answers with a 429
-// "Resource has been exhausted (e.g. check quota)" whatever the quota left,
-// the one Claude Code and its Agent SDK (Claude Desktop's chats) send: its
-// billing line or the SDK's identity line anywhere in the system
-// instruction turns the request away, on every model, while the same words
-// in a message go through (#666). magpie doesn't hide them from Google; it
-// says why, so no one chases a quota that isn't spent.
+// "Resource has been exhausted (e.g. check quota)" whatever the quota left:
+// one that carries a line of agTurnedAway anywhere in the system
+// instruction, in any case, is turned away on every model, while the same
+// words in a message go through (#666). magpie breaks those lines up before
+// they go (antigravityCloak); this still tells the refusal for what it is
+// when the user has the prompt sent as written, or Google turns away one
+// that was broken up, so no one chases a quota that isn't spent.
 func antigravityTurnsAway(system string) bool {
-	return strings.Contains(system, "x-anthropic-billing-header:") ||
-		strings.Contains(system, "built on Anthropic's Claude Agent SDK")
+	low := strings.ToLower(system)
+	for _, line := range agTurnedAway {
+		if strings.Contains(low, line) {
+			return true
+		}
+	}
+	return false
+}
+
+// agTurnedAway are the lines, lower-cased, that Antigravity turns a system
+// instruction away for, each tried on a real account:
+//   - Claude Code's billing line and the Claude Agent SDK's identity line
+//     (Claude Desktop's chats) (#666);
+//   - the identity lines of Codex's own prompts for its GPT-5 models
+//     (gpt-5.6-sol's "You are Codex, an agent based on GPT-5. You and the
+//     user share one workspace…"). Codex sends its model's prompt as the
+//     conversation's first developer message, and a thread begun on a GPT
+//     model keeps it when it is switched to another (/model, resume -m) or
+//     forked as an agent's thread, so such a thread on an Antigravity model
+//     never got an answer (Jodiezzzzzz on X, 10-27). The prompt magpie
+//     handed other models until 11-01 ("You are Codex, based on GPT-5."),
+//     "an AI agent based on GPT-5" and GPT-6's prompt go through. Codex's
+//     prompt for a model it doesn't know, which other models carry since
+//     ("You are a coding agent running in the Codex CLI"), has not been
+//     tried on a real account;
+//   - Hermes Agent's earlier default persona (its SOUL.md until Hermes
+//     replaced it: "You are Hermes Agent, an intelligent AI assistant
+//     created by Nous Research. …"), which a SOUL.md the user edited keeps
+//     (zgoodz on X, 10-27). The line without "Research", "AI" or "Hermes"
+//     goes through, and so does today's "You are Hermes Agent, built by
+//     Nous Research."
+//
+// Each is broken up before it goes by a zero-width space after its first
+// letter (antigravityCloak), which Google lets through: each line so
+// broken ("Y", U+200B, "ou are Codex, an agent based on GPT-5"; "b",
+// U+200B, "uilt on Anthropic's Claude Agent SDK"; and so on) was answered
+// on a real account where the line as written was turned away. A mention
+// of the Claude Agent SDK elsewhere ("running within the Claude Agent
+// SDK") goes through as written, and is sent so.
+var agTurnedAway = []string{
+	"x-anthropic-billing-header:",
+	"built on anthropic's claude agent sdk",
+	"you are codex, an agent based on gpt-5",
+	"you are codex, a coding agent based on gpt-5",
+	"hermes agent, an intelligent ai assistant created by nous research",
+}
+
+// antigravityTurnsCodexAway says whether system carries Codex's GPT-5
+// identity line that Antigravity turns away.
+func antigravityTurnsCodexAway(system string) bool {
+	low := strings.ToLower(system)
+	return strings.Contains(low, "you are codex, an agent based on gpt-5") ||
+		strings.Contains(low, "you are codex, a coding agent based on gpt-5")
+}
+
+// antigravityTurnsHermesAway says whether system carries Hermes Agent's
+// earlier default persona that Antigravity turns away.
+func antigravityTurnsHermesAway(system string) bool {
+	return strings.Contains(strings.ToLower(system), "hermes agent, an intelligent ai assistant created by nous research")
+}
+
+// zeroWidth is what antigravityCloak puts inside a line Antigravity turns
+// away: U+200B, which the model reads past and Google's check doesn't.
+const zeroWidth = "\u200b"
+
+// antigravityCloak is system with each line of agTurnedAway in it broken up
+// by a zero-width space after its first letter, wherever and in whatever
+// case it is, and every other word as the agent wrote it: what an
+// Antigravity account's system instruction is sent as, unless the user has
+// it sent as written (Provider.PromptAsWritten). A line already broken up
+// (the antigravity-cloak plugin's) isn't one any more and is left alone.
+func antigravityCloak(system string) string {
+	if !antigravityTurnsAway(system) {
+		return system
+	}
+	// lower-casing keeps every byte offset here: each line is ASCII, and
+	// a match is found in low at the offset it has in system only while
+	// the two are the same length, which ToLower can change outside ASCII
+	low := strings.ToLower(system)
+	if len(low) != len(system) {
+		low = asciiLower(system)
+	}
+	var at []int
+	for _, line := range agTurnedAway {
+		for i := 0; ; {
+			j := strings.Index(low[i:], line)
+			if j < 0 {
+				break
+			}
+			at = append(at, i+j+1)
+			i += j + len(line)
+		}
+	}
+	slices.Sort(at)
+	at = slices.Compact(at)
+	var b strings.Builder
+	b.Grow(len(system) + len(at)*len(zeroWidth))
+	prev := 0
+	for _, i := range at {
+		b.WriteString(system[prev:i])
+		b.WriteString(zeroWidth)
+		prev = i
+	}
+	b.WriteString(system[prev:])
+	return b.String()
+}
+
+// asciiLower lower-cases only ASCII letters, keeping every byte where it is.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // antigravityRefuses is what Antigravity says when it turns such a request
@@ -85,22 +203,48 @@ const agForeseeing = 6 * time.Hour
 // Antigravity has refused it within agForeseeing. It holds for exactly the
 // requests antigravityTurnedAway would tell as the refusal, and it changes
 // nothing about the account.
-func (s *Server) antigravityForeseen(p provider.Provider, from provider.Protocol, body []byte) bool {
+// What it gives is the hint for that system prompt, or "" when p would be
+// asked.
+func (s *Server) antigravityForeseen(p provider.Provider, from provider.Protocol, body []byte) string {
 	if accountAgent(p) != "antigravity" {
-		return false
+		return ""
 	}
 	at := s.agTurnedAway.Load()
 	if at == 0 || time.Since(time.Unix(0, at)) > agForeseeing {
-		return false
+		return ""
 	}
 	req, err := parse(from, body)
-	return err == nil && antigravityTurnsAway(req.System)
+	if err != nil || !antigravityTurnsAway(req.System) {
+		return ""
+	}
+	return antigravityHint(req.System)
 }
 
 // antigravityTurnedAwayHint is what magpie adds to Antigravity's words, after
 // " — ", for the agent and the Routing page, which says it apart from them in
 // its own language (routing/client.js AG_TURNED_AWAY).
 const antigravityTurnedAwayHint = "Antigravity answers this 429 to the system prompt of Claude Code and the Claude Agent SDK (Claude Desktop's chats) whatever quota is left, so it is not a quota and waiting won't help; use another provider for these chats, or put one after Antigravity in a routing group"
+
+// antigravityCodexHint is the hint for Codex's GPT-5 system prompt
+// (routing/client.js AG_CODEX): the thread keeps the prompt it began with,
+// and a new one on the Antigravity model is sent magpie's own.
+const antigravityCodexHint = "Antigravity answers this 429 to Codex's own system prompt for GPT-5 models whatever quota is left, so it is not a quota and waiting won't help; a Codex chat begun on a GPT model keeps that prompt after a model switch or a fork, so start a new chat on this model"
+
+// antigravityHermesHint is the hint for Hermes Agent's earlier default
+// persona (routing/client.js AG_HERMES).
+const antigravityHermesHint = "Antigravity answers this 429 to Hermes Agent's earlier default persona (its SOUL.md) whatever quota is left, so it is not a quota and waiting won't help; Hermes' current default persona goes through, so put it in SOUL.md, or use another provider for these chats"
+
+// antigravityHint is the hint for what Antigravity turned away with system
+// as its system instruction.
+func antigravityHint(system string) string {
+	if antigravityTurnsCodexAway(system) {
+		return antigravityCodexHint
+	}
+	if antigravityTurnsHermesAway(system) {
+		return antigravityHermesHint
+	}
+	return antigravityTurnedAwayHint
+}
 
 // turnedAwayStatus is what the agent is told when nobody is left to answer
 // what Antigravity turned away: a request it shouldn't send again as it is.
@@ -141,7 +285,21 @@ func codeAssistID(model, effort, agent string) string {
 // in force is looked up against the very id the envelope is addressed to:
 // asking twice reads the vendor's catalogue twice over for one answer.
 func codeAssistBody(p provider.Provider, r *Request, model string, wires map[string]string) []byte {
+	// a model the user lists by an id of theirs (SetModelID) is the
+	// account's own model: its envelope, the variant the effort picks and
+	// a name for the whole provider are of the vendor's id
+	model = p.OwnModelID(model)
 	sent := codeAssistID(model, r.Effort, p.Account.Agent)
+	if p.Account.Agent == "antigravity" && !p.PromptAsWritten {
+		// the lines Google turns away, broken up; the request the
+		// caller holds keeps the system prompt as written, which the
+		// refusal is told against (antigravityTurnedAway)
+		if cloaked := antigravityCloak(r.System); cloaked != r.System {
+			rc := *r
+			rc.System = cloaked
+			r = &rc
+		}
+	}
 	body := buildCodeAssistSent(r, sent, p.Account.Agent)
 	if wire := provider.UpstreamNameAsIn(wires, p.ID, model, sent); wire != sent {
 		body = rewriteModel(body, wire)
@@ -164,6 +322,7 @@ func buildCodeAssist(r *Request, model, agent string) []byte {
 // the request goes out under is the one everything below is shaped from.
 // agent "vertex" is Vertex AI's request (buildVertex).
 func buildCodeAssistSent(r *Request, sent, agent string) []byte {
+	r = responseInstructions(r)
 	ag := agent == "antigravity"
 	vx := agent == "vertex"
 	at := "" // the level the id says it thinks at
@@ -411,9 +570,16 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 			gen["responseJsonSchema"] = sc
 		}
 	}
-	if catalog.DrawsID(sent) {
-		// an image model draws only when asked for images too
+	if catalog.DrawsID(sent) || r.draws {
+		// an image model draws only when asked for images too: one named
+		// for them, or any asked to draw (a plugin's that says it does)
 		gen["responseModalities"] = []string{"TEXT", "IMAGE"}
+	}
+	if len(r.ImageConfig) > 0 {
+		// the size and shape a Gemini client asked its image drawn at, as
+		// it asked them: left out, the model drew at its default size
+		// (#3820)
+		gen["imageConfig"] = r.ImageConfig
 	}
 	if len(gen) > 0 {
 		req["generationConfig"] = gen
@@ -602,6 +768,14 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 		}
 		return tc
 	}
+	if off, _, _, ok := vertexBudgets(strings.TrimPrefix(m, "models/")); ok && r.ThinkOff && !claude {
+		// reasoning turned off (a Chat client's effort none, the routing
+		// classifier's ask) goes as 2.5's off budget, as on Vertex AI:
+		// 0 for Flash and Flash-Lite, Pro's least, 128. It went as low's
+		// 4096 (tangtang969 on X: a classifier that doesn't think is
+		// faster)
+		return map[string]any{"thinkingBudget": off}
+	}
 	budget := budgetOf(effortOf(r.Effort))
 	if claude && r.MaxTokens > 0 && budget >= r.MaxTokens {
 		budget = r.MaxTokens - 1
@@ -648,13 +822,113 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 			}
 		}
 	}
-	var walk func(v any, depth int) any
-	walk = func(v any, depth int) any {
+	// localRef is the schema a local $ref names in root: a JSON pointer
+	// ("#", "#/properties/func/properties/triggers/items", as dsh's tool
+	// parameters carry one, #4561) or, when it is none, a $defs or
+	// definitions name; ok false where it names nothing here
+	localRef := func(ref string) (any, bool) {
+		if rest, ok := strings.CutPrefix(ref, "#/"); ok {
+			cur := any(root)
+			for _, tok := range strings.Split(rest, "/") {
+				tok = strings.ReplaceAll(strings.ReplaceAll(tok, "~1", "/"), "~0", "~")
+				switch m := cur.(type) {
+				case map[string]any:
+					cur = m[tok]
+				case []any:
+					n, err := strconv.Atoi(tok)
+					if err != nil || n < 0 || n >= len(m) {
+						return nil, false
+					}
+					cur = m[n]
+				default:
+					return nil, false
+				}
+				if cur == nil {
+					// named nowhere the pointer says: its last
+					// segment as a $defs or definitions name, as
+					// before pointers were walked
+					d, ok := defs[ref[strings.LastIndex(ref, "/")+1:]]
+					return d, ok
+				}
+			}
+			return cur, true
+		}
+		if ref == "#" {
+			return root, true
+		}
+		d, ok := defs[ref[strings.LastIndex(ref, "/")+1:]]
+		return d, ok
+	}
+	// resolve is a member as its local $ref names it, nil when it is no
+	// schema
+	resolve := func(v any) map[string]any {
+		m, _ := v.(map[string]any)
+		if ref, ok := m["$ref"].(string); ok {
+			if d, ok := localRef(ref); ok {
+				m, _ = d.(map[string]any)
+			} else {
+				m = nil
+			}
+		}
+		return m
+	}
+	// selfRef is whether a local $ref names the site it sits at or one
+	// of its containers: in a tree, a reference to an ancestor is a
+	// self-reference
+	selfRef := func(ref, path string) bool {
+		if strings.HasPrefix(ref, "#") {
+			// whole segments: "#/properties/a" is no container of
+			// /properties/ab
+			r := ref[1:]
+			return r == "" || path == r || strings.HasPrefix(path, r+"/")
+		}
+		return false
+	}
+	// refPath is the path a $ref's target is walked at: its own pointer
+	// where the ref is a JSON pointer, the site's where it is none (a
+	// $defs name, whose place the pointer doesn't say)
+	refPath := func(ref, path string) string {
+		if strings.HasPrefix(ref, "#") {
+			return ref[1:]
+		}
+		return path
+	}
+	// expanding is the $ref chain being walked, a self-reference caught
+	// before it recurses
+	expanding := map[string]bool{}
+	// schemaTypeOf is the type a schema's own shape says, what a
+	// self-reference stops at: the target's type alone
+	schemaTypeOf := func(m map[string]any) string {
+		if t, ok := m["type"].(string); ok {
+			return t
+		}
+		if m["properties"] != nil {
+			return "object"
+		}
+		if m["items"] != nil {
+			return "array"
+		}
+		return "object"
+	}
+	var walk func(v any, depth int, path string) any
+	walk = func(v any, depth int, path string) any {
 		switch x := v.(type) {
+		case bool:
+			// a boolean schema, which JSON Schema has wherever a schema
+			// goes: true is any value, the schema {}; false is none, nil,
+			// and whoever holds it leaves it out. Google's Schema is an
+			// object only, and turns the whole request away over a
+			// boolean ("…items.items (…aiplatform.master.Schema), true",
+			// han_tiv on Discord: an MCP tool's array of arrays of
+			// anything)
+			if x {
+				return map[string]any{}
+			}
+			return nil
 		case []any:
 			out := make([]any, len(x))
 			for i, e := range x {
-				out[i] = walk(e, depth)
+				out[i] = walk(e, depth, path)
 			}
 			return out
 		case map[string]any:
@@ -662,13 +936,24 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 				return map[string]any{"type": "object"}
 			}
 			if ref, ok := x["$ref"].(string); ok {
-				name := ref[strings.LastIndex(ref, "/")+1:]
-				if d, ok := defs[name]; ok {
-					return walk(d, depth+1)
+				if d, found := localRef(ref); found {
+					if expanding[ref] || selfRef(ref, path) {
+						// a self-reference stops at the target's
+						// type alone
+						if m, ok := d.(map[string]any); ok {
+							return map[string]any{"type": schemaTypeOf(m)}
+						}
+						return map[string]any{"type": "object"}
+					}
+					expanding[ref] = true
+					out := walk(d, depth+1, refPath(ref, path))
+					delete(expanding, ref)
+					return out
 				}
 				return map[string]any{"type": "object"}
 			}
-			// allOf: one schema with all the members' fields
+			// allOf: one schema with all the members' fields, and every
+			// field one of them requires
 			if all, ok := x["allOf"].([]any); ok {
 				merged := map[string]any{}
 				for k, v := range x {
@@ -676,9 +961,17 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 						merged[k] = v
 					}
 				}
+				required := requiredNames(x["required"])
 				for _, e := range all {
-					if m, ok := walk(e, depth+1).(map[string]any); ok {
+					// a member's required is read before it is walked: walked
+					// alone, a member that only requires ({"required":["a"]})
+					// has no properties to keep its names for
+					required = append(required, requiredNames(resolve(e)["required"])...)
+					if m, ok := walk(e, depth+1, path+"/allOf").(map[string]any); ok {
 						for k, v := range m {
+							if k == "required" {
+								continue
+							}
 							if k == "properties" {
 								props, _ := merged["properties"].(map[string]any)
 								if props == nil {
@@ -694,9 +987,23 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 						}
 					}
 				}
-				return walk(merged, depth+1)
+				if len(required) > 0 {
+					merged["required"] = distinctNames(required)
+				}
+				return walk(merged, depth+1, path)
 			}
-			// anyOf / oneOf: the first member that isn't null, nullable
+			if (x["anyOf"] != nil || x["oneOf"] != nil) && ownShape(x) {
+				// a schema with its own type or properties beside an anyOf
+				// or oneOf keeps them, and the union is folded into it:
+				// Philo's rg tool is an object whose oneOf only says which
+				// of its fields go together, and its first branch, standing
+				// for the whole, sent it as {"type":"string"}; Claude on
+				// Antigravity answered 400 "input_schema.type: Input should
+				// be 'object'" (#4046, imuxin)
+				return walk(foldUnion(x, resolve), depth+1, path)
+			}
+			// anyOf / oneOf with nothing of its own beside it: the first
+			// member that isn't null, nullable
 			for _, k := range []string{"anyOf", "oneOf"} {
 				if alts, ok := x[k].([]any); ok {
 					var pick map[string]any
@@ -711,7 +1018,7 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 					}
 					out := map[string]any{}
 					if pick != nil {
-						if m, ok := walk(pick, depth+1).(map[string]any); ok {
+						if m, ok := walk(pick, depth+1, path+"/"+k).(map[string]any); ok {
 							out = m
 						}
 					}
@@ -749,6 +1056,14 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 								out["type"] = t
 							}
 						}
+						// Google has one type a node: of a list, the one
+						// its items or properties are for
+						for _, t := range ts {
+							if t == "array" && x["items"] != nil || t == "object" && x["properties"] != nil {
+								out["type"] = t
+								break
+							}
+						}
 					} else {
 						out["type"] = v
 					}
@@ -756,12 +1071,24 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 					props := map[string]any{}
 					if m, ok := v.(map[string]any); ok {
 						for pk, pv := range m {
-							props[pk] = walk(pv, depth+1)
+							// a property whose schema is false is one the
+							// call may not have: it is left out, and so is
+							// its name in required
+							at := strings.ReplaceAll(strings.ReplaceAll(pk, "~", "~0"), "/", "~1")
+							if w := walk(pv, depth+1, path+"/properties/"+at); w != nil {
+								props[pk] = w
+							}
 						}
 					}
 					out[k] = props
 				case "items":
-					out[k] = walk(v, depth+1)
+					if w := walk(v, depth+1, path+"/items"); w != nil {
+						out[k] = w
+					} else if x["maxItems"] == nil {
+						// items false: an array with nothing in it
+						out[k] = map[string]any{}
+						out["maxItems"] = 0
+					}
 				case "enum":
 					// Google takes string enums only
 					if es, ok := v.([]any); ok {
@@ -794,6 +1121,33 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 					out["type"] = "array"
 				}
 			}
+			if out["type"] == "array" && out["items"] == nil {
+				// Google wants items on every array, and turns the whole
+				// request away over one with none ("…properties[batch].
+				// items: missing field", Claude Desktop's own MCP tools,
+				// plugins#375): any item is what JSON Schema means by none
+				out["items"] = map[string]any{}
+			}
+			if t, ok := out["type"].(string); ok {
+				// JSON Schema reads an array's keywords only on an array
+				// and an object's only on an object; Google turns the
+				// whole request away over one on another type ("properties
+				// [display].items: field predicate failed: $type ==
+				// Type.ARRAY", ferock on Discord: items beside a string
+				// enum)
+				if t != "array" {
+					delete(out, "items")
+					delete(out, "minItems")
+					delete(out, "maxItems")
+				}
+				if t != "object" {
+					delete(out, "properties")
+					delete(out, "required")
+					delete(out, "minProperties")
+					delete(out, "maxProperties")
+					delete(out, "propertyOrdering")
+				}
+			}
 			if req, ok := out["required"].([]any); ok {
 				// required names only the properties there are
 				props, _ := out["properties"].(map[string]any)
@@ -813,11 +1167,122 @@ func plainSchema(raw json.RawMessage) json.RawMessage {
 		}
 		return v
 	}
-	b, err := json.Marshal(walk(root, 0))
+	b, err := json.Marshal(walk(root, 0, ""))
 	if err != nil {
 		return raw
 	}
 	return b
+}
+
+// ownShape is whether a schema says what it is beside its anyOf or
+// oneOf: a type that isn't only null, properties or items.
+func ownShape(x map[string]any) bool {
+	if x["properties"] != nil || x["items"] != nil {
+		return true
+	}
+	switch t := x["type"].(type) {
+	case string:
+		return t != "null"
+	case []any:
+		for _, e := range t {
+			if e != "null" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// foldUnion is x, which has a shape of its own (ownShape), with its anyOf
+// and oneOf folded in, for a schema subset that has no unions. What x says
+// itself stands. A null branch makes it nullable. On an object, a field
+// only branches declare joins its properties, as the first branch to
+// declare it gives it, and a field every branch that isn't null requires
+// is required: the model sees every field it may send, and is held only
+// to what any choice holds it to. The rest of a branch — which fields go together, a "not" —
+// is a rule the subset can't say, and the client still checks the call
+// against its own schema.
+func foldUnion(x map[string]any, resolve func(any) map[string]any) map[string]any {
+	out := make(map[string]any, len(x))
+	for k, v := range x {
+		if k != "anyOf" && k != "oneOf" {
+			out[k] = v
+		}
+	}
+	object := x["type"] == "object" || x["properties"] != nil
+	if ts, ok := x["type"].([]any); ok {
+		for _, t := range ts {
+			object = object || t == "object"
+		}
+	}
+	props := map[string]any{}
+	own, _ := x["properties"].(map[string]any)
+	for k, v := range own {
+		props[k] = v
+	}
+	var common []any
+	branches := 0
+	for _, k := range []string{"anyOf", "oneOf"} {
+		alts, _ := x[k].([]any)
+		for _, a := range alts {
+			m := resolve(a)
+			if m == nil {
+				continue
+			}
+			if m["type"] == "null" {
+				out["nullable"] = true
+				continue
+			}
+			if !object {
+				continue
+			}
+			bp, _ := m["properties"].(map[string]any)
+			for _, pk := range slices.Sorted(maps.Keys(bp)) {
+				if _, has := props[pk]; !has {
+					props[pk] = bp[pk]
+				}
+			}
+			br := requiredNames(m["required"])
+			if branches == 0 {
+				common = append([]any(nil), br...)
+			} else {
+				common = slices.DeleteFunc(common, func(n any) bool { return !slices.Contains(br, n) })
+			}
+			branches++
+		}
+	}
+	if object {
+		if len(props) > 0 {
+			out["properties"] = props
+		}
+		if req := requiredNames(x["required"]); len(req)+len(common) > 0 {
+			out["required"] = distinctNames(append(req, common...))
+		}
+	}
+	return out
+}
+
+// requiredNames is a required list's names: its strings, a fresh slice.
+func requiredNames(v any) []any {
+	l, _ := v.([]any)
+	var out []any
+	for _, e := range l {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// distinctNames is vs with each value kept once, in order.
+func distinctNames(vs []any) []any {
+	var out []any
+	for _, v := range vs {
+		if !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // codeAssistDecoder reads Code Assist's stream: Gemini chunks, each wrapped
@@ -1220,4 +1685,43 @@ func hasResponse(parts []map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// antigravityRound is ask, a round of magpie's own search for p, told as
+// the refusal it is when Antigravity turns the system prompt away: its 429
+// or the reply's own error event gets the hint, and the attempt is marked
+// so the account doesn't rest. Codex asks every turn with its web_search
+// tool, which an Antigravity model is given magpie's search for, so its
+// turns went this way and came back as the plain 429 that Codex retried to
+// its limit (Jodiezzzzzz on X, 10-27).
+func antigravityRound(w http.ResponseWriter, p provider.Provider, ask round) round {
+	if accountAgent(p) != "antigravity" {
+		return ask
+	}
+	return func(ctx context.Context, req *Request) (<-chan Event, int, string) {
+		in, status, msg := ask(ctx, req)
+		if in == nil {
+			if status == http.StatusTooManyRequests && antigravityTurnedAway(p, req.System, msg) {
+				markAntigravityTurnsAway(w, req.System)
+				msg += " — " + antigravityHint(req.System)
+			}
+			return in, status, msg
+		}
+		out := make(chan Event, cap(in))
+		go func() {
+			defer close(out)
+			for ev := range in {
+				if ev.Kind == KError && markAntigravityRefused(w, p, req.System, ev.Text) {
+					ev.Text += " — " + antigravityHint(req.System)
+				}
+				select {
+				case out <- ev:
+				case <-ctx.Done():
+					// in's own reader stops sending once ctx is done
+					return
+				}
+			}
+		}()
+		return out, status, msg
+	}
 }

@@ -5,11 +5,14 @@
 package usageapi
 
 import (
+	"cmp"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
@@ -72,7 +75,28 @@ const PageSessions = 100
 // Usage page asks for: over a long history (Vantiboo1ean, ~750k requests)
 // State sent the page every one of ~84k sessions (22 MB) and worked the
 // summary out again for each refresh.
-func Page(p usage.Period) Usage { return stateOf(usage.SummarizeTop(p, PageSessions)) }
+func Page(p usage.Period) Usage { return PageIn(p, nil) }
+
+// PageIn is Page with the period's days and the chart's hours in zone, the
+// reader's (ZoneOf); nil is this computer's.
+func PageIn(p usage.Period, zone *time.Location) Usage {
+	return stateOf(usage.SummarizeTopIn(p, PageSessions, zone))
+}
+
+// ZoneOf is the reader's time zone, which the Usage page names in ?tz= (its
+// browser's IANA name, as Intl gives it) for its days and hours to be the
+// reader's: magpie web may be read from another zone than the computer's
+// (Outvi V on Discord). This computer's when it names none or one unknown
+// here.
+func ZoneOf(r *http.Request) *time.Location { return usage.Zone(r.URL.Query().Get("tz")) }
+
+// FilterIn is FilterOf with the reader's zone, ZoneOf(r), which its Day and
+// the period's days are read in.
+func FilterIn(r *http.Request) usage.Filter {
+	f := FilterOf(r.URL.Query())
+	f.Zone = ZoneOf(r)
+	return f
+}
 
 func stateOf(s usage.Summary) Usage {
 	out := Usage{Summary: s, Agents: []Group{}, Models: []Group{}, Accounts: []Group{}, Path: Tilde(usage.Path())}
@@ -94,11 +118,13 @@ func stateOf(s usage.Summary) Usage {
 		out.Models = append(out.Models, ug)
 	}
 	// each subscription account's share, by the account that answered
-	// (#557); Name "" is the calls whose record names none, the page
+	// (#557), named as the user named it now (provider.AccountShownOf,
+	// plugins#310): the record keeps the vendor's name, which the user's
+	// is kept by; Name "" is the calls whose record names none, the page
 	// saying "account not recorded"
 	for _, g := range s.Accounts {
 		p := which(g.Provider)
-		ug := Group{Group: g, Name: g.Account, Sub: p.Name, Icon: p.Icon}
+		ug := Group{Group: g, Name: provider.AccountShownOf(g.Provider, g.Account), Sub: p.Name, Icon: p.Icon}
 		out.Accounts = append(out.Accounts, ug)
 	}
 	out.CallerKeys = callerGroups(s)
@@ -116,10 +142,14 @@ func providerFaces(all []provider.Provider) func(id string) Named {
 	for _, p := range all {
 		set[p.ID] = p
 	}
+	renames := provider.UsageRenames()
 	return func(id string) Named {
 		a := Named{ID: id}
 		if p, ok := set[id]; ok && p.Name != "" {
 			a.Name, a.Icon = p.Name, p.Icon
+		} else if d, ok := renames.Gone(id); ok {
+			at := d.At
+			a.Name, a.Icon, a.Deleted = d.Shown(), d.Icon, &at
 		} else if id == usage.UnknownProvider {
 			a.Name = "Local session"
 		} else {
@@ -130,6 +160,13 @@ func providerFaces(all []provider.Provider) func(id string) Named {
 		}
 		if a.Icon == "" {
 			a.Icon = "generic"
+		}
+		// the deleted providers the user merged into it, so the page can
+		// part them again
+		for _, m := range renames.Merged(id) {
+			if d, ok := renames.Gone(m); ok {
+				a.Merged = append(a.Merged, Merged{ID: m, Name: d.Shown()})
+			}
 		}
 		return a
 	}
@@ -153,6 +190,29 @@ func callerGroups(s usage.Summary) []Group {
 		keys = append(keys, Group{Group: g, Name: n, Icon: "generic"})
 	}
 	return keys
+}
+
+// inKeyOrder puts the Gateway key filter's keys in the order the user
+// gave the keys on the Gateway page (alextjy on Discord), not by what each
+// used: a key removed since, which the store no longer lists, goes after
+// them, in the order it came. The Overview's list stays a ranking.
+func inKeyOrder(groups []Group) []Group {
+	current, err := access.List()
+	if err != nil {
+		return groups
+	}
+	place := make(map[string]int, len(current))
+	for i, k := range current {
+		place[k.ID] = i
+	}
+	at := func(g Group) int {
+		if i, ok := place[g.CallerKeyID]; ok {
+			return i
+		}
+		return len(current)
+	}
+	slices.SortStableFunc(groups, func(a, b Group) int { return at(a) - at(b) })
+	return groups
 }
 
 // PeriodOf is the period a ?period= names: a preset, or days picked as
@@ -236,9 +296,12 @@ type Share struct {
 }
 
 // Account is a subscription account the Account filter offers: its
-// name, and the providers it answered for, by name.
+// name, as the record keeps it and the filter asks by, the name the user
+// gave it in magpie when there is one (plugins#310), and the providers it
+// answered for, by name.
 type Account struct {
 	ID        string   `json:"id"`
+	Name      string   `json:"name,omitempty"`
 	Providers []string `json:"providers"`
 }
 
@@ -246,6 +309,18 @@ type Named struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Icon string `json:"icon"`
+	// Deleted is when the provider was deleted, for one whose calls are
+	// kept apart from a provider's added under its id since
+	Deleted *time.Time `json:"deleted,omitempty"`
+	// Merged are the deleted providers whose calls the user merged into
+	// this one (provider.MergeDeleted), by the ids they are kept apart by
+	Merged []Merged `json:"merged,omitempty"`
+}
+
+// Merged is a deleted provider merged into another.
+type Merged struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // LedgerPage is one page of the ledger: limit rows (100 when none is
@@ -276,7 +351,7 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	out.Bucket, out.Series = l.Bucket, l.Series
 	out.Purposes = l.Purposes
 	out.Day = f.Day
-	out.CallerKeys = callerGroups(usage.Summary{CallerKeys: l.CallerKeys})
+	out.CallerKeys = inKeyOrder(callerGroups(usage.Summary{CallerKeys: l.CallerKeys}))
 	callerLabels := map[string]string{}
 	for _, g := range out.CallerKeys {
 		callerLabels[g.CallerKeyID] = g.Name
@@ -321,14 +396,17 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	at := map[string]int{}
 	for _, g := range l.Accounts {
 		name := which(g.Provider).Name
+		own := provider.AccountLabelOf(g.Provider, g.Account)
 		if i, ok := at[g.Account]; ok {
-			if a := &out.Accounts[i]; !slices.Contains(a.Providers, name) {
+			a := &out.Accounts[i]
+			if !slices.Contains(a.Providers, name) {
 				a.Providers = append(a.Providers, name)
 			}
+			a.Name = cmp.Or(a.Name, own)
 			continue
 		}
 		at[g.Account] = len(out.Accounts)
-		out.Accounts = append(out.Accounts, Account{ID: g.Account, Providers: []string{name}})
+		out.Accounts = append(out.Accounts, Account{ID: g.Account, Name: own, Providers: []string{name}})
 	}
 	// what each is of: the rows of the filter, or, for the dimension the
 	// filter has picked, of the rows without that pick

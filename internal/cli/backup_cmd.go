@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"golang.org/x/term"
 
@@ -64,6 +65,9 @@ func backupCmd(args []string) error {
 		green.Render("saved"), file, len(b.Providers), what, len(b.Profiles), len(b.Agents))
 	if l := b.Library; l != nil {
 		fmt.Printf("; library: %d MCP servers, %d skills", len(l.MCP), len(l.Skills))
+		if l.Subagents != nil && len(*l.Subagents) > 0 {
+			fmt.Printf(", %d subagents", len(*l.Subagents))
+		}
 	}
 	fmt.Println()
 	fmt.Println(muted.Render("Subscriptions are not in it: sign in to them on the other machine. Keep the passphrase: without it the file can't be opened."))
@@ -143,15 +147,33 @@ func passphrase(prompt string, confirm bool) (string, error) {
 }
 
 // stdin is read through one reader, so a second secret piped in is the
-// second line and not lost to the first one's buffer.
-var stdin = bufio.NewReader(os.Stdin)
+// second line and not lost to the first one's buffer. The reader is made
+// over os.Stdin as it is when first read, never at package init: package
+// variables are set before any init runs, and on Windows the desktop
+// build's init (console_windows.go) only then swaps in the terminal's
+// CONIN$. A reader made earlier keeps the invalid handle, and every
+// prompt fails with "read /dev/stdin: The handle is invalid".
+var (
+	stdinMu   sync.Mutex
+	stdinFile *os.File
+	stdinBuf  *bufio.Reader
+)
+
+func stdin() *bufio.Reader {
+	stdinMu.Lock()
+	defer stdinMu.Unlock()
+	if stdinBuf == nil || stdinFile != os.Stdin {
+		stdinFile, stdinBuf = os.Stdin, bufio.NewReader(os.Stdin)
+	}
+	return stdinBuf
+}
 
 // secret reads what (a passphrase, a password) as passphrase does; piped
 // in, it is the next line of stdin.
 func secret(what, prompt string, confirm bool) (string, error) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		line, err := stdin.ReadString('\n')
+		line, err := stdin().ReadString('\n')
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
 			if err != nil {

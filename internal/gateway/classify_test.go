@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -249,7 +251,7 @@ func TestIntentNotAskedWhenItCantMatter(t *testing.T) {
 	hit := ruleFor("img", g, ms, img, "claude", func(string, []string, before, bool, string) (verdict, error) {
 		asked++
 		return verdict{Intent: "debugging"}, nil
-	})
+	}, "")
 	if hit.N != 0 || hit.Classified == nil || !strings.Contains(hit.Classified.Error, "no words") || asked != 0 {
 		t.Fatalf("image: %+v %+v", hit, hit.Classified)
 	}
@@ -281,9 +283,9 @@ func TestIntentClassifierFails(t *testing.T) {
 		t.Fatalf("rested: %s %+v", out, r.Rule)
 	}
 	// slow: past the timeout it's no answer
-	was := classifyTimeout
-	classifyTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { classifyTimeout = was })
+	was := classifyUnit
+	classifyUnit = 25 * time.Millisecond // the 8 seconds unset are 200ms
+	t.Cleanup(func() { classifyUnit = was })
 	c.mu.Lock()
 	c.wait = 2 * time.Second
 	c.mu.Unlock()
@@ -291,6 +293,44 @@ func TestIntentClassifierFails(t *testing.T) {
 	out, r = postOK(t, s, "f4", chat("rename everything", nil, 0, ""))
 	if !strings.Contains(out, "from ka") || !strings.Contains(r.Rule.Classified.Error, "no answer") || time.Since(t0) > 1500*time.Millisecond {
 		t.Fatalf("slow: %s %+v %s", out, r.Rule, time.Since(t0))
+	}
+}
+
+// #2934 (aurochs-code): a Kiro subscription's haiku answered past the 8
+// seconds a classifier was given, so every turn fell back. Settings'
+// Classifier timeout gives it longer: a classifier slower than the 8
+// seconds unset routes the turn by its answer once it is given 60, and
+// one given 8 again is no answer.
+func TestClassifierTimeoutSetting(t *testing.T) {
+	was := classifyUnit
+	classifyUnit = 100 * time.Millisecond // 8 seconds are 800ms, 60 are 6s
+	t.Cleanup(func() { classifyUnit = was })
+	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
+	c.set("1", 0)
+	c.mu.Lock()
+	c.wait = 2 * time.Second
+	c.mu.Unlock()
+	for i, x := range []struct {
+		seconds int
+		answers bool
+	}{{0, false}, {60, true}, {8, false}} {
+		st := settings.Load()
+		st.ClassifyTimeout = x.seconds
+		if err := settings.Save(st); err != nil {
+			t.Fatal(err)
+		}
+		// a failure rests the classifier: each case asks it afresh
+		classified.Lock()
+		delete(classified.failed, "c/cls")
+		classified.Unlock()
+		out, r := postOK(t, s, fmt.Sprintf("ct%d", i), chat(fmt.Sprintf("rename package %d", i), nil, 0, ""))
+		cl := r.Rule.Classified
+		if x.answers && (!strings.Contains(out, "from kb") || r.Rule.N != 1 || cl.Intent != "refactoring" || cl.Error != "") {
+			t.Fatalf("given %ds: %s %+v %+v", x.seconds, out, r.Rule, cl)
+		}
+		if !x.answers && (!strings.Contains(out, "from ka") || r.Rule.N != 0 || !strings.Contains(cl.Error, "no answer in 800ms")) {
+			t.Fatalf("given %ds: %s %+v %+v", x.seconds, out, r.Rule, cl)
+		}
 	}
 }
 
@@ -342,12 +382,13 @@ func TestIntentOddAnswerDoesNotRest(t *testing.T) {
 }
 
 // A classifier that reasons is asked to reason least, with room for its
-// reasoning and the number; one whose levels aren't known is asked plainly.
+// reasoning and the number; one whose levels aren't known is asked for
+// none (TestClassifierAsksThinkingOff).
 func TestIntentClassifierEffort(t *testing.T) {
 	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
 	c.set("1", 0)
 	postOK(t, s, "e1", chat("rename this package", nil, 0, ""))
-	if asked := c.last(); strings.Contains(asked, "reasoning_effort") || !strings.Contains(asked, `"max_tokens":2048`) {
+	if asked := c.last(); !strings.Contains(asked, `"reasoning_effort":"none"`) || !strings.Contains(asked, `"max_tokens":2048`) {
 		t.Fatalf("plain: %s", asked)
 	}
 	p, _ := provider.Find("c")
@@ -392,12 +433,16 @@ func TestUserText(t *testing.T) {
 		t.Fatalf("%d", len(got))
 	}
 	for in, want := range map[string]string{"1": "x", "2": "y", " 0 ": "", "2\n": "y"} {
-		if got, err := readIntent(in, []string{"x", "y"}); err != nil || got != want {
+		got, said, err := readIntent(in, []string{"x", "y"})
+		if err != nil || got != want {
 			t.Fatalf("%q: %q %v", in, got, err)
+		}
+		if said != strings.TrimSpace(in) {
+			t.Fatalf("%q: said %q", in, said)
 		}
 	}
 	for _, in := range []string{"3", "-", "none", ""} {
-		if _, err := readIntent(in, []string{"x", "y"}); err == nil {
+		if _, _, err := readIntent(in, []string{"x", "y"}); err == nil {
 			t.Fatalf("%q read", in)
 		}
 	}

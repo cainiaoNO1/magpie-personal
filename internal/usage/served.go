@@ -3,6 +3,8 @@ package usage
 import (
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -22,8 +24,11 @@ var versionTail = regexp.MustCompile(`(?:[-_@:](?:\d{4}-\d{2}-\d{2}|\d{2}-\d{2}|
 
 // vendorDot is Bedrock's region and maker before a model's name
 // (us.anthropic.claude-…), the geography of an inference profile as
-// catalog's bedrockGeos has them: global. and us-gov. among them.
-var vendorDot = regexp.MustCompile(`^(?:(?:global|us-gov|[a-z]{2,4})\.)?(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|qwen|openai|google|moonshotai|minimax|zai)\.`)
+// catalog's bedrockGeos has them: global. and us-gov. among them. The
+// makers are those models.dev's bedrock list names ids by (xai.grok-4.7,
+// writer.palmyra-x5, moonshot.kimi-k2-thinking, nvidia.nemotron), which
+// the reply names as Anthropic's own are, without the geography.
+var vendorDot = regexp.MustCompile(`^(?:(?:global|us-gov|[a-z]{2,4})\.)?(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|qwen|openai|google|moonshotai|moonshot|minimax|nvidia|writer|xai|zai)\.`)
 
 // contextTail is what Claude Code writes after a model's name for the size of
 // its context: claude-opus-5[1m].
@@ -62,7 +67,112 @@ func bareModel(m string) string {
 // (RelayRenamed).
 func Swapped(sent, served string) bool {
 	a, b := bareModel(sent), bareModel(served)
-	return a != "" && b != "" && squash(a) != squash(b) && a != "auto" && squash(bareModel(provider.EffortFamily(a))) != squash(b) && !GroupRouted(sent, served) && !ServingName(sent, served) && !RelayRenamed(sent, served)
+	return a != "" && b != "" && squash(a) != squash(b) && a != "auto" && squash(bareModel(provider.EffortFamily(a))) != squash(b) && !GroupRouted(sent, served) && !ServingName(sent, served) && !RelayRenamed(sent, served) && !VendorAlias(sent, served)
+}
+
+// vendorAlias is a vendor's own alias for one of its models, as the
+// vendor's docs state it, spelled as squash spells it: DeepSeek renamed
+// its V4.1 Flash deepseek-flash (api-docs.deepseek.com/updates,
+// 2026-09-10: "Change the model name to deepseek-flash to call the latest
+// V4.1 Flash model", the name its later entries keep answering under), so
+// a request for either is answered under whichever name the deployment
+// writes (#4593, chowyuan1314). A name the docs retire or route elsewhere
+// (deepseek-v4-flash to V4.1 Flash) is another model, not an alias.
+var vendorAlias = map[string]string{
+	"deepseekflash": "deepseekv41flash",
+}
+
+// VendorAlias reports whether served is the vendor's own alias for the
+// model sent — an official name its docs give one of its models, not
+// another model swapped in. Both ways: a request under the alias answered
+// under the name it stands for is the same model too. A vendor may rename
+// a model over time, and what its name stands for is its docs' word, so
+// only pairs the docs state go here; catalog's SameModel keeps the two ids
+// apart (the catalog lists deepseek-flash as an id of its own).
+func VendorAlias(sent, served string) bool {
+	a, b := squash(bareModel(sent)), squash(bareModel(served))
+	if a == "" || b == "" {
+		return false
+	}
+	return vendorAlias[a] == b || vendorAlias[b] == a
+}
+
+// ListedAs reports whether served is the name the provider's own model
+// list gives the model asked for: Qoder's plugin lists its free Qwen model
+// as qfmodel, named Qwen3.8-Flash, and since 0.2.38 (plugins#412) answers
+// under that name, which was marked a swap to "actual Qwen3.8-Flash"
+// (jzing.draw on Discord, 10-27). The list is the provider's word that
+// the two are one model. It is asked only once a reply already reads as
+// swapped, and each provider's list is read at most once a minute.
+func ListedAs(prov, model, served string) bool {
+	if prov == "" || model == "" || served == "" {
+		return false
+	}
+	n := listedNames(prov)[model]
+	return n != "" && n != model && SameSpelled(n, served)
+}
+
+// listedFor is how long ListedAs keeps a provider's names.
+const listedFor = time.Minute
+
+var listed struct {
+	sync.Mutex
+	by map[string]listedEntry
+}
+
+type listedEntry struct {
+	names map[string]string
+	at    time.Time
+}
+
+// listedModels is the provider's models as magpie lists them; a test
+// replaces it.
+var listedModels = func(prov string) map[string]string {
+	p, err := provider.Find(prov)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, m := range p.Available() {
+		if m.Name != "" {
+			out[m.ID] = m.Name
+		}
+	}
+	return out
+}
+
+// ListedForTest gives ListedAs these lists, provider by model id, and
+// forgets every list read before, until restore.
+func ListedForTest(lists map[string]map[string]string) (restore func()) {
+	old := listedModels
+	listedModels = func(prov string) map[string]string { return lists[prov] }
+	forgetListed()
+	return func() { listedModels = old; forgetListed() }
+}
+
+func forgetListed() {
+	listed.Lock()
+	listed.by = nil
+	listed.Unlock()
+}
+
+func listedNames(prov string) map[string]string {
+	listed.Lock()
+	e, ok := listed.by[prov]
+	listed.Unlock()
+	if ok && time.Since(e.at) < listedFor {
+		return e.names
+	}
+	// read outside the lock: a provider's list can take a moment, and
+	// another reader of another provider needn't wait on it
+	names := listedModels(prov)
+	listed.Lock()
+	if listed.by == nil {
+		listed.by = map[string]listedEntry{}
+	}
+	listed.by[prov] = listedEntry{names: names, at: time.Now()}
+	listed.Unlock()
+	return names
 }
 
 // RelayRenamed reports whether sent is served's own name with a relay's
@@ -86,10 +196,34 @@ func RelayRenamed(sent, served string) bool {
 
 // ServingName reports whether served is the vendor's own name for the
 // deployment serving the model sent, which no request asks for by: Google's
-// for a Gemini model (GeminiServing), xAI's for a Grok one (GrokServing).
+// for a Gemini model (GeminiServing), xAI's for a Grok one (GrokServing),
+// ClinePass's for one of its models (ClineServing).
 func ServingName(sent, served string) bool {
-	return GeminiServing(sent, served) || GrokServing(sent, served)
+	return GeminiServing(sent, served) || GrokServing(sent, served) || ClineServing(sent, served)
 }
+
+// ClineServing reports whether served is ClinePass's name for the virtual
+// model config ("vmc/") serving the cline-pass/ model sent: the model's
+// own name, its version's dot written as "p". ClinePass answers
+// cline-pass/deepseek-v4.1-flash-1017 as vmc/deepseek-v4p1-flash-1017
+// whichever upstream served it, DeepSeek's own API included
+// (finalProvider "deepseek": hy125245 on X, 10-23), and the swap it was
+// marked read as the request going to another provider (zRain on
+// Discord, 10-24). It holds for ClinePass's models only, and for the same
+// model: vmc/deepseek-v4p1-flash for cline-pass/deepseek-v4-pro is still
+// a swap, as is a vmc/ name for a model not asked of ClinePass.
+func ClineServing(sent, served string) bool {
+	s := strings.ToLower(strings.TrimSpace(served))
+	if !strings.HasPrefix(s, "vmc/") || !strings.Contains(strings.ToLower(sent), "cline-pass/") {
+		return false
+	}
+	a := squash(bareModel(sent))
+	return a != "" && squash(bareModel(vmcPoint.ReplaceAllString(s, "$1.$2"))) == a
+}
+
+// vmcPoint is a version's dot as ClinePass's vmc/ names write it (v4p1
+// for v4.1), the part ClineServing reads past
+var vmcPoint = regexp.MustCompile(`(\d)p(\d)`)
 
 // GrokServing reports whether served is xAI's name for the build serving
 // the Grok model sent: the model's own name with "-build" after its

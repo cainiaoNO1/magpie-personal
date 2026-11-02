@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/backup"
 	"github.com/yetone/magpie/internal/davsync"
 	"github.com/yetone/magpie/internal/edit"
@@ -127,6 +128,8 @@ func backupRoutes(mux *http.ServeMux, w Windows) {
 			_, err = davsync.Undo()
 		case "upload": // this computer's setup over a server file that isn't a backup, kept first
 			err = davsync.Upload(ctx)
+		case "follow": // the agent fields kept on this computer follow the others again
+			err = busy(davsync.Follow(ctx))
 		case "reveal":
 			err = w.OpenFolder(filepath.Join(settings.Dir(), "sync"))
 		default:
@@ -162,12 +165,16 @@ func busy(err error) error {
 	return nil
 }
 
-// downloads is where an export is saved: the Downloads folder, or home
-// when there is none.
+// downloads is where an export is saved: the Downloads folder the system
+// keeps (appdir.Downloads: Windows' known folder, the XDG one on Linux,
+// which 1Shin on Discord had moved off home\Downloads), else
+// home\Downloads, else home when there is none.
 func downloads() string {
 	home, _ := os.UserHomeDir()
-	if d := filepath.Join(home, "Downloads"); isDir(d) {
-		return d
+	for _, d := range []string{appdir.Downloads(), filepath.Join(home, "Downloads")} {
+		if d != "" && isDir(d) {
+			return d
+		}
 	}
 	return home
 }

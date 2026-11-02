@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"maps"
 	"math"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/claudelock"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
@@ -47,6 +49,34 @@ type Server struct {
 	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
 	// given the server as before.
 	OAuth *OAuthApp `json:"oauth,omitempty"`
+	// StartupTimeout is the seconds an agent waits for the server to start
+	// and list its tools: Codex's startup_timeout_sec (#3168), the only
+	// agent given it. 0 leaves it to the agent (Codex's own is 30s).
+	StartupTimeout int `json:"startupTimeout,omitempty"`
+	// Local keeps the server to this computer (huhuy72219405 on X: a
+	// server of a program or folder only this computer has). A backup or
+	// a sync never carries it, and one coming in neither takes it away nor
+	// puts another computer's of that name in its place (carry.go).
+	Local bool `json:"local,omitempty"`
+	// Plugin is the plugin (plugin.Name) whose tools the server is: the
+	// gateway serves them at its URL, and the hub calls the plugin itself
+	// (plugin_tools.go)
+	Plugin string `json:"plugin,omitempty"`
+	// Hub is how the MCP hub (Library.MCPHub) gives the server: "" shares
+	// it through the hub's one entry, as every server was before;
+	// HubDirect keeps it the agents' own entry, written as with the hub
+	// off, for a server that reads its project from the folder it is
+	// started in, or keeps a session's state (#4382, cuipengcx90).
+	Hub string `json:"hub,omitempty"`
+
+	// about is the hub entry's description, for an agent that shows a
+	// server by one before it has connected (Pi, hubServerFor)
+	about string
+
+	// startupWrote is the startup_timeout_sec magpie last wrote in the
+	// entry being written, 0 for none: one the entry has otherwise is the
+	// user's, and stays (startupTheirs)
+	startupWrote float64
 }
 
 // OAuthApp is an OAuth app made with a server's vendor, by the names
@@ -100,6 +130,13 @@ func (s *Server) check() error {
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
 	}
+	switch s.Hub {
+	case "", "shared":
+		s.Hub = ""
+	case HubDirect:
+	default:
+		return fmt.Errorf("%s: unknown hub policy %q: shared or direct", s.Name, s.Hub)
+	}
 	// magpie signs in only to a streamable HTTP server
 	if s.Transport != "http" {
 		s.OAuth = nil
@@ -116,6 +153,9 @@ func (s *Server) check() error {
 			}
 			s.OAuth = nil
 		}
+	}
+	if s.StartupTimeout < 0 || s.StartupTimeout > maxStartupTimeout {
+		return fmt.Errorf("%s: the startup timeout is between 0 (the agent's own) and %d seconds", s.Name, maxStartupTimeout)
 	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
@@ -134,7 +174,7 @@ func (s *Server) check() error {
 // have it doesn't matter.
 func (s *Server) same(o *Server) bool {
 	return s.Transport == o.Transport && s.Command == o.Command && slices.Equal(s.Args, o.Args) &&
-		maps.Equal(s.Env, o.Env) && s.URL == o.URL && maps.Equal(s.Headers, o.Headers)
+		maps.Equal(s.Env, o.Env) && s.URL == o.URL && maps.Equal(s.Headers, o.Headers) && s.about == o.about
 }
 
 // ---- each agent's own format ----------------------------------------------
@@ -185,6 +225,10 @@ const (
 	// fmtZed is Zed's settings.json context_servers: command/args/env, or
 	// url/headers, which Zed speaks streamable HTTP to
 	fmtZed
+	// fmtKiro is Kiro CLI's ~/.kiro/settings/mcp.json: mcpServers of
+	// command/args/env or url/headers — no type on an entry, its shape
+	// saying which, and no way to name SSE (kiro.dev/docs/mcp/configuration)
+	fmtKiro
 )
 
 // mcpFile is the file an agent keeps its user-wide MCP servers in.
@@ -235,7 +279,7 @@ func (f *mcpFile) supports(s *Server) error {
 	if f.Format == fmtDesktop && s.Remote() {
 		return errNoRemote
 	}
-	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed) {
+	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed || f.Format == fmtKiro) {
 		return errNoSSE
 	}
 	if f.Format == fmtDsh && s.Name != "" && !dshServerName.MatchString(s.Name) {
@@ -277,7 +321,8 @@ var errNoRemote = errors.New("no-remote")
 // over SSE (Codex, Goose, DeepSeek Harness, Pi's own MCP, Grok Build — its
 // type = "sse" is taken, but it speaks streamable HTTP to it all the same,
 // Command Code, whose own add refuses sse, Zed, whose only remote transport
-// POSTs to the url: crates/context_server/src/transport/http.rs).
+// POSTs to the url: crates/context_server/src/transport/http.rs, Kiro CLI,
+// whose docs name no SSE at all).
 var errNoSSE = errors.New("no-sse")
 
 // ordered is a JSON object that keeps its keys in the order given, so an
@@ -337,12 +382,72 @@ func (o ordered) MarshalYAML() (any, error) {
 }
 
 // selfTimeout is the seconds an agent waits for a tool of s: what
-// magpie-image's video tool needs, else def.
+// magpie-image's video tool needs, at least two minutes for
+// magpie-browser's, magpie-web-search's and magpie-vision's, else def.
 func selfTimeout(s *Server, def int) int {
 	if s.Name == selfServerName && s.Command != "" {
 		return int(imagemcp.ToolTimeout().Seconds())
 	}
+	if (s.Name == searchServerName || s.Name == visionServerName) && s.Command != "" {
+		// a search a searcher model answers, a slow page, or a look at a
+		// big image takes a while
+		return max(def, 120)
+	}
+	if s.Name == browserServerName && s.Command != "" {
+		// a browser_wait waits up to a minute, and the page settles after
+		return max(def, 120)
+	}
 	return def
+}
+
+// maxStartupTimeout is the longest startup timeout a server is given: a
+// day, as a hook's timeout.
+const maxStartupTimeout = 86400
+
+// startupTheirs says whether old, a Codex entry, has a startup timeout
+// magpie didn't write: a startup_timeout_ms (magpie writes only _sec, and
+// Codex reads _ms only without it), or a startup_timeout_sec other than
+// the one magpie wrote last. That one is the user's, and magpie's value
+// never goes over it.
+func startupTheirs(s *Server, old map[string]any) bool {
+	if _, ok := old["startup_timeout_ms"]; ok {
+		return true
+	}
+	v, ok := old["startup_timeout_sec"]
+	return ok && (s.startupWrote == 0 || !isNumber(v, s.startupWrote))
+}
+
+// startupWritten is the startup_timeout_sec of magpie's in the entry it
+// writes for s over old, for the next write to know it by: 0 for none.
+func (f *mcpFile) startupWritten(s *Server, old map[string]any) float64 {
+	if f.Format != fmtCodex || startupTheirs(s, old) {
+		return 0
+	}
+	return float64(s.StartupTimeout)
+}
+
+// startupBehind says whether a Codex entry lacks the startup timeout
+// magpie gives s, or has one magpie wrote that s no longer has.
+func startupBehind(s *Server, old map[string]any) bool {
+	if startupTheirs(s, old) {
+		return false
+	}
+	v, ok := old["startup_timeout_sec"]
+	if s.StartupTimeout == 0 {
+		return ok
+	}
+	return !isNumber(v, float64(s.StartupTimeout))
+}
+
+// wroteStartup is s with the startup timeout magpie last wrote in its
+// entry.
+func wroteStartup(s *Server, v float64) *Server {
+	if s.startupWrote == v {
+		return s
+	}
+	c := *s
+	c.startupWrote = v
+	return &c
 }
 
 // gooseOldTimeout is the timeout magpie wrote for every Goose server before
@@ -351,9 +456,13 @@ const gooseOldTimeout = 300
 
 // behind says whether an entry magpie wrote before lacks the timeout it
 // gives s now: Codex's tool_timeout_sec is missing, or Goose's timeout is
-// still the gooseOldTimeout every server had. A value the user chose is
-// neither, so it is left as it is.
+// still the gooseOldTimeout every server had, or Codex's startup timeout
+// isn't the one s has (startupBehind). A value the user chose is none of
+// these, so it is left as it is.
 func (f *mcpFile) behind(s *Server, old map[string]any) bool {
+	if f.Format == fmtCodex && old != nil && startupBehind(s, old) {
+		return true
+	}
 	if selfTimeout(s, 0) == 0 {
 		return false
 	}
@@ -511,6 +620,9 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("args", list(s.Args))
 			optional("env", s.Env)
 		}
+		if s.about != "" {
+			add("description", s.about)
+		}
 	case fmtHermes, fmtAlma:
 		// Hermes' own `hermes mcp add` writes url/headers or
 		// command/args/env; transport: sse is its only other transport
@@ -552,6 +664,18 @@ func (f *mcpFile) encode(s *Server) ordered {
 			if f.Format == fmtDevin {
 				add("transport", "stdio")
 			}
+		}
+	case fmtKiro:
+		// as the docs show them: command/args/env, or url/headers — no
+		// type, the entry's shape saying which (kiro.dev/docs/mcp/
+		// configuration); an SSE server never comes this far
+		if s.Remote() {
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
 		}
 	case fmtCline:
 		// as `cline mcp add` writes it; a url with no type would be SSE
@@ -630,6 +754,10 @@ func (f *mcpFile) encode(s *Server) ordered {
 		// Codex gives a tool a minute unless its entry says more
 		if t := selfTimeout(s, 0); t > 0 {
 			add("tool_timeout_sec", t)
+		}
+		// and 30s to start and list its tools unless its entry says more
+		if s.StartupTimeout > 0 {
+			add("startup_timeout_sec", s.StartupTimeout)
 		}
 	case fmtDsh:
 		// a reference is a !!js expression dsh evaluates (dshRef)
@@ -831,6 +959,19 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		} else {
 			local(str(m, "command"), m["args"], m["env"])
 		}
+		// the hub entry's description is magpie's; any other is the user's
+		if f.Format == fmtPiNative && name == HubEntry {
+			s.about = str(m, "description")
+		}
+	case fmtKiro:
+		// a url is streamable HTTP: the docs give no way to name SSE
+		// (kiro.dev/docs/mcp/configuration), so no transport in the entry
+		// is read as one
+		if u := str(m, "url"); u != "" {
+			remote("http", u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
 	default: // Claude Code, Cursor, Copilot, Crush, ZCode, omp, Grok, Zed
 		t := str(m, "type")
 		if u := str(m, "url"); u != "" {
@@ -907,12 +1048,91 @@ func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
 	for _, k := range strings.Split(f.key(), ".") {
 		all, _ = all[k].(map[string]any)
 	}
+	v2 := openCodeServers(f.Format, all)
 	for name, v := range all {
+		if m, ok := v.(map[string]any); ok && (v2 == nil || name != "servers") {
+			out[name] = m
+		}
+	}
+	// OpenCode 2's own entries win a name over a V1 one, as OpenCode
+	// reads them
+	for name, v := range v2 {
 		if m, ok := v.(map[string]any); ok {
 			out[name] = m
 		}
 	}
 	return out, nil
+}
+
+// openCodeServers is OpenCode 2's mcp.servers, where its native config and
+// its own `opencode mcp add` keep the servers ("Configure MCP servers under
+// `mcp.servers`", opencode 2.0.25), or nil. OpenCode 2 reads the V1 shape,
+// mcp.<name>, beside it, so one file can hold both, and "servers" there is
+// that object, not a server called servers: one with a type, command or
+// url of its own is a V1 server by that name.
+func openCodeServers(format mcpFormat, mcp map[string]any) map[string]any {
+	if format != fmtOpenCode {
+		return nil
+	}
+	m, ok := mcp["servers"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, k := range []string{"type", "command", "url"} {
+		if _, own := m[k]; own {
+			return nil
+		}
+	}
+	return m
+}
+
+// openCodeLayout is what the OpenCode file at path holds under mcp: the
+// names of its V1 entries (mcp.<name>), those of OpenCode 2's own
+// (mcp.servers.<name>), and whether it has mcp.servers at all.
+func openCodeLayout(path string) (v1, v2 map[string]bool, native bool, err error) {
+	raw, err := edit.Read(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	raw = edit.TrimBOM(raw)
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil, false, nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(jsonc.ToJSON(raw), &doc); err != nil {
+		return nil, nil, false, fmt.Errorf("%s: %w", path, err)
+	}
+	all, _ := doc["mcp"].(map[string]any)
+	servers := openCodeServers(fmtOpenCode, all)
+	v1, v2 = map[string]bool{}, map[string]bool{}
+	for name, v := range all {
+		if _, ok := v.(map[string]any); ok && (servers == nil || name != "servers") {
+			v1[name] = true
+		}
+	}
+	for name, v := range servers {
+		if _, ok := v.(map[string]any); ok {
+			v2[name] = true
+		}
+	}
+	return v1, v2, servers != nil, nil
+}
+
+// openCodePath is the key path of the server's entry in the OpenCode file:
+// OpenCode 2's mcp.servers.<name> once the file keeps its servers there
+// (the entry there already, or a new one), else mcp.<name>.
+func (f *mcpFile) openCodePath(name string) (string, bool, error) {
+	v1, v2, native, err := openCodeLayout(f.Path)
+	if err != nil {
+		return "", false, err
+	}
+	if native && (v2[name] || !v1[name]) {
+		return "mcp.servers." + name, true, nil
+	}
+	return "mcp." + name, false, nil
 }
 
 // cloneAny is a deep copy of a parsed value, so a caller can change what
@@ -1036,6 +1256,9 @@ var owned = map[mcpFormat][]string{
 	fmtCommandCode: {"transport", "type", "url", "headers", "command", "args", "env"},
 	// enabled, remote, timeout and oauth are the user's
 	fmtZed: {"url", "headers", "command", "args", "env"},
+	// disabled, autoApprove, disabledTools and oauth are the user's; a
+	// transport names nothing Kiro reads
+	fmtKiro: {"transport", "url", "headers", "command", "args", "env"},
 
 	// a url agy read in place of serverUrl goes when magpie writes one
 	fmtAntigravity: {"type", "serverUrl", "url", "headers", "command", "args", "env"},
@@ -1046,10 +1269,14 @@ var owned = map[mcpFormat][]string{
 // one there (refKeys): an env_vars or env_keys the user gave a server
 // whose library entry has none stays theirs.
 func (f *mcpFile) mine(s *Server) []string {
-	if extra := f.refKeys(s); len(extra) > 0 {
-		return append(slices.Clone(owned[f.Format]), extra...)
+	own := owned[f.Format]
+	if f.Format == fmtPiNative && s.Name == HubEntry {
+		own = append(slices.Clone(own), "description")
 	}
-	return owned[f.Format]
+	if extra := f.refKeys(s); len(extra) > 0 {
+		return append(slices.Clone(own), extra...)
+	}
+	return own
 }
 
 // current is the agent's entry read as the server, for comparing with s:
@@ -1094,6 +1321,16 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 	o := f.encode(s)
 	mine := f.mine(s)
 	behind := f.behind(s, old)
+	// Codex's startup timeout is magpie's unless the user wrote one
+	// (startupTheirs): theirs is kept as it is, below, with no _sec of
+	// magpie's beside a _ms of theirs
+	if f.Format == fmtCodex {
+		if startupTheirs(s, old) {
+			o = slices.DeleteFunc(o, func(e kv) bool { return e.k == "startup_timeout_sec" })
+		} else {
+			mine = append(slices.Clone(mine), "startup_timeout_sec")
+		}
+	}
 	for i, e := range o {
 		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) && !(behind && f.Format == fmtGoose && e.k == "timeout") {
 			o[i].v = v
@@ -1144,6 +1381,13 @@ func (f *mcpFile) putEntry(s *Server, o ordered) error {
 		}
 		return nil
 	}
+	// Claude Code saves the file under its own lock: read and written
+	// back under it, or a save of its own between the two is lost (#4747)
+	release, err := f.claudeLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	// Pi's files, or Desktop's, all of them or none
 	return edit.Atomically(func() error {
 		for _, a := range f.also() {
@@ -1155,7 +1399,19 @@ func (f *mcpFile) putEntry(s *Server, o ordered) error {
 				return err
 			}
 		}
-		return edit.SetJSON(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
+		key := f.key() + "." + s.Name
+		if f.Format == fmtOpenCode {
+			p, native, err := f.openCodePath(s.Name)
+			if err != nil {
+				return err
+			}
+			// OpenCode 2's servers have no enabled: on unless disabled,
+			// which is the user's to set
+			if key = p; native {
+				o = slices.DeleteFunc(slices.Clone(o), func(e kv) bool { return e.k == "enabled" })
+			}
+		}
+		return edit.SetJSON(f.Path, edit.KV{Path: key, Value: o})
 	}, f.files()...)
 }
 
@@ -1176,14 +1432,50 @@ func (f *mcpFile) del(name string) error {
 	case fmtHermes:
 		return edit.DelYAML(f.Path, f.key()+"."+name)
 	}
+	// Claude Code saves the file under its own lock: read and written
+	// back under it, or a save of its own between the two is lost (#4747)
+	release, err := f.claudeLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return edit.Atomically(func() error {
 		for _, a := range f.also() {
 			if err := a.del(name); err != nil {
 				return err
 			}
 		}
+		if f.Format == fmtOpenCode {
+			// from wherever OpenCode reads it: mcp.<name>, OpenCode 2's
+			// mcp.servers.<name>, or both, and never mcp.servers itself
+			v1, v2, _, err := openCodeLayout(f.Path)
+			if err != nil {
+				return err
+			}
+			var paths []string
+			if v1[name] {
+				paths = append(paths, "mcp."+name)
+			}
+			if v2[name] {
+				paths = append(paths, "mcp.servers."+name)
+			}
+			return edit.DelJSON(f.Path, paths...)
+		}
 		return edit.DelJSON(f.Path, f.key()+"."+name)
 	}, f.files()...)
+}
+
+// claudeLock takes the lock Claude Code saves its .claude.json under,
+// when the file f writes is that one (claudeJSON): held while it is read
+// and written back, or a save of its own between the two is lost
+// (#4747). No other file of the library's has a lock of Claude Code's to
+// take, and a distro's copy isn't this machine's file: the Claude Code
+// there saves under a lock in the distro's own files.
+func (f *mcpFile) claudeLock() (func(), error) {
+	if f.Format != fmtClaude || filepath.Clean(f.Path) != filepath.Clean(claudeJSON()) {
+		return func() {}, nil
+	}
+	return claudelock.Config(f.Path)
 }
 
 // ---- Codex's TOML ---------------------------------------------------------

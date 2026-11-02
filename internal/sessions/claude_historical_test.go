@@ -44,11 +44,12 @@ func TestHistoricalClaudeFilesDoNotDisplaceActiveWindows(t *testing.T) {
 					v.add(c.Tokens)
 					totals[c.File] = v
 				}
-				if totals[claude] != cache[claude].Models["m"] || totals[codex] != cache[codex].Models["gpt-6-astra"] {
+				if totals[claude] != cache[claude].Models.of("m") || totals[codex] != cache[codex].Models.of("gpt-6-astra") {
 					t.Fatal("calls and summaries disagree", totals[claude], totals[codex])
 				}
 			}
 			read()
+			saved() // the marker below is written on a parse a save may be encoding
 			before := map[string]os.FileInfo{}
 			for _, path := range []string{claude, codex} {
 				if cache[path].revisionWeight() == 0 {
@@ -77,10 +78,10 @@ func TestHistoricalClaudeFilesDoNotDisplaceActiveWindows(t *testing.T) {
 						t.Fatal("rebuilt active call shard", path)
 					}
 				}
-				if got := cache[claude].Models["m"]; got != (Tokens{Input: 100, Output: i + 2}) {
+				if got := cache[claude].Models.of("m"); got != (Tokens{Input: 100, Output: i + 2}) {
 					t.Fatal(got)
 				}
-				if got := cache[codex].Models["gpt-6-astra"]; got != (Tokens{Input: 100 * (i + 2), Output: i + 2}) {
+				if got := cache[codex].Models.of("gpt-6-astra"); got != (Tokens{Input: 100 * (i + 2), Output: i + 2}) {
 					t.Fatal(got)
 				}
 			}
@@ -111,7 +112,7 @@ func TestIdleWindowsYieldToRecentWork(t *testing.T) {
 	}
 	// A ten-minute pause is still in the working set. Cost outranks the eight
 	// newer tiny transcripts, so this does not restore the five-minute cliff.
-	candidates = []revisionCandidate{{path: "large", mod: now.Add(-2 * revisionIdle).UnixNano(), size: 1 << 30, weight: claudeRevisionEntries, bounded: true}}
+	candidates = []revisionCandidate{{path: "large", mod: now.Add(-10 * time.Minute).UnixNano(), size: 1 << 30, weight: claudeRevisionEntries, bounded: true}}
 	for i := 0; i < revisionFiles; i++ {
 		candidates = append(candidates, revisionCandidate{path: fmt.Sprint("small-", i), mod: now.UnixNano(), size: 1024, weight: 2, bounded: true})
 	}

@@ -231,6 +231,36 @@ func TestSettingsImageTimeout(t *testing.T) {
 	}
 }
 
+// How long a routing group's classifier is given (#2934) is set by the
+// Settings page, 0 for the default 8 seconds, kept by a save from a page
+// that doesn't send it, and refused past 60 with the saved value kept.
+func TestSettingsClassifyTimeout(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	handler := Handler(nil, nil)
+	for _, x := range []struct {
+		body string
+		code int
+		want int
+	}{
+		{`{"theme":"dark","classifyTimeout":30}`, http.StatusOK, 30},
+		{`{"theme":"light"}`, http.StatusOK, 30},
+		{`{"theme":"light","classifyTimeout":61}`, http.StatusBadRequest, 30},
+		{`{"theme":"light","classifyTimeout":0}`, http.StatusOK, 0},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(x.body)))
+		if rec.Code != x.code {
+			t.Fatalf("%s: %d %s", x.body, rec.Code, rec.Body)
+		}
+		if got := settings.Load().ClassifyTimeout; got != x.want {
+			t.Fatalf("%s: classifyTimeout %d", x.body, got)
+		}
+	}
+}
+
 func TestSettingsColorblindMode(t *testing.T) {
 	h := t.TempDir()
 	t.Setenv("HOME", h)
@@ -294,5 +324,146 @@ func TestSettingsRedactWordsAnyCaseKept(t *testing.T) {
 		if got := settings.Load(); got.RedactWordsAnyCase != c.want || !reflect.DeepEqual(got.RedactWords, []string{"Nightjar"}) {
 			t.Fatalf("after %s: any case %v, words %v; want %v", c.body, got.RedactWordsAnyCase, got.RedactWords, c.want)
 		}
+	}
+}
+
+// Whole words only is the Privacy page's too: a page from before it sends
+// no redactWordsWhole, and its save leaves the user's choice as it was; a
+// page that sends it sets it (acmilan_ on Discord).
+func TestSettingsRedactWordsWholeKept(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	h := Handler(nil, nil)
+	for _, c := range []struct {
+		body string
+		want bool
+	}{
+		{`{"theme":"dark","redactWords":["ABC"],"redactWordsWhole":true}`, true},
+		{`{"theme":"light","redactWords":["ABC"],"redactWordsAnyCase":true}`, true},
+		{`{"theme":"light","redactWords":["ABC"],"redactWordsWhole":false}`, false},
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(c.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("saving %s: %d %s", c.body, rec.Code, rec.Body)
+		}
+		if got := settings.Load(); got.RedactWordsWhole != c.want || !reflect.DeepEqual(got.RedactWords, []string{"ABC"}) {
+			t.Fatalf("after %s: whole words %v, words %v; want %v", c.body, got.RedactWordsWhole, got.RedactWords, c.want)
+		}
+	}
+}
+
+// Reduce motion (#3813) is saved by the Settings page, handed to the page
+// in boot.js so it is still from the first paint, and kept by a save from
+// a page from before it, which doesn't send it.
+func TestSettingsReduceMotion(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	handler := Handler(nil, nil)
+
+	getBoot := func() string {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /boot.js: %d %s", rec.Code, rec.Body)
+		}
+		return rec.Body.String()
+	}
+	if boot := getBoot(); strings.Contains(boot, `"reduceMotion"`) {
+		t.Fatalf("reduceMotion off by default, got boot.js: %s", boot)
+	}
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"theme":"dark","reduceMotion":true}`, true},
+		{`{"theme":"light"}`, true},
+		{`{"theme":"dark","reduceMotion":false}`, false},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(tc.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", tc.body, rec.Code, rec.Body)
+		}
+		if got := settings.Load().ReduceMotion; got != tc.want {
+			t.Fatalf("%s: ReduceMotion = %v, want %v", tc.body, got, tc.want)
+		}
+		if boot := getBoot(); strings.Contains(boot, `"reduceMotion":true`) != tc.want {
+			t.Fatalf("%s: boot.js = %s, want reduceMotion=%v", tc.body, boot, tc.want)
+		}
+	}
+}
+
+// The loading bird's switch (Yayoi_no_yume on X) is on unless turned off:
+// boot.js says noBird only when it is, a save that leaves it out keeps it,
+// and false brings the bird back.
+func TestSettingsNoBird(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	handler := Handler(nil, nil)
+
+	getBoot := func() string {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /boot.js: %d %s", rec.Code, rec.Body)
+		}
+		return rec.Body.String()
+	}
+	if boot := getBoot(); strings.Contains(boot, `"noBird"`) {
+		t.Fatalf("the bird is on by default, got boot.js: %s", boot)
+	}
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"theme":"dark","noBird":true}`, true},
+		{`{"theme":"light"}`, true},
+		{`{"theme":"dark","noBird":false}`, false},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(tc.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", tc.body, rec.Code, rec.Body)
+		}
+		if got := settings.Load().NoBird; got != tc.want {
+			t.Fatalf("%s: NoBird = %v, want %v", tc.body, got, tc.want)
+		}
+		if boot := getBoot(); strings.Contains(boot, `"noBird":true`) != tc.want {
+			t.Fatalf("%s: boot.js = %s, want noBird=%v", tc.body, boot, tc.want)
+		}
+	}
+}
+
+// "Models that search by themselves" (Settings › Models › Web search) is
+// set on its own: the endpoint sets it, and a save of the whole page, which
+// doesn't name it, keeps it.
+func TestSettingsSearchAllSetOnItsOwn(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	h := Handler(nil, nil)
+	post := func(path, body string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: %d %s", path, body, rec.Code, rec.Body)
+		}
+	}
+	post("/api/settings/search-all", `{"on":true}`)
+	if !settings.Load().SearchAll {
+		t.Fatal("search-all didn't set it")
+	}
+	post("/api/settings", `{"theme":"dark"}`)
+	if !settings.Load().SearchAll {
+		t.Fatal("a save of the page dropped searchAll")
+	}
+	post("/api/settings/search-all", `{"on":false}`)
+	if settings.Load().SearchAll {
+		t.Fatal("search-all didn't turn it off")
 	}
 }

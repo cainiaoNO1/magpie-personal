@@ -64,6 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
@@ -79,6 +80,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       assert.equal(await row.locator(".badge.wsl").textContent(), "WSL Ubuntu");
       assert.equal(await view.locator(".sm-note", { hasText: w.note }).count(), 0, "no note that WSL's can't be deleted");
+      assert.equal(await view.locator(".sm-bar").isHidden(), true, "no bar before Select");
+      await view.locator(".sm-select").click();
       assert.equal(await view.locator(".sm-bar").isHidden(), false);
       const folderBox = view.locator(".row.sm-folder input.sm-folder-check");
       assert.equal(await folderBox.count(), 1);

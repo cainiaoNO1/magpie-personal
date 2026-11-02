@@ -12,8 +12,9 @@ package provider
 // again. Every reader — the gateway's routing, /v1/models, rules, the
 // Routing view, the TUI and the CLI — gets the group from there, so all of
 // them see the same members: those the user named, in their order, then
-// those the patterns match, in the catalog's order. A model named and
-// matched both keeps the place it was named at.
+// those the patterns match, in the catalog's order, or in the order the
+// user put them in (Group.Placed). A model named and matched both keeps
+// the place it was named at.
 
 import (
 	"fmt"
@@ -23,7 +24,8 @@ import (
 )
 
 // RegexpPrefix starts a member that is a regular expression over the whole
-// "provider/model" id: "re:openrouter/.*:(free|beta)".
+// "provider/model" id, in any case as a glob is: "re:openrouter/.*:(free|beta)".
+// "(?-i)" in it makes case matter from there on: "re:(?-i)openrouter/.*:FREE".
 const RegexpPrefix = "re:"
 
 // IsPattern reports whether a member as typed is a pattern rather than a
@@ -36,13 +38,14 @@ func IsPattern(s string) bool {
 
 // compilePattern is a pattern as the regexp it means. A glob's "*" is any
 // run of characters, "/" too, and the rest is the id as spelt, in any case
-// ("openrouter/*:free", "*-free"); a regexp must match the whole id.
+// ("openrouter/*:free", "*-free"); a regexp must match the whole id, in any
+// case as a glob does unless it says "(?-i)" (usrname1833 on Discord).
 func compilePattern(p string) (*regexp.Regexp, error) {
 	if re, ok := strings.CutPrefix(p, RegexpPrefix); ok {
 		if strings.TrimSpace(re) == "" {
 			return nil, fmt.Errorf("%q has no regular expression after %s", p, RegexpPrefix)
 		}
-		x, err := regexp.Compile("^(?:" + re + ")$")
+		x, err := regexp.Compile("(?i)^(?:" + re + ")$")
 		if err != nil {
 			return nil, fmt.Errorf("%q is not a regular expression magpie can read: %v", p, err)
 		}
@@ -113,14 +116,90 @@ func matchesIn(entries []Entry, g Group) []string {
 }
 
 // withMatches is a stored group as it is read: the members its patterns
-// match now after those it names (Matched says which they are).
+// match now after those it names (Matched says which they are), or in
+// the order the user put them in (Placed).
 func withMatches(entries []Entry, g Group) Group {
 	if len(g.Match) == 0 {
 		return g
 	}
 	g.Matched = matchesIn(entries, g)
-	g.Members = append(slices.Clone(g.Members), g.Matched...)
+	g.Members = placedIn(append(slices.Clone(g.Members), g.Matched...), g.Placed)
 	return g
+}
+
+// placedIn are members in the order placed has them: those it names
+// first, as it has them, then the rest in their own order — a model a
+// pattern matches since it was placed, at the end. One placed that isn't
+// a member now is left out.
+func placedIn(members, placed []string) []string {
+	if len(placed) == 0 {
+		return members
+	}
+	in := make(map[string]bool, len(members))
+	for _, m := range members {
+		in[m] = true
+	}
+	out := make([]string, 0, len(members))
+	for _, p := range placed {
+		if in[p] {
+			out = append(out, p)
+			delete(in, p)
+		}
+	}
+	for _, m := range members {
+		if in[m] {
+			out = append(out, m)
+			delete(in, m)
+		}
+	}
+	return out
+}
+
+// placedOver is the Placed a group is saved with: its members (named
+// first, then the matched) in the order placed before (the caller's, or
+// the one stored), with those the caller names (given) put in the places
+// those have, in the caller's order. So the named are reordered as the
+// caller says and the pattern's stay where they were placed; a model
+// named since goes after the last one named, one matched since last.
+// nil when that is the members' own order.
+func placedOver(members, before, given []string) []string {
+	if len(before) == 0 {
+		return nil
+	}
+	sent := map[string]bool{}
+	var order []string
+	for _, m := range given {
+		if !sent[m] && slices.Contains(members, m) {
+			sent[m] = true
+			order = append(order, m)
+		}
+	}
+	var seq []string
+	for _, m := range before {
+		if slices.Contains(members, m) && !slices.Contains(seq, m) {
+			seq = append(seq, m)
+		}
+	}
+	for _, m := range order {
+		if !slices.Contains(seq, m) {
+			at := len(seq)
+			for at > 0 && !sent[seq[at-1]] {
+				at--
+			}
+			seq = slices.Insert(seq, at, m)
+		}
+	}
+	seq = placedIn(members, seq)
+	for i, j := 0, 0; i < len(seq); i++ {
+		if sent[seq[i]] {
+			seq[i] = order[j]
+			j++
+		}
+	}
+	if slices.Equal(seq, members) {
+		return nil
+	}
+	return seq
 }
 
 // ownMembers are the members a group names itself and its patterns, from a

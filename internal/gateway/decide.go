@@ -255,6 +255,7 @@ func readJev(b []byte, intents []string, levels bool, prev before) (verdict, err
 	var v verdict
 	if a, ok := out.Answers["intent"]; ok && len(intents) > 0 && !levels {
 		v.Sure = sureOf(a.Confidence, a.Probabilities)
+		v.Said = a.Choice // as it said it, no intent come of it or not (#4598)
 		if a.Choice != noIntent && v.Sure >= jevSure {
 			v.Intent = intentNamed(intents, a.Choice)
 		}
@@ -265,6 +266,7 @@ func readJev(b []byte, intents []string, levels bool, prev before) (verdict, err
 		// (继续，再加一个基准测试 after a 复杂任务 came out 0.54 to 0.46),
 		// and a turn with none before takes the likelier
 		v.Sure = sureOf(a.Confidence, a.Probabilities)
+		v.Said = a.Choice
 		v.Intent = intentNamed(intents, a.Choice)
 		if was := intentNamed(intents, prev.Intent); v.Sure < jevSure && was != "" {
 			v.Intent = was
@@ -350,10 +352,22 @@ func (s *Server) jevLevelled(ctx context.Context, p provider.Provider, model str
 	return l, nil
 }
 
-// askJev asks a decision provider's model through its System One API.
-func (s *Server) askJev(p provider.Provider, model string, intents []string, prev before, effort bool, text string) (verdict, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), classifyTimeout)
-	defer cancel()
+// errNoAnswer is a System One call the classifier's wait cut off; askJev
+// says which provider and how long it was given.
+var errNoAnswer = errors.New("no answer in the classifier's wait")
+
+// askJev asks a decision provider's model through its System One API,
+// within ctx: the classifier's wait, which is wait long, that every try
+// of askDecideTries shares.
+func (s *Server) askJev(ctx context.Context, wait time.Duration, p provider.Provider, model string, intents []string, prev before, effort bool, text string) (v verdict, err error) {
+	defer func() {
+		// only a call cut off by the wait is reworded: a refusal or an
+		// answer read as the wait ran out keeps its own type, which
+		// askDecideTries rests the account by
+		if errors.Is(err, errNoAnswer) {
+			err = fmt.Errorf("%s gave no answer in %s", p.Name, wait)
+		}
+	}()
 	if model == "" {
 		model = p.Jev()
 	}
@@ -363,7 +377,7 @@ func (s *Server) askJev(p provider.Provider, model string, intents []string, pre
 	// remote Jev is none of those members
 	if !p.SkipsRedaction() {
 		var err error
-		if text, prev.User, prev.Reply, err = maskedState(text, prev.User, prev.Reply); err != nil {
+		if text, prev.User, prev.Reply, err = maskedState(ctx, text, prev.User, prev.Reply); err != nil {
 			return verdict{}, err // fails closed: never sent unmasked
 		}
 	}
@@ -382,14 +396,14 @@ func (s *Server) askJev(p provider.Provider, model string, intents []string, pre
 }
 
 // maskedState masks what Jev is told of a turn, each as maskedText does.
-func maskedState(text, user, reply string) (string, string, string, error) {
+func maskedState(ctx context.Context, text, user, reply string) (string, string, string, error) {
 	out := [3]string{text, user, reply}
 	var all maskHits
 	for i, v := range out {
 		if v == "" {
 			continue
 		}
-		_, m, h, err := maskTextHits(v)
+		_, m, h, err := maskTextHits(ctx, v)
 		if err != nil {
 			return "", "", "", err
 		}
@@ -408,7 +422,7 @@ func (s *Server) systemOne(ctx context.Context, p provider.Provider, model strin
 	status, b, header, err := s.postDecide(ctx, p, model, body)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("%s gave no answer in %s", p.Name, classifyTimeout)
+			return nil, errNoAnswer
 		}
 		return nil, err
 	}
@@ -461,6 +475,7 @@ func (s *Server) postDecide(ctx context.Context, p provider.Provider, model stri
 		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)
 	}
+	p.DecideHeaders(req.Header)
 	if via == provider.ViaVercelEval {
 		// what the AI SDK's gateway provider sends with an evaluation
 		req.Header.Set("ai-gateway-protocol-version", "0.0.1")
@@ -722,7 +737,9 @@ func withFixedEffort(proto provider.Protocol, body []byte, effort string) []byte
 			v.Reasoning = map[string]any{}
 		}
 		v.Reasoning["effort"] = effort
-		return withFields(body, map[string]any{"reasoning": v.Reasoning})
+		// and the agent's last change of effort mid-thread, which an
+		// upstream reading the items would take over the top's
+		return withEffortUpdated(withFields(body, map[string]any{"reasoning": v.Reasoning}), effort)
 	case provider.Anthropic:
 		var v struct {
 			Thinking *struct {
@@ -756,15 +773,22 @@ func withFixedEffort(proto provider.Protocol, body []byte, effort string) []byte
 // groupLevels are the reasoning levels the group offers for the member a
 // candidate is of, where the user named them (Group.Levels, #295): the
 // group's own, else those of the outermost group in it that names some.
-// nil when none is named. They bound what the candidate is asked for
+// nil when none is named. A member given several levels of its own
+// ("provider/model:low+high") is bounded by those instead. They bound what the candidate is asked for
 // (withinLevels): the agent, a model's suffix or the turn's pick asking
 // for a level the group doesn't offer is sent the nearest it does (#671).
 func groupLevels(g provider.Group, ms []provider.Member, c candidate) []string {
+	if len(c.levels) > 0 {
+		// the member's own (Member.Levels): the agent picked among the
+		// group's, and this member is sent the nearest of those it was
+		// given
+		return c.levels
+	}
 	if len(g.Levels) > 0 {
 		return g.Levels
 	}
 	for _, m := range ms {
-		if m.Provider.ID != c.p.ID || m.Model != c.model || m.Effort != c.effort {
+		if m.Provider.ID != c.p.ID || m.Model != c.model || m.Effort != c.effort || !slices.Equal(m.Levels, c.levels) {
 			continue
 		}
 		if i := slices.IndexFunc(m.Via, func(v provider.Group) bool { return len(v.Levels) > 0 }); i >= 0 {

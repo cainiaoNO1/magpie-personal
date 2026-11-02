@@ -80,7 +80,11 @@ func FetchIcon(ctx context.Context, rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fetchIcon(ctx, iconClient(), iconproxy.URL(u))
+	c := iconClient()
+	// the client is this fetch's alone: the connection it made, left idle
+	// in the transport's pool, is dropped by nobody else (#4824)
+	defer c.CloseIdleConnections()
+	return fetchIcon(ctx, c, iconproxy.URL(u))
 }
 
 // iconClient is the client FetchIcon uses; tests point it at a local proxy.
@@ -277,8 +281,9 @@ func iconExt(b []byte) string {
 }
 
 // pruneIcons removes pictures no provider points at any more, nor a plugin
-// gave its provider (PluginIcon). One picked in the editor is stored
-// before its provider is saved, so a fresh one stays.
+// gave its provider (PluginIcon), nor a partner listed now shows. One
+// picked in the editor is stored before its provider is saved, so a fresh
+// one stays.
 func pruneIcons(f file) {
 	used := map[string]bool{}
 	for _, p := range f.Providers {
@@ -287,6 +292,9 @@ func pruneIcons(f file) {
 		}
 	}
 	for _, name := range keptPluginIcons() {
+		used[name] = true
+	}
+	for _, name := range keptPartnerIcons() {
 		used[name] = true
 	}
 	ents, _ := os.ReadDir(IconDir())
@@ -298,4 +306,5 @@ func pruneIcons(f file) {
 			os.Remove(filepath.Join(IconDir(), e.Name()))
 		}
 	}
+	pruneSmallIcons()
 }

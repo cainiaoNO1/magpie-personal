@@ -50,6 +50,7 @@ magpie.plugin("library", (ctx) => {
     subagent: "M6 3a2.2 2.2 0 1 0 0 4.4A2.2 2.2 0 0 0 6 3z M2 13c.5-2.2 2-3.4 4-3.4s3.5 1.2 4 3.4 M11.5 7.5a1.5 1.5 0 1 0 0 .01 M10.2 12.5c.3-1.3 1.1-2 2.3-2s1.6.5 1.9 1.4",
     // a clock with an arrow going back round it, as macOS draws backups
     backup: "M3.2 8a4.8 4.8 0 1 0 1.4-3.4 M2.8 2.6v2.4h2.4 M8 5.3V8l1.9 1.2",
+    power: "M8 2.5v5 M4.7 4.6a4.8 4.8 0 1 0 6.6 0",
   };
 
   const tilde = (p) => (lib?.home && p?.startsWith(lib.home) ? "~" + p.slice(lib.home.length) : p || "");
@@ -62,12 +63,42 @@ magpie.plugin("library", (ctx) => {
   // One gone from this computer (gone: uninstalled, or its CLI) is listed
   // only on the rows of what it still has (withGone), for that to be taken
   // out: an agent that isn't installed was on every row (@jiahao_jayden).
-  const shownAgents = () => lib.agents.filter((a) => !a.gone && !isHidden(a));
-  const withGone = (all, on) => [...all, ...lib.agents.filter((a) => a.gone && (on || []).includes(a.id) && !all.some((x) => x.id === a.id))];
+  // An agent in a stopped WSL distro (asleep) is listed by what magpie last
+  // knew of it, its ticks kept for when the distro next runs; one whose
+  // places magpie never saw (unseen) only on the rows that name it, like
+  // a gone one, its chip greyed out: opening its files would start WSL
+  // (#3896, cybercaius on Discord).
+  const shownAgents = () => lib.agents.filter((a) => !a.gone && !a.unseen && !isHidden(a));
+  const withGone = (all, on) => [...all, ...lib.agents.filter((a) => (a.gone || a.unseen && !isHidden(a)) && (on || []).includes(a.id) && !all.some((x) => x.id === a.id))];
   const mcpAgents = () => shownAgents().filter((a) => a.mcp)
     .map((a) => a.mcpVia ? { ...a, aside: t("{agent} reads MCP servers through the {ext} extension", { agent: a.name, ext: a.mcpVia }) } : a);
   const skillAgents = () => shownAgents().filter((a) => a.skills);
+  // the MCP hub's agents: not a stopped distro's, whose files say what it
+  // has of the hub, and can't be read without starting it
+  const hubAgents = () => mcpAgents().filter((a) => !a.asleep);
+  // one line for each stopped WSL distro the page lists agents of: they
+  // show what magpie last saw, and a change waits for the distro to run.
+  // The Instructions page passes its own rows' agents ({asleep, unseen,
+  // name}).
+  function asleepAsides(seen = lib.agents.filter((a) => a.asleep && !isHidden(a))) {
+    return [...new Set(seen.map((a) => a.asleep))].map((d) => {
+      const unseen = seen.filter((a) => a.asleep === d && a.unseen).map((a) => a.name);
+      const p = el("p", "lib-aside lib-asleep", t("WSL {distro} isn't running: its agents show what magpie last saw there, and what you change is written there the next time it runs.", { distro: d }));
+      if (unseen.length) p.append(" " + t("{agents} can be changed once it runs.", { agents: unseen.join(", ") }));
+      p.dataset.distro = d;
+      return p;
+    });
+  }
 
+  // the hub's mark: magpie's bird, the one server each agent is given,
+  // its tail three lines out to three servers (the owner's pick, 10-31)
+  function hubMark() {
+    const g = el("span", "lib-glyph lib-hubmark");
+    g.innerHTML = '<svg viewBox="0 0 44 44" aria-hidden="true"><use href="#bird" clip-path="url(#bird-notail)"/>'
+      + '<g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M13.5 24C9 21 7 15 4.5 9.5"/><path d="M13 25C9 24 6 21.5 3 19.5"/><path d="M12.5 26.2C9 27 6.5 28 4 29.5"/></g>'
+      + '<g fill="currentColor"><circle cx="4" cy="8.5" r="2.6"/><circle cx="2.8" cy="19.2" r="2.6"/><circle cx="3.6" cy="29.8" r="2.6"/></g></svg>';
+    return g;
+  }
   function glyph(d, cls = "lib-glyph") {
     const g = el("span", cls);
     g.append(svg(d, 16, 1.3));
@@ -263,6 +294,12 @@ magpie.plugin("library", (ctx) => {
       // grey chip for a remote server and nothing said why
       if (blocked) { c.classList.add("blocked"); c.setAttribute("aria-disabled", "true"); tip = blocked; }
       if (a.gone) { c.classList.add("gone"); tip = t("{agent} isn't installed here — click to take it away", { agent: a.name }); }
+      if (a.unseen) { c.classList.add("asleep", "unseen", "blocked"); c.setAttribute("aria-disabled", "true"); tip = t("WSL {distro} isn't running, and magpie hasn't seen {agent}'s files there yet: start the distro to change this", { distro: a.asleep, agent: a.name }); }
+      else if (a.asleep) {
+        c.classList.add("asleep");
+        const v = { distro: a.asleep, agent: a.name };
+        if (!problem && !blocked) tip = has ? t("WSL {distro} isn't running: {agent} has it — click to take it away, and magpie writes the change there the next time it runs", v) : t("WSL {distro} isn't running: a click gives it to {agent} the next time the distro runs", v);
+      }
       c.title = a.aside && !problem && !blocked ? tip + "\n" + a.aside : tip;
       c.setAttribute("aria-pressed", has ? "true" : "false");
       // What's lit is read off the chips clicked, not the list they were
@@ -290,12 +327,13 @@ magpie.plugin("library", (ctx) => {
   // The agents a row's chips have lit by a click: not one lit because it
   // has the item whatever is ticked.
   function litOf(box) {
-    return [...box.children].filter((x) => x.dataset.agent && !x.classList.contains("always") && x.getAttribute("aria-pressed") === "true").map((x) => x.dataset.agent);
+    return [...box.children].filter((x) => x.dataset.agent && !x.classList.contains("always") && !x.classList.contains("unseen") && x.getAttribute("aria-pressed") === "true").map((x) => x.dataset.agent);
   }
-  // What a click leaves as it was: an agent not shown, and one that has the
-  // item whatever is ticked, whose chip can't be clicked.
+  // What a click leaves as it was: an agent not shown, one that has the
+  // item whatever is ticked, whose chip can't be clicked, and one in a
+  // stopped distro magpie can't show the ticks of (unseen).
   function keptOf(box, all, on) {
-    const fixed = [...box.children].filter((x) => x.classList.contains("always")).map((x) => x.dataset.agent);
+    const fixed = [...box.children].filter((x) => x.classList.contains("always") || x.classList.contains("unseen")).map((x) => x.dataset.agent);
     return on.filter((id) => !all.some((x) => x.id === id) || fixed.includes(id));
   }
 
@@ -472,6 +510,10 @@ magpie.plugin("library", (ctx) => {
       take(v);
       if (glanced && tab !== "skills") return;
       if ((quiet === true || glanced) && seen(lib) === was) return;
+      // opening the page (its nav clicked, while on it too) draws it again
+      // only for a change, or for RTK's tab, which is asked again: a page
+      // drawn over again replaced the row under the reader's pointer (#3099)
+      if (quiet === "open" && seen(lib) === was && tab !== "rtk" && page.querySelector(":scope > .lib-body")) return;
       rtk = null; // asked again when its tab is drawn: an agent may have been installed since
       render();
     } catch (e) {
@@ -521,6 +563,12 @@ magpie.plugin("library", (ctx) => {
   // agent written that isn't one of them had it taken out (#332).
   function report(res, done, given) {
     if (!res) return;
+    // an update that found its source without the skill: said so, not
+    // as done or failed (スライム on Discord)
+    if (res.gone?.length) {
+      status(goneSaid(res.gone), "warn", 10000);
+      return;
+    }
     // skills installed together (lc on Discord): those the library had
     // already, and those left out because another by that name is in the
     // way, are named, beside how many were installed
@@ -749,7 +797,7 @@ magpie.plugin("library", (ctx) => {
         if (!mk || !window.scrollOnPurpose?.(e, 1500)) return;
         // its heading just under the strip, however many lines that takes
         const top = mk.getBoundingClientRect().top - page.getBoundingClientRect().top + page.scrollTop - head.getBoundingClientRect().height - 8;
-        page.scrollTo({ top, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        page.scrollTo({ top, behavior: calm() ? "auto" : "smooth" });
         mk.querySelector("input")?.focus({ preventScroll: true });
       });
       go.append(glyph(GLYPH.search, "lib-mini"), el("span", "", t("Discover")));
@@ -865,6 +913,11 @@ magpie.plugin("library", (ctx) => {
       // (#1025), so none is offered until it does
       const waiting = !rtkUpgrading && rtk.waiting;
       const behind = !waiting && rtk.latest && rtk.version && vNewer(rtk.latest, rtk.version);
+      // why there is no upgrade to run: a cargo RTK with no cargo to be
+      // found says what to install or run (新v学员)
+      const noUpgrade = rtk.noUpgrade === "cargo"
+        ? t("RTK was installed with cargo, but magpie can't find cargo to upgrade it. Install Rust from rustup.rs, or run {cmd} in a terminal.", { cmd: rtk.manual })
+        : t("magpie can't tell how this RTK was installed — update it the way you installed it");
       if (rtkUpgrading) ttl.append(tag(t("Upgrading…"), "lib-new"));
       else if (waiting) ttl.append(tag(t("v{v} is out · waiting for {via}", { v: rtk.latest, via: rtk.waiting }), "", t("RTK {v} is out, but {via} has {has} so far — usually within a few days. Upgrade comes back once {via} has it.", { v: rtk.latest, via: rtk.waiting, has: rtk.waitingHas || rtk.version })));
       else if (behind) ttl.append(tag(t("v{v} is out", { v: rtk.latest }), "lib-new", t("RTK {v} is the latest release; this one is {have}", { v: rtk.latest, have: rtk.version })));
@@ -872,7 +925,7 @@ magpie.plugin("library", (ctx) => {
       if (behind || rtkUpgrading) {
         const ub = button(rtkUpgrading ? t("Upgrading…") : t("Upgrade"), "action", upgradeRTK);
         ub.disabled = rtkUpgrading || !rtk.upgrade;
-        ub.title = rtk.upgrade ? (rtk.admin ? t("Runs {cmd}, as administrator: Windows asks first", { cmd: rtk.upgrade }) : t("Runs {cmd}", { cmd: rtk.upgrade })) : t("magpie can't tell how this RTK was installed — update it the way you installed it");
+        ub.title = rtk.upgrade ? (rtk.admin ? t("Runs {cmd}, as administrator: Windows asks first", { cmd: rtk.upgrade }) : t("Runs {cmd}", { cmd: rtk.upgrade })) : noUpgrade;
         ttl.append(ub);
       }
       card.append(ttl);
@@ -880,6 +933,10 @@ magpie.plugin("library", (ctx) => {
       // with the tool's exit code and what it said, until the next try (#741)
       if (rtkUpgrading && rtk.upgrade) card.append(el("p", "lib-rtk-gain", t("Running {cmd} — this can take a few minutes.", { cmd: rtk.upgrade })));
       else if (rtkUpgradeErr) card.append(el("p", "lib-rtk-note lib-rtk-err", t("The upgrade failed: {why}", { why: rtkUpgradeErr })));
+      // no upgrade to run: said on the card, not only in the disabled
+      // button's tooltip, which a click never shows (新v学员: a cargo RTK
+      // on Windows whose Upgrade did nothing)
+      else if (behind && !rtk.upgrade) card.append(el("p", "lib-rtk-note lib-rtk-noupgrade", noUpgrade));
       if (rtk.note) card.append(el("p", "lib-rtk-note", rtk.note));
       // found where magpie looks, but not on the PATH the agents get: their
       // hooks run rtk by name, so it does nothing for them (#601)
@@ -923,6 +980,10 @@ magpie.plugin("library", (ctx) => {
         ? t("Installing RTK… this can take a minute.")
         : t("RTK isn't installed. magpie can install it for you, or get it from its site.")));
       if (rtk.install) card.append(el("p", "lib-rtk-cmd", rtk.install));
+      // why the last install failed stays on the card, beside Get RTK, not
+      // only in a status line gone after ten seconds (Scott__D on X: the
+      // install never succeeded, and nothing on the page said why)
+      if (rtkInstallErr && !rtkInstalling) card.append(el("p", "lib-rtk-note lib-rtk-err lib-rtk-install-err", t("The install failed: {why}", { why: rtkInstallErr })));
       const acts = el("div", "lib-acts");
       if (rtk.install) {
         const ib = button(rtkInstalling ? t("Installing…") : t("Install RTK"), "action", installRTK);
@@ -933,6 +994,8 @@ magpie.plugin("library", (ctx) => {
       card.append(acts);
     }
     body.append(card);
+    // an agent in WSL runs its distro's own RTK (rtk_wsl.go): one card each
+    for (const d of rtk.wsl || []) body.append(rtkDistroCard(d));
     const rh = el("div", "row-head");
     rh.append(el("span", "label", t("Agents")), el("span", "grow"), el("span", "note", t("restart an agent after switching it")));
     body.append(rh);
@@ -943,22 +1006,33 @@ magpie.plugin("library", (ctx) => {
       const who = el("div", "who");
       who.append(el("div", "name", a.name));
       row.append(icon(a.icon), who, el("span", "grow"));
+      // an agent in WSL: its distro's RTK, not this computer's
+      const kind = a.id.split("@")[0];
+      const d = a.wsl ? (rtk.wsl || []).find((x) => x.name === a.wsl) : null;
+      const path = a.wsl ? d?.path : rtk.path, offPath = a.wsl ? d?.offPath : rtk.offPath;
+      if (a.asleep) row.append(tag(t("Not running"), "", t("WSL {distro} isn't running: magpie doesn't start it to read or change {agent}. Start the distro, then Check again.", { distro: a.wsl, agent: a.name })));
       // its hook calls an rtk that isn't there: switching it off still works
-      if (a.on && !rtk.path) row.append(tag(t("RTK missing"), "warn", t("{agent}'s hook calls rtk, which isn't installed, so its shell commands fail. Install RTK, or switch this off.", { agent: a.name })));
+      else if (a.on && !path) row.append(tag(t("RTK missing"), "warn", a.wsl
+        ? t("{agent}'s hook calls rtk, which isn't installed in WSL {distro}, so its shell commands fail. Install RTK there, or switch this off.", { agent: a.name, distro: a.wsl })
+        : t("{agent}'s hook calls rtk, which isn't installed, so its shell commands fail. Install RTK, or switch this off.", { agent: a.name })));
       // …or one that is, off the PATH the agent gets
-      else if (a.on && rtk.offPath) row.append(tag(t("Not on PATH"), "warn", t("{agent}'s hook runs rtk by name and can't find it, so RTK does nothing for it. Put RTK on PATH above.", { agent: a.name })));
+      else if (a.on && offPath) row.append(tag(t("Not on PATH"), "warn", a.wsl
+        ? t("{agent}'s hook runs rtk by name and can't find it in WSL {distro}, so RTK does nothing for it. Add RTK's folder to PATH there.", { agent: a.name, distro: a.wsl })
+        : t("{agent}'s hook runs rtk by name and can't find it, so RTK does nothing for it. Put RTK on PATH above.", { agent: a.name })));
       // an agent RTK has no hook for (rtkNoHook in rtk.go): listed, with its own why
       if (a.noHook) row.append(tag(t("No RTK hook"), "warn", rtkNoHookWhy(a)));
       // RTK before 0.51 installs Antigravity's hook only per project
-      else if (a.blocked && a.id === "agy") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.51 or newer: older ones install it only per project. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
-      else if (a.blocked && a.id !== "opencode") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.50 or newer: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
+      else if (a.blocked && kind === "agy") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.51 or newer: older ones install it only per project. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
+      // RTK before 0.44 has no Droid agent
+      else if (a.blocked && kind === "droid") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.44 or newer: older ones have no hook for it. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
+      else if (a.blocked && kind !== "opencode") row.append(tag(t("Update RTK"), "warn", t("{agent}'s hook needs RTK 0.50 or newer: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on.", { agent: a.name })));
       // OpenCode 2 loads only the plugin RTK 0.52 on writes (rtk-ai/rtk#4187);
       // an older one's, already there, can be switched off
       else if (a.blocked) row.append(tag(t("Update RTK"), "warn", a.on
         ? t("OpenCode 2 refuses to load this plugin: RTK before 0.52 writes it for OpenCode 1. Update RTK (brew upgrade rtk, or its installer again) and switch it on again, or switch this off.")
         : t("OpenCode 2 needs RTK 0.52 or newer: older ones write a plugin for OpenCode 1, which OpenCode 2 refuses to load. Update RTK (brew upgrade rtk, or its installer again), then switch it on.")));
       const sw = toggle(a.on, t("{agent} runs its commands through RTK", { agent: a.name }), (on) => setRTK(a, on));
-      if ((!rtk.path && !a.on) || (a.blocked && !a.on) || rtkBusy.has(a.id) || rtkInstalling || rtkUpgrading) sw.disabled = true;
+      if ((!path && !a.on) || a.asleep || (a.blocked && !a.on) || rtkBusy.has(a.id) || rtkInstalling || rtkInstallingIn || rtkUpgrading) sw.disabled = true;
       row.append(sw);
       list.append(row);
     }
@@ -972,10 +1046,14 @@ magpie.plugin("library", (ctx) => {
   // two together. An agent with no entry gets no reason and no link.
   function rtkNoHookWhy(a) {
     const agent = a.name;
-    switch (a.id) {
+    switch (a.id.split("@")[0]) {
       case "dsh": return t("RTK can't be given to {agent} yet: RTK works by rewriting the shell command an agent is about to run, and {agent}'s hooks can only allow or deny a command, not change it. RTK's installer has no option for it either (github.com/rtk-ai/rtk/issues/3847).", { agent });
       case "grok": return t("RTK can't be given to {agent} yet: RTK's installer has no option for Grok Build (github.com/rtk-ai/rtk/issues/2136).", { agent });
       case "grok-app": return t("RTK can't be given to {agent} yet: {agent} runs Grok Build, and RTK's installer has no option for Grok Build (github.com/rtk-ai/rtk/issues/2136).", { agent });
+      case "qoder": return t("RTK can't be given to {agent} yet: RTK's installer has no option for Qoder (github.com/rtk-ai/rtk/issues/1327).", { agent });
+      case "qoder-cn": return t("RTK can't be given to {agent} yet: {agent} is Qoder's China build, and RTK's installer has no option for Qoder (github.com/rtk-ai/rtk/issues/1327).", { agent });
+      case "cline": return t("RTK can't be given to {agent} yet: RTK's installer only writes a .clinerules into one project, asking the model to type rtk itself, and has nothing for every project (github.com/rtk-ai/rtk/issues/3841).", { agent });
+      case "kimi": return t("RTK can't be given to {agent}: {agent}'s hooks can only allow or deny a command, not change it, so RTK's installer only adds instructions to one project's AGENTS.md and has nothing for every project.", { agent });
       default: return t("RTK can't be given to {agent} yet: RTK has no hook for it.", { agent });
     }
   }
@@ -1095,14 +1173,71 @@ magpie.plugin("library", (ctx) => {
     rtkPathing = false;
     render();
   }
-  let rtkInstalling = false;
+  // RTK in a WSL distro: its agents' hooks run there, so they run its own
+  // rtk, installed by RTK's own Linux script run in the distro. A distro
+  // that isn't running is never started for it.
+  let rtkInstallingIn = "";
+  const rtkInstallErrIn = {};
+  function rtkDistroCard(d) {
+    const card = el("div", "list lib-card lib-rtk-wsl");
+    const ttl = el("div", "lib-cardhead");
+    ttl.append(el("b", "", t("RTK in WSL {distro}", { distro: d.name })), el("span", "grow"));
+    if (d.path) ttl.append(el("span", "note mono", d.version ? "v" + d.version : d.path));
+    card.append(ttl);
+    const acts = el("div", "lib-acts");
+    const again = (cls) => button(t("Check again"), cls, () => { rtk = null; render(); });
+    if (d.asleep) {
+      card.append(el("p", "lib-rtk-gain", t("WSL {distro} isn't running: magpie doesn't start it to look for RTK or change its agents. Start the distro, then Check again.", { distro: d.name })));
+      acts.append(again("action"));
+    } else if (!d.path) {
+      const installing = rtkInstallingIn === d.name;
+      card.append(el("p", "lib-rtk-gain", installing
+        ? t("Installing RTK in WSL {distro}… this can take a minute.", { distro: d.name })
+        : d.install
+          ? t("RTK isn't installed in WSL {distro}. Agents there run their hooks in the distro, so they need RTK there: magpie can run RTK's own installer in it.", { distro: d.name })
+          : t("magpie couldn't look for RTK in WSL {distro}.", { distro: d.name })));
+      if (d.install) card.append(el("p", "lib-rtk-cmd", d.install));
+      if (rtkInstallErrIn[d.name] && !installing) card.append(el("p", "lib-rtk-note lib-rtk-err lib-rtk-install-err", t("The install failed: {why}", { why: rtkInstallErrIn[d.name] })));
+      if (d.install) {
+        const ib = button(installing ? t("Installing…") : t("Install RTK in WSL {distro}", { distro: d.name }), "action", () => installRTKIn(d.name));
+        ib.disabled = !!rtkInstallingIn || rtkInstalling;
+        acts.append(ib);
+      }
+      acts.append(again(d.install ? "" : "action"));
+    } else if (d.offPath) {
+      const dir = d.path.replace(/\/[^/]*$/, "");
+      card.append(el("p", "lib-rtk-note lib-rtk-offpath", t("RTK is in {dir} in WSL {distro}, which isn't on its shells' PATH. Agents there run rtk by name, so they can't find it. Add {dir} to PATH in your shell profile there, then Check again.", { dir, distro: d.name })));
+      acts.append(again("action"));
+    } else {
+      card.append(el("p", "lib-rtk-gain", t("Agents in WSL {distro} run its own RTK, at {path}. What it saves there is in its own count (rtk gain in the distro), not the one above.", { distro: d.name, path: d.path })));
+    }
+    if (acts.childNodes.length) card.append(acts);
+    return card;
+  }
+  async function installRTKIn(distro) {
+    rtkInstallingIn = distro;
+    delete rtkInstallErrIn[distro];
+    render();
+    try {
+      rtk = await api("library/rtk/install", { distro });
+      status(t("RTK is installed in WSL {distro} — switch it on for its agents below", { distro }), "ok", 6000);
+    } catch (e) {
+      rtkInstallErrIn[distro] = e.message;
+      status(e.message, "err", 10000);
+    }
+    rtkInstallingIn = "";
+    render();
+  }
+  let rtkInstalling = false, rtkInstallErr = "";
   async function installRTK() {
     rtkInstalling = true;
+    rtkInstallErr = "";
     render();
     try {
       rtk = await api("library/rtk/install", {});
       status(t("RTK is installed — switch it on for your agents below"), "ok", 6000);
     } catch (e) {
+      rtkInstallErr = e.message;
       status(e.message, "err", 10000);
     }
     rtkInstalling = false;
@@ -1206,8 +1341,11 @@ magpie.plugin("library", (ctx) => {
     for (const a of rows) list.append(...instructionsRow(a));
     if (!rows.length) list.append(el("div", "lib-none", t("None of your agents reads a user-wide instructions file magpie knows.")));
     body.append(list);
-    const skip = shownAgents().filter((a) => !a.instructions);
+    // a stopped WSL distro's agents are rows above when magpie saw their
+    // file; one it didn't see isn't said to keep none
+    const skip = shownAgents().filter((a) => !a.instructions && !a.asleep);
     if (skip.length) body.append(el("p", "lib-aside", t(skip.length > 1 ? "{agents} keep no user-wide instructions file." : "{agents} keeps no user-wide instructions file.", { agents: skip.map((a) => a.name).join(", ") })));
+    body.append(...asleepAsides(rows.filter((a) => a.asleep)));
     body.append(bar);
   }
 
@@ -1335,14 +1473,20 @@ magpie.plugin("library", (ctx) => {
     return row;
   }
 
+  // An agent in a stopped WSL distro (asleep) is its row as magpie last saw
+  // it, greyer: its file isn't read or shown in the file manager, either of
+  // which would start WSL (#3896), and a switch is written there the next
+  // time it runs. One whose file magpie never saw (unseen) is listed only
+  // while it is on, its switch kept as it is (#4182).
   function instructionsRow(a) {
     const isOpen = open.has(a.agent);
-    const row = el("div", "row lib-row click" + (isOpen ? " open" : ""));
+    const row = el("div", "row lib-row click" + (isOpen ? " open" : "") + (a.asleep ? " asleep" : ""));
     const who = el("div", "who");
     const name = el("div", "name", a.name);
     who.append(name);
     const sub = el("div", "sub");
-    sub.append(pathLink(a.path));
+    if (a.asleep) { if (a.path) sub.append(el("span", "lib-path", tilde(a.path))); }
+    else sub.append(pathLink(a.path));
     who.append(sub);
     const tags = el("div", "lib-tags");
     const extra = extras[a.agent] ?? a.extra;
@@ -1352,7 +1496,8 @@ magpie.plugin("library", (ctx) => {
     if (a.own) tags.append(tag(a.own === 1 ? t("1 line of its own") : t("{n} lines of its own", { n: a.own }), "", t("The file has instructions besides magpie's part — they stay, and the agent reads both")));
     const chev = el("span", "chev");
     chev.append(svg(CHEV_R, 11, 1.7));
-    row.append(icon(a.icon), who, tags, toggle(a.on, t("{agent} reads the shared instructions", { agent: a.name }), (on) => {
+    const sw = toggle(a.on, t("{agent} reads the shared instructions", { agent: a.name }), (on) => {
+      if (a.unseen) return;
       const agents = lib.instructions.agents.filter((x) => (x.agent === a.agent ? on : x.on)).map((x) => x.agent);
       let done = t("Taken out of {agent}'s file", { agent: a.name });
       if (on && dirty()) done = t("{agent} is on — save to write the new text into its file", { agent: a.name });
@@ -1363,8 +1508,13 @@ magpie.plugin("library", (ctx) => {
           : t("{agent} is on — it gets the shared instructions once there are some", { agent: a.name });
       }
       else if (on) done = t("{agent} reads the shared instructions now", { agent: a.name });
+      if (a.asleep) done = asleepSaid;
       change("instructions/save", { agents }, done);
-    }), chev);
+    });
+    const asleepSaid = a.asleep && t("WSL {distro} isn't running: its agents show what magpie last saw there, and what you change is written there the next time it runs.", { distro: a.asleep });
+    if (a.unseen) { sw.setAttribute("aria-disabled", "true"); sw.title = t("WSL {distro} isn't running, and magpie hasn't seen {agent}'s files there yet: start the distro to change this", { distro: a.asleep, agent: a.name }); }
+    else if (a.asleep) sw.title = asleepSaid;
+    row.append(icon(a.icon), who, tags, sw, chev);
     row.onclick = () => { if (isOpen) open.delete(a.agent); else open.add(a.agent); render(); };
     if (!isOpen) return [row];
 
@@ -1421,7 +1571,16 @@ magpie.plugin("library", (ctx) => {
     if (s.transport === "stdio") return [s.command, ...(s.args || [])].map(quote).join(" ");
     return s.url;
   }
-  function quote(a) { return /^[\w@%+=:,./-]+$/.test(a) ? a : "'" + a.replace(/'/g, `'\\''`) + "'"; }
+  // quote: an argument as this system's shell reads it, and words() reads
+  // back. On Windows that is cmd's double quotes, and a \ is a path's, not an
+  // escape: sh's 'C:\…\npx.cmd' read as quotes magpie had added to the
+  // command (fremontdango on Discord), and a path typed as it is lost its \
+  // and : on save (#2685).
+  const WIN_LINE = /^Win/.test(navigator.platform);
+  function quote(a) {
+    if (WIN_LINE) return a && !/[\s"'&|<>^%]/.test(a) ? a : '"' + a.replace(/"/g, '""') + '"';
+    return /^[\w@%+=:,./-]+$/.test(a) ? a : "'" + a.replace(/'/g, `'\\''`) + "'";
+  }
 
   function sseBlocked(s) {
     return (a) => {
@@ -1470,6 +1629,9 @@ magpie.plugin("library", (ctx) => {
       const after = el("div", "after-list");
       after.append(button(t("＋ Add server"), "", () => editServer(null)));
       body.append(after);
+      // kept while picking too, as Add server is: the page stays as tall,
+      // so Select doesn't move under the pointer (library-servers-bulk)
+      body.append(...hubPart());
       // each server is checked once a session, and again only once it
       // changed; once the rows are on the page, for them to show it. One
       // that no agent and no project has is started for nobody, so it is
@@ -1493,6 +1655,7 @@ magpie.plugin("library", (ctx) => {
     if (lib.servers.length || lib.projects.length) renderProjects(body, "mcp");
     const skip = shownAgents().filter((a) => !a.mcp);
     if (skip.length) body.append(el("p", "lib-aside", t("{agents} has no MCP servers magpie can write.", { agents: skip.map((a) => a.name).join(", ") })));
+    body.append(...asleepAsides());
     // WorkBuddy connects a server only once it is trusted there, again
     // after its command or address changes (#1266)
     for (const wb of shownAgents().filter((a) => (a.id === "workbuddy" || a.id === "workbuddy-ai") && a.mcp)) {
@@ -1503,12 +1666,386 @@ magpie.plugin("library", (ctx) => {
     body.append(discover("mcp"));
   }
 
+  // The MCP hub (#2679): magpie as each agent's one MCP server, handing
+  // each call on to the library's servers ticked for it, and one address
+  // for any other app with every server in the library. A switch, off
+  // till turned on; on, what it serves, the address with Connect, and the
+  // agents that keep each server's own entry, with why.
+  function hubPart() {
+    const list = el("div", "list lib-list lib-hublist");
+    const row = el("div", "row lib-row lib-hub");
+    const who = el("div", "who");
+    who.append(el("div", "name", t("MCP router")));
+    who.append(el("div", "sub wraps", lib.mcpHub
+      ? t("Each agent is given one server, magpie, in place of these. magpie runs each server once for all of them and hands each call to it, as server__tool. Restart an agent for it to read the change.")
+      : t("Serve every server through magpie: each agent is given one server, magpie, in place of these, and any other app connects at one address.")));
+    if (lib.mcpHub) who.append(el("div", "sub lib-hubstats", hubStats()));
+    row.append(hubMark(), who, toggle(!!lib.mcpHub, t("MCP router"), (on) =>
+      change("servers/hub", { on }, on
+        ? t("The agents are given magpie's one MCP server — restart them to use it")
+        : t("The agents are given each server's own entry again — restart them to use it"))));
+    list.append(row);
+    const out = [list];
+    if (!lib.mcpHub) return out;
+    // the one address any other app connects at
+    const at = el("div", "row lib-row lib-hubat");
+    const aw = el("div", "who");
+    // what it is, not who: the hub's address (the owner: "Other apps" over
+    // an address read as nonsense); who connects there is in the tooltip
+    aw.append(el("div", "name", t("Router address")));
+    aw.title = t("Any other app, as Cursor or VS Code, connects here for every server in the library");
+    const u = el("div", "sub mono lib-hubURL", hubURL());
+    u.title = hubURL();
+    aw.append(u);
+    const connect = button(t("Connect…"), "", () => connectHub());
+    connect.classList.add("lib-hubconnect");
+    at.append(glyph(GLYPH.web), aw, copyBtn(hubURL(), t("Address")), connect);
+    list.append(at);
+    list.append(hubNoteRow());
+    const names = (why) => hubAgents().filter((a) => a.hub === why).map((a) => a.name).join(", ");
+    const why = [
+      ["no-remote", "{agents} reaches no MCP server over HTTP, so it keeps each server's own entry."],
+      ["taken", "A server in the library is called magpie, so {agents} keeps each server's own entry: give that server another name for the router to be used."],
+      ["own", "{agents} has an MCP server called magpie of its own, which magpie leaves as it is, so it keeps each server's own entry."],
+    ];
+    for (const [k, text] of why) {
+      const n = names(k);
+      if (n) {
+        const p = el("p", "lib-aside lib-hub-why", t(text, { agents: n }));
+        p.dataset.why = k;
+        out.push(p);
+      }
+    }
+    return out;
+  }
+  // What the router says of itself to the agents (packinggoodsllc_07668 on
+  // Discord: one magpie in China and one in Los Angeles serve the same
+  // tools, and an agent fetching Google should pick Los Angeles): before
+  // each tool's description and in what it tells an agent connecting.
+  // Empty, an agent on another computer is told this computer's name,
+  // shown as the placeholder. Saved on Enter or leaving the field, this
+  // computer's own (settings' routerNote).
+  function hubNoteRow() {
+    const row = el("div", "row lib-row lib-hubnoterow");
+    const who = el("div", "who");
+    who.append(el("div", "name", t("Router name")));
+    who.append(el("div", "sub wraps", t("Agents connected to more than one router tell them apart by it. Empty, agents on other computers are told this computer's name.")));
+    const f = el("input", "lib-filter lib-hubname");
+    f.type = "text";
+    f.value = lib.hubNote || "";
+    f.placeholder = lib.hubName || "";
+    f.maxLength = 80;
+    f.spellcheck = false;
+    f.autocomplete = "off";
+    f.setAttribute("aria-label", t("Router name"));
+    let saved = lib.hubNote || "";
+    const save = () => {
+      const note = f.value.trim().replace(/\s+/g, " ");
+      if (note === saved) return;
+      const was = saved;
+      saved = note;
+      // a change of settings, not of the agents' files: no result to report
+      change("servers/hub-note", { note }).then((ok) => {
+        if (!ok) { saved = was; return; }
+        status(note
+          ? t("Agents are told this router is {name} — restart them to read it", { name: note })
+          : t("Agents on other computers are told this computer's name — restart them to read it"), "ok");
+      });
+    };
+    f.onkeydown = (e) => {
+      e.stopPropagation();
+      // an Enter that ends an input method's composition is the IME's
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter") { e.preventDefault(); f.blur(); }
+      if (e.key === "Escape") { e.preventDefault(); f.value = saved; f.blur(); }
+    };
+    f.onblur = save;
+    row.append(glyph(GLYPH.doc), who, f);
+    return row;
+  }
+  // every server is behind the hub, magpie's own image server too, but one
+  // the user keeps direct (#4382): each agent's own entry (inHub in
+  // mcp_hub.go)
+  const inHub = (s) => s.hub !== "direct";
+  // the servers each agent is given directly, by name, for the hub's lines
+  const directNames = () => lib.servers.filter((s) => !inHub(s)).map((s) => s.name).join(", ");
+  // what the hub serves: its servers, their tools as far as checked, and
+  // the agents given it
+  function hubStats() {
+    const servers = lib.servers.filter(inHub);
+    const parts = [servers.length === 1 ? t("1 server") : t("{n} servers", { n: servers.length })];
+    const known = servers.filter((s) => health.get(s.name)?.h?.state === "ok");
+    if (known.length) {
+      const n = known.reduce((sum, s) => sum + Math.max(0, (health.get(s.name).h.tools || 0) - (s.disabledTools?.length || 0)), 0);
+      parts.push(n === 1 ? t("1 tool") : t("{n} tools", { n }));
+    }
+    const given = hubAgents().filter((a) => a.hub === "on").map((a) => a.name);
+    if (given.length) parts.push(t("in {agents}", { agents: given.length > 3 ? t("{first} and {n} more", { first: given.slice(0, 2).join(", "), n: given.length - 2 }) : given.join(", ") }));
+    // the owner, counting two servers and seeing one: where the other went
+    const direct = directNames();
+    if (direct) parts.push(t("{name} is given to each agent directly", { name: direct }));
+    return parts.join(" · ");
+  }
+  const hubURL = () => mcpAddress(state.settings || {}, lib.hubPath.replace(/\/+$/, ""));
+
+  // Connect to the hub (#2679): two tabs. Agents: every agent magpie looks
+  // after, in three groups, each a switch of its own. Not connected
+  // comes first, then connected, then the agents that keep each server's
+  // own entry, with why. Over them is one line of how many go through
+  // magpie, and in the bar a Connect all for the rest. With many agents,
+  // the connected and the kept fold to one row each and a search narrows
+  // them all. Other apps: the one address, and a row per app with what
+  // adds it, by its install link (servers/hub-open, which the app
+  // confirms) or by copying its entry. The agents are magpie's to
+  // connect, never a command for the user to run; Cursor is among them
+  // when it's here.
+  let hubTab = "agents";
+  const hubFold = { on: true, kept: true };
+  function connectHub() {
+    const url = hubURL();
+    const json = (o) => JSON.stringify(o, null, 2);
+    const served = () => lib.servers.filter(inHub);
+    const ed = el("div", "editor lib-editor lib-hubsheet");
+    const head = el("div", "ehead");
+    head.append(hubMark(), el("b", "", t("Connect an app")));
+    ed.append(head);
+    const pane = el("div", "lib-hubpane");
+    const bar = el("div", "bar");
+    let busy = false, changed = false, q = "";
+    const why = new Set();
+    if (!mcpAgents().length) hubTab = "apps";
+    if (mcpAgents().length) ed.append(segs([["agents", t("Agents")], ["apps", t("Other apps")]], hubTab, (k) => { hubTab = k; draw(); }));
+    ed.append(pane, bar);
+
+    // posts agents-all for some agents, on or off, and says what came of it
+    const give = async (ids, on, b) => {
+      if (busy) return;
+      busy = true;
+      for (const x of ed.querySelectorAll(".lib-hubpane button, .bar button")) x.disabled = true;
+      b?.classList.add("busy");
+      const named = mcpAgents().filter((a) => ids.includes(a.id));
+      try {
+        take(await api("library/servers/agents-all", { agents: ids, on }));
+        changed = true;
+        const now = mcpAgents().filter((a) => ids.includes(a.id));
+        const failed = now.filter((a) => on ? a.hub !== "on" : a.hub === "on");
+        if (failed.length) status(t("{agent} couldn't be connected", { agent: failed.map((a) => a.name).join(", ") }), "warn", 8000);
+        else if (!on) status(t("{agent} no longer has the library's servers — restart it to read the change", { agent: named[0]?.name || "" }), "ok");
+        else if (named.length === 1) status(t("{agent} is connected — restart it to use magpie's tools", { agent: named[0].name }), "ok");
+        else status(t("{n} agents are connected — restart them to use magpie's tools", { n: named.length }), "ok");
+        render();
+      } catch (e) {
+        status(e.message, "err", 6000);
+      }
+      busy = false;
+      if (ed.isConnected) draw();
+    };
+
+    // an agent's row: a switch, or, kept, why in a word and in full
+    const agentRow = (a) => {
+      const st = a.hub || (a.noRemote ? "no-remote" : "");
+      const row = el("div", "row lib-row lib-hubagent");
+      row.dataset.agent = a.id;
+      row.dataset.state = st || "none";
+      const who = el("div", "who");
+      who.append(el("div", "name", a.name));
+      if (a.aside && st !== "no-remote") who.append(el("div", "sub", a.aside));
+      row.append(agentIcon(a.icon), who);
+      if (st === "on" || !st) {
+        const sw = toggle(st === "on", t("{agent} through magpie", { agent: a.name }), (on) => give([a.id], on, sw));
+        if (!st && !served().length) { sw.disabled = true; sw.title = t("The library has no MCP servers yet"); }
+        row.append(sw);
+        return [row];
+      }
+      row.classList.add("lib-hubkept");
+      row.append(el("span", "lib-hubtag", { "no-remote": t("No HTTP"), own: t("Has its own magpie"), taken: t("Name taken") }[st]));
+      const open = why.has(a.id);
+      const i = el("button", "lib-hubinfo");
+      i.type = "button";
+      i.setAttribute("aria-expanded", open ? "true" : "false");
+      i.setAttribute("aria-label", t("Why"));
+      i.title = t("Why");
+      i.append(svg("M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z M8 7.2v3.6 M8 5.2v.1", 14, 1.3));
+      i.onclick = (e) => { e.stopPropagation(); open ? why.delete(a.id) : why.add(a.id); draw(); };
+      row.append(i);
+      if (!open) return [row];
+      const p = el("p", "lib-hubwhy", {
+        "no-remote": t("It reaches no MCP server over HTTP, so it keeps each server's own entry"),
+        own: t("It has a server called magpie of its own, which magpie leaves as it is"),
+        taken: t("A server in the library is called magpie: give it another name to connect"),
+      }[st]);
+      p.dataset.why = st;
+      return [row, p];
+    };
+    // a group: its name and count, a fold when there are many, its rows
+    const group = (key, title, list, many) => {
+      if (!list.length) return [];
+      const sec = el("div", "lib-hubgrp");
+      sec.dataset.group = key;
+      const h = el("div", "lib-hubsec");
+      h.append(el("span", "", title), el("span", "lib-hubn", String(list.length)));
+      const folds = many && key !== "off" && !q;
+      const folded = folds && hubFold[key];
+      if (folds) {
+        const f = button(folded ? t("Show all") : t("Hide"), "lib-hubfold", () => { hubFold[key] = !hubFold[key]; draw(); });
+        f.setAttribute("aria-expanded", folded ? "false" : "true");
+        h.append(f);
+      }
+      const box = el("div", "list lib-list lib-hubagents");
+      if (folded) {
+        // one row for them all: a few icons, a couple of names, how many
+        const row = el("button", "row lib-row lib-hubfolded");
+        row.type = "button";
+        const stack = el("span", "lib-hubstack");
+        for (const a of list.slice(0, 4)) stack.append(agentIcon(a.icon));
+        const names = list.length > 2
+          ? t("{first} and {n} more", { first: list.slice(0, 2).map((a) => a.name).join(", "), n: list.length - 2 })
+          : list.map((a) => a.name).join(", ");
+        row.append(stack, el("span", "name", names), svg("M6 3.5l4.5 4.5L6 12.5", 12, 1.6));
+        row.onclick = (e) => { e.stopPropagation(); hubFold[key] = false; draw(); };
+        box.append(row);
+      } else box.append(...list.flatMap(agentRow));
+      sec.append(h, box);
+      return [sec];
+    };
+
+    const drawAgents = () => {
+      const all = hubAgents();
+      const st = (a) => a.hub || (a.noRemote ? "no-remote" : "");
+      const can = all.filter((a) => st(a) === "on" || !st(a));
+      const on = can.filter((a) => st(a) === "on");
+      const kept = all.filter((a) => !can.includes(a));
+      const many = all.length > 8;
+      // agents → magpie → servers, and the one line of where things stand
+      const flow = el("div", "lib-hubflow");
+      const route = el("div", "lib-hubroute");
+      const ends = (items, more) => {
+        const s = el("span", "lib-hubstack");
+        s.append(...items);
+        if (more > 0) s.append(el("span", "ic lib-hubmore", "+" + more));
+        return s;
+      };
+      // magpie itself in the middle: the bird the sidebar shows, on a plain tile
+      const node = el("span", "lib-hubnode");
+      node.innerHTML = '<svg viewBox="0 0 44 44" width="22" height="22" aria-hidden="true"><use href="#bird"/></svg>';
+      const srv = served();
+      route.append(ends(on.slice(0, 3).map((a) => agentIcon(a.icon)), on.length - 3), el("span", "lib-hubwire"), node, el("span", "lib-hubwire"),
+        ends(srv.slice(0, 3).map((s) => mark(s.icon, s.transport === "stdio" ? GLYPH.cmd : GLYPH.web)), srv.length - 3));
+      flow.append(route);
+      flow.append(el("p", "lib-hublead", !srv.length ? t("The library has no MCP servers yet")
+        : can.length === 1 ? t(on.length ? "{agent} uses the library's servers through magpie" : "{agent} can use the library's servers through magpie", { agent: can[0].name })
+        : t("{on} of {all} agents use the library's servers through magpie", { on: on.length, all: can.length })));
+      const left = can.length - on.length;
+      const sub = [left ? t("{n} more can be connected", { n: left }) : t("Each server runs once, for all of them")];
+      if (kept.length) sub.push(kept.length === 1 ? t("1 keeps each server's own entry") : t("{n} keep each server's own entry", { n: kept.length }));
+      const direct = directNames();
+      if (direct) sub.push(t("{name} is given to each agent directly", { name: direct }));
+      // each part whole on its line, the dot kept with the part before it
+      const line = el("p", "lib-hubsub");
+      sub.forEach((x, i) => line.append(...(i ? [" "] : []), el("span", "", x + (i < sub.length - 1 ? "\u00a0·" : ""))));
+      flow.append(line);
+      const out = [flow];
+      if (many) {
+        const box = el("label", "lib-hubsearch");
+        box.append(svg("M7 2.5a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9z M10.3 10.3l3.2 3.2", 13, 1.5));
+        const inp = el("input");
+        inp.type = "search";
+        inp.id = "lib-hubq";
+        inp.placeholder = t("Find an agent");
+        inp.setAttribute("aria-label", t("Find an agent"));
+        inp.value = q;
+        inp.oninput = () => { q = inp.value.trim(); draw(); };
+        box.append(inp);
+        out.push(box);
+      }
+      const m = (a) => !q || a.name.toLowerCase().includes(q.toLowerCase());
+      const groups = [
+        ...group("off", t("Not connected"), can.filter((a) => !st(a) && m(a)), many),
+        ...group("on", t("Connected"), on.filter(m), many),
+        ...group("kept", t("Keep each server's own entry"), kept.filter(m), many),
+      ];
+      out.push(...(groups.length ? groups : [el("p", "lib-hubnone", t("No agent called “{q}”", { q }))]));
+      return out;
+    };
+
+    // any other app: the address, and a row per app with what adds it
+    const drawApps = () => {
+      const out = [el("p", "lib-hublead lib-hubapps", t("Any app that speaks MCP connects at this address"))];
+      const addr = el("div", "lib-hubaddr");
+      addr.append(el("code", "", url), copyBtn(url, t("Address")));
+      out.push(addr, el("p", "lib-hubcap", t("From another computer, use the address magpie is reached at there, with a gateway key: Authorization: Bearer <key>.")));
+      const apps = [
+        ...(mcpAgents().some((a) => a.id === "cursor") ? [] : [{ id: "cursor", icon: "cursor", name: "Cursor", link: true, where: t("Or add it to ~/.cursor/mcp.json"), text: json({ mcpServers: { magpie: { url } } }) }]),
+        { id: "vscode", icon: "vscode", name: "VS Code", link: true, where: t("Or add it to .vscode/mcp.json, or to your user mcp.json"), text: json({ servers: { magpie: { type: "http", url } } }) },
+        { id: "windsurf", icon: "windsurf", name: "Windsurf", where: t("Paste it into ~/.codeium/windsurf/mcp_config.json"), text: json({ mcpServers: { magpie: { serverUrl: url } } }) },
+        { id: "json", icon: "generic", name: t("Other"), where: t("Cline, LM Studio and any app that takes MCP servers as JSON"), text: json({ mcpServers: { magpie: { type: "http", url } } }) },
+      ];
+      const sec = el("div", "lib-hubgrp");
+      sec.append(el("div", "lib-hubsec", t("Add to an app")));
+      const box = el("div", "list lib-list lib-hubappl");
+      for (const a of apps) {
+        const row = el("div", "row lib-row lib-hubapp");
+        row.dataset.app = a.id;
+        const who = el("div", "who");
+        const link = a.link && !web;
+        who.append(el("div", "name", a.name), el("div", "sub", link ? t("{app} asks you to confirm, then it's ready", { app: a.name }) : a.where));
+        row.append(icon(a.icon), who);
+        if (link) {
+          const go = button(t("Add"), "lib-hubpill lib-hubadd", async () => {
+            go.disabled = true;
+            try {
+              await api("library/servers/hub-open", { app: a.id });
+              status(t("{app} asks you to confirm adding magpie", { app: a.name }));
+            } catch (e) { status(e.message, "err"); }
+            go.disabled = false;
+          });
+          go.title = t("Add to {app}", { app: a.name });
+          row.append(go);
+        }
+        const cp = button(t("Copy entry"), "lib-hubpill lib-hubcopy", () => copy(a.text, a.name, cp, t("{app}'s entry copied", { app: a.name })));
+        cp.title = a.text;
+        if (link) cp.classList.add("quiet");
+        row.append(cp);
+        box.append(row);
+      }
+      sec.append(box);
+      out.push(sec);
+      return out;
+    };
+
+    const done = button(t("Done"), "", () => closeLibModal(true));
+    const draw = () => {
+      const top = pane.scrollTop;
+      const focus = document.activeElement?.id === "lib-hubq";
+      pane.replaceChildren(...(hubTab === "agents" ? drawAgents() : drawApps()));
+      pane.scrollTop = top;
+      if (focus) { const i = pane.querySelector("#lib-hubq"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+      // the one primary action: Connect all while there are agents to connect
+      const rest = hubTab === "agents" && served().length ? hubAgents().filter((a) => !a.hub && !a.noRemote) : [];
+      bar.replaceChildren(el("span", "grow lib-hubnote", changed ? t("Restart an agent for it to read the change") : ""), done);
+      done.className = "text" + (rest.length ? "" : " primary");
+      done.disabled = false;
+      if (rest.length) {
+        const all = button(t("Connect all"), "primary lib-huball", (e, b) => give(rest.map((a) => a.id), true, b));
+        all.title = rest.map((a) => a.name).join(", ");
+        bar.append(all);
+      }
+    };
+    draw();
+    modal = { save: () => (bar.querySelector(".lib-huball") || done).click() };
+    openLib(ed);
+  }
+
   function serverRow(s, all) {
     const row = el("div", "row lib-row click lib-server");
     const who = el("div", "who");
     const nm = el("div", "name mono", s.name);
     if (s.signIn?.dead) nm.append(tag(t("Sign-in ran out"), "warn", t("Open it to sign in again")));
     else if (s.signIn?.signedIn) nm.append(tag(t("Signed in"), "lib-signed", t("The agents given it use magpie's sign-in")));
+    // kept to this computer: sync carries it nowhere (huhuy72219405 on X)
+    if (s.local) nm.append(tag(t("This computer only"), "lib-local", t("Sync never carries it to your other computers")));
+    // out of the hub, each agent's own entry (#4382): said only while the hub is on
+    if (lib.mcpHub && s.hub === "direct") nm.append(tag(t("Not through the router"), "lib-direct", t("Each agent is given its own entry for it, as with the MCP router off")));
     // its status beside the name, not in it: the name is still the name
     who.classList.add("lib-srvwho");
     who.append(nm, healthEl(s.name));
@@ -1518,9 +2055,51 @@ magpie.plugin("library", (ctx) => {
     row.append(mark(s.icon, s.transport === "stdio" ? GLYPH.cmd : GLYPH.web), who, ...removeAct(() => confirmRemoveServer(s)),
       agentChips(withGone(all, s.agents), s.agents, chipsChange("servers/agents", s.name, "servers", (x) => serverRow(x, all)), { problems: s.problems, blocked: sseBlocked(s), all: true }));
     if (picking) return pickRow(row, s.name);
+    if (s.name === "magpie-browser" && !s.agents?.length) who.append(browserAsk(row));
     row.onclick = () => editServer(s);
     row.title = t("Edit {name}", { name: s.name });
     return row;
+  }
+
+  // Magpie Browser connected and given to no agent: it is added opt-in, so
+  // until an agent is ticked the router offers it to none, and an agent
+  // asked to use the browser reached for something else (AppleScript).
+  // Once the extension connects, its row asks which agents may use it,
+  // each a button that clicks that agent's chip in the row; the first one
+  // taken, it says nothing more. Read again every few seconds while the
+  // row is shown, so connecting the extension shows it without a reload.
+  let browserSeen = null; // { at, link } — the last read of the extension's state, shared by redrawn rows
+  function browserLink() {
+    if (browserSeen && Date.now() - browserSeen.at < 2500) return browserSeen.link;
+    const link = api("library/browser").then((b) => !!b?.connected, () => false);
+    browserSeen = { at: Date.now(), link };
+    return link;
+  }
+  function browserAsk(row) {
+    const ask = el("div", "lib-browserask");
+    ask.hidden = true;
+    ask.onclick = (e) => e.stopPropagation();
+    const draw = () => {
+      const chips = [...row.querySelectorAll(":scope > .lib-agents > .lib-ag[data-agent]")].filter((c) => !cannot(c) && !c.classList.contains("gone"));
+      const picks = el("div", "lib-browserask-picks");
+      for (const c of chips) {
+        const b = button("", "lib-browserask-pick", () => { c.click(); ask.remove(); });
+        b.dataset.agent = c.dataset.agent;
+        b.append(agentIcon(agentOf(c.dataset.agent)?.icon), el("span", "", nameOf(c.dataset.agent)));
+        picks.append(b);
+      }
+      ask.replaceChildren(el("span", "lib-browserask-dot"), el("span", "lib-browserask-q", t("Connected to your browser. Which agents may use it? They act in your tabs, signed in as you are.")), picks);
+    };
+    const look = async () => {
+      if (!ask.isConnected && ask.dataset.drawn) return;
+      ask.dataset.drawn = "1";
+      const on = await browserLink();
+      if (on && ask.hidden) draw();
+      ask.hidden = !on;
+      setTimeout(look, 3000);
+    };
+    requestAnimationFrame(look);
+    return ask;
   }
 
   // A server's or a hook's own Remove on its row, as a skill's has (#2364,
@@ -1580,7 +2159,10 @@ magpie.plugin("library", (ctx) => {
   // each says it does (nf1qaz2w on Discord), with Check again under them.
   const health = new Map(); // name → { key: the server as checked, h: what was found, null while checking }
   const toolsOpen = new Set(); // the servers whose tools are shown
-  const healthKey = (s) => JSON.stringify([s.transport, s.command, s.args, s.env, s.url, s.headers, s.signIn]);
+  // a command is started where its agents run, this computer or a WSL
+  // distro (mcp_check_wsl.go): agents moved between them is a check anew
+  const healthKey = (s) => JSON.stringify([s.transport, s.command, s.args, s.env, s.url, s.headers, s.signIn,
+    s.transport === "stdio" ? [...new Set((s.agents || []).map((a) => a.split("@wsl:")[1] || ""))].sort() : null]);
   const toolList = (name) => { const h = health.get(name)?.h; return h?.state === "ok" ? h.toolList || [] : []; };
   // whether an agent the page shows gets the server, here or in a project
   // magpie keeps whose folder is there. The library keeps every agent it
@@ -1607,6 +2189,11 @@ magpie.plugin("library", (ctx) => {
     b.dataset.server = name;
     b.onclick = (e) => {
       e.stopPropagation(); // the row opens the editor
+      // a server that asks for a sign-in is signed in to from its status
+      // (the owner: a click on "needs sign-in" signs in)
+      const s = lib.servers.find((x) => x.name === name);
+      if (mcpSigning?.name === name && mcpSigning.id) return editServer(s); // under way: its dialog has Cancel
+      if (canSignIn(s)) return signInFromRow(s);
       if (!toolList(name).length) return recheck(name);
       if (toolsOpen.has(name)) toolsOpen.delete(name); else toolsOpen.add(name);
       paintHealth(name);
@@ -1729,6 +2316,14 @@ magpie.plugin("library", (ctx) => {
   }
   function healthWords(h, s) {
     if (h.state === "ok") return [h.tools === 1 ? t("1 tool") : t("{n} tools", { n: h.tools }), t("It started and listed its tools")];
+    // an agent signed in to it on its own (Claude Code's /mcp, in WSL too)
+    // uses it, though magpie's check, without that sign-in, was asked for
+    // one: the row says who, not "needs sign-in" (CyberCaius on Discord)
+    if (h.state === "auth" && h.agentSignIn?.length) {
+      const names = h.agentSignIn.map(nameOf);
+      const text = t("signed in in {agent}", { agent: names[0] }) + (names.length > 1 ? " +" + (names.length - 1) : "");
+      return [text, t("{agents}: signed in to it on its own, and uses it. magpie's check doesn't have that sign-in, so it can't list the tools: open it to sign in once in magpie too", { agents: names.join(", ") })];
+    }
     if (h.state === "auth") {
       const why = h.oauth
         ? (s?.transport === "http" ? t("The server asks for a sign-in — open it to sign in once in magpie") : t("The server asks for a sign-in"))
@@ -1754,12 +2349,18 @@ magpie.plugin("library", (ctx) => {
       // a ${NAME} magpie's own environment hasn't; an agent started from a
       // shell that has it still gets it
       case "novar": return [t("{names} not set", { names: h.detail }), t("magpie can't check it: {names} isn't set where magpie runs. An agent started where it is set still gets it", { names: h.detail })];
+      // the agents given it run in a WSL distro that isn't running, which
+      // a check doesn't start: nothing is known of the server
+      case "wsldown": return [t("WSL {distro} not running", { distro: h.detail }), t("magpie can't check it: the agents given it run in WSL {distro}, which isn't running, and a check doesn't start it", { distro: h.detail })];
       default: return [t("couldn't check"), more(t("magpie couldn't check it"))];
     }
   }
   // paintHealth fills a row's status in place, by the button or the
   // server's name, so a check ending moves nothing on the page
   function paintHealth(x) {
+    // the hub's count of tools follows each check
+    const stats = page.querySelector(".lib-hubstats");
+    if (stats) stats.textContent = hubStats();
     const boxes = typeof x === "string" ? page.querySelectorAll(`.lib-health[data-server="${CSS.escape(x)}"]`) : [x];
     for (const b of boxes) {
       const e = health.get(b.dataset.server);
@@ -1775,25 +2376,40 @@ magpie.plugin("library", (ctx) => {
         continue;
       }
       b.hidden = false;
+      const sg = mcpSigning?.name === b.dataset.server ? mcpSigning : null;
+      if (sg && (sg.state === "starting" || sg.state === "waiting")) {
+        b.className = "lib-health auth";
+        b.replaceChildren(el("span", "", sg.state === "starting" ? t("Opening the sign-in…") : t("Finish signing in in your browser…")));
+        b.title = t("Click to see the sign-in");
+        continue;
+      }
       if (!e.h) {
         b.className = "lib-health checking";
         b.replaceChildren(el("span", "", t("checking…")));
         b.title = t("Connecting to it to list its tools");
         continue;
       }
-      const [text, tip] = healthWords(e.h, lib.servers.find((s) => s.name === b.dataset.server));
+      let [text, tip] = healthWords(e.h, lib.servers.find((s) => s.name === b.dataset.server));
+      // a command agents in WSL start is checked where they run: the tip
+      // says where, and a failure which place it was (loong on Discord)
+      const places = (e.h.checked || []).map((p) => (p ? "WSL " + p : "Windows"));
+      if (places.length && e.h.state === "ok") tip += "\n" + t("Checked in: {places}", { places: places.join(", ") });
+      else if (places.length) {
+        text += " · " + places[places.length - 1];
+        tip += "\n" + t("Failed in: {place}", { place: places[places.length - 1] });
+      }
       // a check magpie couldn't make for want of a variable only the
       // agent's own launch sets says nothing of the server, so it isn't
       // painted as broken (#2308, ASD-max: Codex's host-only codex_app,
       // whose pipe Codex itself hands it)
-      b.className = "lib-health " + (e.h.state === "ok" ? "ok" : e.h.state === "auth" ? "auth" : e.h.why === "novar" ? "unknown" : "err");
+      b.className = "lib-health " + (e.h.state === "ok" || e.h.agentSignIn?.length ? "ok" : e.h.state === "auth" ? "auth" : e.h.why === "novar" || e.h.why === "wsldown" ? "unknown" : "err");
       b.replaceChildren(el("span", "", text));
       if (toolList(b.dataset.server).length) {
         const open = toolsOpen.has(b.dataset.server);
         b.classList.add("has-list");
         b.setAttribute("aria-expanded", String(open));
         b.title = tip + "\n" + (open ? t("Click to hide them") : t("Click to see them"));
-      } else b.title = tip + "\n" + t("Click to check again");
+      } else b.title = tip + "\n" + (canSignIn(lib.servers.find((s) => s.name === b.dataset.server)) ? t("Click to sign in") : t("Click to check again"));
     }
     const name = typeof x === "string" ? x : x.dataset.server;
     for (const box of page.querySelectorAll(`.lib-tools[data-server="${CSS.escape(name)}"]`)) paintTools(box);
@@ -1802,6 +2418,58 @@ magpie.plugin("library", (ctx) => {
   // magpie's sign-in to a remote server (#615): signed in once here, and
   // every agent given the server reaches it through magpie, with it
   let mcpSigning = null; // { name, id, state, error } while one is under way
+  let signDraw = null; // the open dialog's sign-in box, drawn as a sign-in moves
+  function signMoved(name) {
+    if (signDraw && !signDraw.box.isConnected) signDraw = null;
+    signDraw?.draw();
+    if (name) paintHealth(name);
+  }
+  // one the row's status signs in to: a remote server that asked for a
+  // sign-in, unless an agent's own sign-in already uses it
+  function canSignIn(s) {
+    const h = s && health.get(s.name)?.h;
+    return !!h && s.transport === "http" && h.state === "auth" && !!h.oauth && !h.agentSignIn?.length;
+  }
+  // a sign-in from a row's status, as the dialog's Sign in starts one; the
+  // dialog opens when the user has something to do there: the browser
+  // didn't open (the link to open by hand) or the sign-in failed
+  async function signInFromRow(s) {
+    const name = s.name;
+    mcpSigning = { name, state: "starting" };
+    signMoved(name);
+    try {
+      const st = await api("library/mcp-signin", { name });
+      if (mcpSigning?.name !== name || mcpSigning.id) return; // canceled
+      if (web && st.url) api("open", { url: st.url }).catch(() => {});
+      mcpSigning = { ...st, name };
+      signMoved(name);
+      if (st.openError) editServer(s);
+      followSignIn(st.id, name);
+    } catch (e) {
+      if (mcpSigning?.name !== name) return;
+      mcpSigning = { name, state: "failed", error: t(e.message) };
+      signMoved(name);
+      editServer(s);
+    }
+  }
+  // followed with the dialog closed too, for the row to say it's signed in
+  async function followSignIn(id, name) {
+    while (mcpSigning?.id === id) {
+      await new Promise((r) => setTimeout(r, 800));
+      let st;
+      try { st = await api("library/mcp-signin/" + id); } catch { continue; }
+      if (mcpSigning?.id !== id) return;
+      if (st.state === "waiting") continue;
+      if (st.state === "done") {
+        mcpSigning = null;
+        await api("library").then(take, () => {});
+        status(t("Signed in to {name} — the agents given it use magpie's sign-in", { name }), "ok");
+        render();
+      } else mcpSigning = st.state === "canceled" ? null : { ...st, name };
+      signMoved(name);
+      return;
+    }
+  }
   // name is the server as saved ("" for one being added); ready saves what
   // the editor shows when it isn't that (a URL changed to the one that
   // signs in, as Exa's ?login) and gives the name it's saved as, for the
@@ -1821,6 +2489,7 @@ magpie.plugin("library", (ctx) => {
             if (sg.id) await api("library/mcp-signin/" + sg.id + "/cancel", {}).catch(() => {});
             mcpSigning = null;
             draw();
+            signMoved(name);
           }));
       } else if (cur.signedIn && !cur.dead) {
         line.append(tag(t("Signed in"), "lib-signed"), el("span", "note", t("The agents given it use magpie's sign-in")), el("span", "grow"), button(t("Sign out"), "", signOut));
@@ -1859,31 +2528,13 @@ magpie.plugin("library", (ctx) => {
         if (web && st.url) api("open", { url: st.url }).catch(() => {});
         mcpSigning = { ...st, name };
         draw();
-        follow(st.id);
+        followSignIn(st.id, name);
       } catch (e) {
         if (!mcpSigning) return; // canceled
         // magpie's words in the reader's language, where it has them
         mcpSigning = { name, state: "failed", error: t(e.message) };
         draw();
         ready?.failed?.(e.message);
-      }
-    }
-    // followed with the dialog closed too, for the row to say it's signed in
-    async function follow(id) {
-      while (mcpSigning?.id === id) {
-        await new Promise((r) => setTimeout(r, 800));
-        let st;
-        try { st = await api("library/mcp-signin/" + id); } catch { continue; }
-        if (mcpSigning?.id !== id) return;
-        if (st.state === "waiting") continue;
-        if (st.state === "done") {
-          mcpSigning = null;
-          await api("library").then(take, () => {});
-          status(t("Signed in to {name} — the agents given it use magpie's sign-in", { name }), "ok");
-          render();
-        } else mcpSigning = st.state === "canceled" ? null : { ...st, name };
-        draw();
-        return;
       }
     }
     async function signOut() {
@@ -1895,6 +2546,7 @@ magpie.plugin("library", (ctx) => {
       } catch (e) { status(e.message, "err", 6000); }
     }
     box.redraw = draw;
+    signDraw = { box, draw };
     draw();
     return box;
   }
@@ -1947,11 +2599,13 @@ magpie.plugin("library", (ctx) => {
     for (let i = 0; i < s.length; i++) {
       const c = s[i];
       if (q) {
-        if (c === q) q = "";
-        else if (c === "\\" && q === '"' && i + 1 < s.length) cur += s[++i];
+        // on Windows "" in quotes is one ", as quote() writes it
+        if (c === q && WIN_LINE && q === '"' && s[i + 1] === '"') cur += s[++i];
+        else if (c === q) q = "";
+        else if (c === "\\" && q === '"' && !WIN_LINE && i + 1 < s.length) cur += s[++i];
         else cur += c;
       } else if (c === "'" || c === '"') { q = c; any = true; }
-      else if (c === "\\" && i + 1 < s.length) { cur += s[++i]; any = true; }
+      else if (c === "\\" && !WIN_LINE && i + 1 < s.length) { cur += s[++i]; any = true; }
       else if (/\s/.test(c)) { if (cur || any) out.push(cur); cur = ""; any = false; }
       else cur += c;
     }
@@ -2042,6 +2696,7 @@ magpie.plugin("library", (ctx) => {
     const d = prefill || (s ? structuredClone(s) : { name: "", transport: "stdio", command: "", args: [], env: {}, url: "", headers: {}, agents: all.map((a) => a.id) });
     if (!d.env) d.env = {};
     if (!d.headers) d.headers = {};
+    d.local = !!d.local;
     const ed = el("div", "editor lib-editor");
     const head = el("div", "ehead");
     head.append(mark(s?.icon, d.transport === "stdio" ? GLYPH.cmd : GLYPH.web), el("b", "", s ? s.name : t("New MCP server")));
@@ -2102,6 +2757,22 @@ magpie.plugin("library", (ctx) => {
     ed.append(slot);
     const agentsBox = el("div");
     ed.append(...field(t("Agents"), agentsBox));
+    // kept to this computer: a sync neither carries it to the others nor
+    // takes it away here (huhuy72219405 on X)
+    const hereBox = el("div", "lib-localbox");
+    const drawHere = () => hereBox.replaceChildren(toggle(d.local, t("This computer only"), (on) => { d.local = on; drawHere(); }));
+    drawHere();
+    ed.append(...field(t("This computer only"), hereBox, t("Sync never carries it to your other computers, and a sync from them neither removes it nor puts theirs in its place")));
+    // with the hub on, a server can stay each agent's own entry (#4382,
+    // cuipengcx90): one that reads its project from the folder it starts
+    // in, or keeps a session's state. Shown only while the hub is on
+    d.hub = d.hub === "direct" ? "direct" : "";
+    if (lib.mcpHub) {
+      const hubBox = el("div", "lib-hubbox");
+      const drawHub = () => hubBox.replaceChildren(toggle(d.hub !== "direct", t("Through the MCP router"), (on) => { d.hub = on ? "" : "direct"; drawHub(); }));
+      drawHub();
+      ed.append(...field(t("Through the MCP router"), hubBox, t("Off gives each agent its own entry for it, as with the router off: for a server that reads its project from the folder it starts in, or keeps a session's state")));
+    }
     ed.append(err);
 
     function drawAgents() {
@@ -2132,6 +2803,19 @@ magpie.plugin("library", (ctx) => {
           g.append(...field(t("Sign-in"), signBox, t("For a server that asks you to sign in (OAuth): magpie signs in once, and every agent given it uses that sign-in")));
         } else appBox = null;
       }
+      // how long the agents that take one (Codex's startup_timeout_sec)
+      // wait for it to start, shown only when one of them is here (#3168)
+      const slow = [...new Set(all.filter((a) => a.startup).map((a) => a.name))];
+      if (slow.length) {
+        const wait = field2(d.startupTimeout || "", "30", (v) => {
+          wait.value = v.replace(/\D/g, "").slice(0, 5);
+          d.startupTimeout = Number(wait.value) || 0;
+        });
+        wait.inputMode = "numeric";
+        wait.classList.add("lib-startup");
+        wait.setAttribute("aria-label", t("Startup timeout"));
+        g.append(...field(t("Startup timeout"), wait, t("Seconds {agents} waits for it to start and list its tools. Empty leaves {agents}'s own 30; a value you wrote in its config.toml by hand is kept", { agents: slow.join(", ") })));
+      }
       slot.append(g);
       if (appBox) drawApp();
       // its own icon while it runs as it did; another way of running is another server
@@ -2150,7 +2834,7 @@ magpie.plugin("library", (ctx) => {
     // send saves the form; s is then the server as saved, for a save after
     // a sign-in's to be of it
     const send = async () => {
-      const body = { old: s ? s.name : "", server: { name: d.name, transport: d.transport, agents: d.agents } };
+      const body = { old: s ? s.name : "", server: { name: d.name, transport: d.transport, agents: d.agents, startupTimeout: d.startupTimeout || 0, local: !!d.local, hub: d.hub || "" } };
       if (d.transport === "stdio") Object.assign(body.server, { command: d.command, args: d.args, env: d.env });
       else Object.assign(body.server, { url: d.url, headers: d.headers, oauth: d.transport === "http" && d.oauth?.clientId ? d.oauth : null });
       take(await api("library/servers/save", body));
@@ -2669,6 +3353,10 @@ magpie.plugin("library", (ctx) => {
       }
       if (lib.skills.length > 1 && all.length) rh.append(pickButton("skills"), ...everyButtons("skills", all));
       if (byAgentRows("skills").length) rh.append(byAgentButton("skills"));
+      // every one kept in ~/.agents/skills, moved into the library at once
+      // (tnt1223); a row moves its own
+      const kept = lib.skills.filter((s) => s.shared);
+      if (kept.length > 1) rh.append(handOverButton(kept));
       if (lib.skills.length > 1) rh.append(removeEveryButton("skills"));
       if (lib.skills.some((s) => s.kind === "github" || s.kind === "git")) {
         const c = button(checking ? t("Checking…") : t("Check for updates"), "lib-updall", () => checkSkills());
@@ -2685,8 +3373,14 @@ magpie.plugin("library", (ctx) => {
         autoChecked = true;
         setTimeout(() => checkSkills(true), 0);
       }
+      // skills their source no longer has, from one place only: no group
+      // heading is drawn to hold its Clean up, so the bar does
+      if (skillGroups().length === 1) {
+        const gone = lib.skills.filter(isGone);
+        if (gone.length) rh.append(cleanUpButton(gone));
+      }
       // one changed here is updated from its own row, which asks first
-      const stale = lib.skills.filter((s) => s.check?.status === "update" && !s.edited);
+      const stale = lib.skills.filter((s) => s.check?.status === "update" && !s.edited && !isGone(s));
       if (stale.length) {
         const n = stale.length;
         const u = button(t("Update {n}", { n }), "action lib-updall", async (e, b) => {
@@ -2751,6 +3445,7 @@ magpie.plugin("library", (ctx) => {
     if (lib.skills.length || lib.projects.length) renderProjects(body, "skills");
     const skip = shownAgents().filter((a) => !a.skills);
     if (skip.length) body.append(el("p", "lib-aside", t("{agents} has no skills folder.", { agents: skip.map((a) => a.name).join(", ") })));
+    body.append(...asleepAsides());
     // Desktop reads its skills list again only when its window is reloaded (#638)
     if (shownAgents().some((a) => a.id === "claude-desktop" && a.skills)) {
       body.append(el("p", "lib-aside", t("Claude Desktop shows skill changes once its window is reloaded ({keys}). It gets a copy of each skill, and one you change in Desktop is left as it is.", { keys: /^Mac/.test(navigator.platform) ? "⌘R" : "Ctrl+R" })));
@@ -3118,7 +3813,7 @@ magpie.plugin("library", (ctx) => {
     head.append(chev, el("span", "name" + (p.mono && p.key ? " mono" : ""), p.label),
       el("span", "sub", filtering && hits.length !== n ? t("{n} of {total}", { n: hits.length, total: n }) : String(n)));
     // a dot when GitHub changed some of its skills
-    const stale = p.skills.filter((s) => s.check?.status === "update").length;
+    const stale = p.skills.filter((s) => s.check?.status === "update" && !isGone(s)).length;
     if (stale) {
       const dot = el("span", "lib-dot");
       dot.title = stale === 1 ? t("1 skill has an update") : t("{n} skills have updates", { n: stale });
@@ -3169,7 +3864,9 @@ magpie.plugin("library", (ctx) => {
     who.append(sub);
     const tags = el("div", "lib-tags");
     // one changed here is updated from its own row, which asks first (#1449)
-    const stale = g.skills.filter((s) => s.check?.status === "update" && !s.edited);
+    const stale = g.skills.filter((s) => s.check?.status === "update" && !s.edited && !isGone(s));
+    const gone = g.skills.filter((s) => isGone(skillNamed(s.name) || s));
+    if (gone.length) tags.append(cleanUpButton(gone.map((s) => skillNamed(s.name) || s)));
     if (stale.length) {
       const u = button(t("Update {n}", { n: stale.length }), "action lib-updall", async (e, b) => {
         b.classList.add("busy");
@@ -3981,13 +4678,14 @@ magpie.plugin("library", (ctx) => {
       const v = await api(names ? "library/skills/update-some" : "library/skills/update-all", names ? { names } : {});
       take(v);
       const res = v.result || {};
-      const up = res.updated?.length || 0, no = res.unupdated || [];
+      const up = res.updated?.length || 0, no = res.unupdated || [], gone = res.gone || [];
       // one changed here is left as it is (#1449): said apart from those
       // that couldn't be fetched
       const isEdited = (p) => lib.skills.some((s) => s.edited && "skill:" + s.name === p.what);
       const kept = no.filter(isEdited).map((p) => p.what.replace(/^skill:/, "")), failed = no.filter((p) => !isEdited(p));
-      if (no.length) {
+      if (no.length || gone.length) {
         const parts = [];
+        if (gone.length) parts.push(goneSaid(gone));
         if (failed.length) {
           const p = failed[0];
           parts.push(t("{name} wasn't updated: {error}", { name: p.what.replace(/^skill:/, ""), error: p.error }) + (failed.length > 1 ? " " + t("(and {n} more)", { n: failed.length - 1 }) : ""));
@@ -4343,20 +5041,23 @@ magpie.plugin("library", (ctx) => {
     try {
       take(await api("library/skills/check", {}));
       const got = lib.skills.filter((s) => s.check);
-      const n = got.filter((s) => s.check.status === "update").length;
+      const n = got.filter((s) => s.check.status === "update" && !isGone(s)).length;
       const unknown = got.filter((s) => s.check.status === "unknown");
-      let msg = n ? (n === 1 ? t("1 skill has an update") : t("{n} skills have updates", { n })) : t("Every skill is up to date");
+      const gone = lib.skills.filter(isGone).map((s) => s.name);
+      let msg = n ? (n === 1 ? t("1 skill has an update") : t("{n} skills have updates", { n })) : gone.length ? "" : t("Every skill is up to date");
+      if (gone.length) msg += (msg ? " · " : "") + goneSaid(gone);
       const more = lib.newSkills?.length || 0;
       if (more) msg += " · " + (more === 1 ? t("1 more skill in their repositories") : t("{n} more skills in their repositories", { n: more }));
       if (quiet) {
         const said = [];
         if (n) said.push(n === 1 ? t("1 skill has an update") : t("{n} skills have updates", { n }));
+        if (gone.length) said.push(goneSaid(gone));
         if (more) said.push(more === 1 ? t("1 more skill in their repositories") : t("{n} more skills in their repositories", { n: more }));
         if (said.length) status(said.join(" · "), "ok");
       } else if (unknown.length) {
         msg += " · " + t("{n} couldn't be checked: {error}", { n: unknown.length, error: checkError(unknown[0].check) });
         status(msg, "warn", 8000);
-      } else status(msg, "ok");
+      } else status(msg, gone.length ? "warn" : "ok", gone.length ? 10000 : undefined);
     } catch (e) {
       if (!quiet) status(e.message, "err", 6000);
     }
@@ -4501,7 +5202,11 @@ magpie.plugin("library", (ctx) => {
         const w = el("span", "who");
         w.append(el("span", "name", x.name), el("span", "sub", x.description || x.path || ""));
         r.append(cb, w);
-        if (x.have) r.append(tag(t("in the library"), ""));
+        // another skill from elsewhere has its name (mora1n on Discord):
+        // this one is in the library, or goes in beside it, by its own
+        if (x.have && x.as) r.append(tag(t("In the library as {name}", { name: x.as }), "lib-as", t("In the library as {name}", { name: x.as })));
+        else if (x.have) r.append(tag(t("in the library"), ""));
+        else if (x.as) r.append(tag(t("adds as {name}", { name: x.as }), "lib-as", t("The library has another skill called {name}, from elsewhere. This one goes in beside it as {as}.", { name: x.name, as: x.as })));
         list.append(r);
       }
     };
@@ -4528,11 +5233,18 @@ magpie.plugin("library", (ctx) => {
   }
 
   function skillRow(s, all) {
-    const row = el("div", "row lib-row click lib-skill" + (s.missing ? " missing" : "") + (s.source ? " src" : ""));
+    const row = el("div", "row lib-row click lib-skill" + (s.missing ? " missing" : "") + (s.source ? " src" : "") + (s.offHere ? " offhere" : ""));
     const who = el("div", "who");
     const nm = el("div", "name", s.name);
     const c = s.check;
-    if (c?.status === "update") {
+    const gone = isGone(s);
+    if (gone) {
+      // its source no longer has it: kept till the user takes it out
+      const repo = gitRepoOf(s) || skillRepo(s);
+      nm.append(tag(t("Removed upstream"), "warn lib-gone", repo
+        ? t("{repo} no longer has this skill: it was removed there. It stays here until you remove it.", { repo })
+        : t("Its source no longer has this skill: it was removed there. It stays here until you remove it.")));
+    } else if (c?.status === "update") {
       const b = tag(t("Update available"), "lib-new", t("Changed on GitHub since it was installed") + "\n" + checkLine(c));
       if (c.url) {
         b.classList.add("link");
@@ -4560,7 +5272,24 @@ magpie.plugin("library", (ctx) => {
       };
       nm.append(b);
     }
+    // turned off on this computer alone: no agent here gets it, the ticks
+    // stay what a sync carries to the others, and a sync doesn't turn it
+    // on here again. A line of its own: a narrow row's name has no room
+    let hereLine = null;
+    if (s.offHere) {
+      const b = tag(t("Off on this computer"), "link lib-offhere", t("No agent on this computer gets it. Your other computers keep their own choice, and a sync doesn't turn it on here. Click to turn it on here."));
+      b.setAttribute("role", "button");
+      b.tabIndex = 0;
+      b.onclick = (e) => { e.stopPropagation(); change("skills/here", { name: s.name, on: true }, t("{name} is on on this computer", { name: s.name })); };
+      b.onkeydown = (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault(); e.stopPropagation(); b.click();
+      };
+      hereLine = el("div", "lib-hereline");
+      hereLine.append(b);
+    }
     who.append(nm);
+    if (hereLine) who.append(hereLine);
     const sub = el("div", "sub", s.missing ? t("Its folder is gone from the library") : s.description || "");
     sub.title = s.description || "";
     who.append(sub);
@@ -4584,10 +5313,15 @@ magpie.plugin("library", (ctx) => {
       } else {
         src.append(el("span", "", t("linked from")), pathLink(s.source));
       }
+      // kept in ~/.agents/skills, which some agents read themselves: moved
+      // into the library, each of them can be turned off (tnt1223)
+      if (s.shared) src.append(handOverButton([s]));
       who.append(src);
     }
     const acts = el("div", "lib-rowacts");
-    if (s.kind === "github" || s.kind === "git" || s.origin) {
+    // one its source no longer has has nothing to update from: Update all,
+    // or a check, finds it there again if it comes back
+    if (!gone && (s.kind === "github" || s.kind === "git" || s.origin)) {
       const u = button("", "lib-icon", async (e, b) => {
         if (s.edited) return confirmUpdateEdited(s);
         b.classList.add("busy");
@@ -4603,6 +5337,12 @@ magpie.plugin("library", (ctx) => {
       if (s.edited) u.title += "\n" + t("Changed here: asks before it replaces your changes");
       acts.append(u);
     }
+    const here = button("", "lib-icon lib-here" + (s.offHere ? " on" : ""), () => change("skills/here", { name: s.name, on: !!s.offHere },
+      s.offHere ? t("{name} is on on this computer", { name: s.name }) : t("{name} is off on this computer", { name: s.name })));
+    here.append(svg(GLYPH.power, 13, 1.5));
+    here.title = s.offHere ? t("Turn on on this computer") : t("Turn off on this computer only: your other computers keep it");
+    here.setAttribute("aria-pressed", s.offHere ? "true" : "false");
+    acts.append(here);
     const rm = button("", "lib-icon danger", () => confirmRemoveSkill(s));
     rm.append(svg(GLYPH.trash, 13, 1.4));
     rm.title = t("Remove");
@@ -4612,6 +5352,70 @@ magpie.plugin("library", (ctx) => {
     row.onclick = () => viewSkill(s);
     row.title = t("Read {name}'s SKILL.md", { name: s.name });
     return row;
+  }
+
+  // A skill its source no longer has (スライム on Discord): an update or a
+  // check read the repository and found it removed there. Nothing takes
+  // it out by itself; Clean up takes out every such skill of a group at
+  // once, asking first, and a row's Remove takes out one.
+  const isGone = (s) => !!s.gone || s.check?.status === "gone";
+  function goneSaid(names) {
+    return names.length === 1 ? t("{name} was removed from its source", { name: names[0] })
+      : t("{n} skills were removed from their sources: {names}", { n: names.length, names: names.join(", ") });
+  }
+  function cleanUpButton(skills) {
+    const b = button(t("Clean up {n}", { n: skills.length }), "action lib-updall lib-cleanup", () => confirmRemoveGone(skills));
+    b.title = skills.length === 1 ? t("Remove {name}: its source no longer has it", { name: skills[0].name })
+      : t("Remove the {n} skills their source no longer has", { n: skills.length });
+    return b;
+  }
+  function confirmRemoveGone(skills) {
+    const names = skills.map((s) => s.name), n = names.length;
+    const repos = [...new Set(skills.map((s) => gitRepoOf(s) || skillRepo(s)).filter(Boolean))];
+    const ed = el("div", "editor lib-editor lib-remove-gone");
+    const head = el("div", "ehead");
+    head.append(glyph(GLYPH.trash), el("b", "", n === 1 ? t("Remove {name}?", { name: names[0] }) : t("Remove {n} skills removed upstream?", { n })));
+    ed.append(head);
+    ed.append(el("p", "lib-confirm", repos.length === 1
+      ? (n === 1 ? t("{repo} no longer has this skill: it was removed there.", { repo: repos[0] }) : t("{repo} no longer has these skills: they were removed there.", { repo: repos[0] }))
+      : t("Their sources no longer have these skills: they were removed there.")));
+    // each by name, and one changed here says so: removing it takes the change out too
+    const list = el("ul", "lib-gonelist");
+    for (const s of skills) {
+      const li = el("li", "", s.name);
+      if (s.edited) li.append(tag(t("Changed here"), "warn lib-edited", t("You changed it here since it was fetched.")));
+      list.append(li);
+    }
+    ed.append(list);
+    ed.append(el("p", "lib-confirm", takenFrom(skills) + " " + t("Their folders are moved to magpie's backups (Backups, at the top of the Library), not deleted.")));
+    const bar = el("div", "bar");
+    const go = button(n === 1 ? t("Remove") : t("Remove {n}", { n }), "primary danger-fill", async () => {
+      go.disabled = true;
+      if (await removeGone(names)) closeLibModal(true);
+      else go.disabled = false;
+    });
+    bar.append(el("span", "grow"), button(t("Cancel"), "", closeLibModal), go);
+    ed.append(bar);
+    modal = { save: () => go.click() };
+    openLib(ed);
+  }
+  // only those still marked removed from their source are taken out; one
+  // found there again meanwhile stays, and is said
+  async function removeGone(names) {
+    try {
+      const v = await api("library/skills/remove-gone", { names });
+      take(v);
+      const res = v.result || {}, no = res.unremoved || [];
+      const out = names.filter((x) => !no.some((p) => p.what === "skill:" + x));
+      const done = out.length === 1 ? t("{name} removed", { name: out[0] }) : t("{n} skills removed", { n: out.length });
+      if (no.length) status((out.length ? done + " · " : "") + t("{name} wasn't removed: {error}", { name: no[0].what.replace(/^skill:/, ""), error: no[0].error }) + (no.length > 1 ? " " + t("(and {n} more)", { n: no.length - 1 }) : ""), "warn", 10000);
+      else report(res, done);
+      render();
+      return true;
+    } catch (e) {
+      status(e.message, "err", 6000);
+      return false;
+    }
   }
 
   // An update of a skill changed here replaces the change (#1449): asked in
@@ -4635,6 +5439,83 @@ magpie.plugin("library", (ctx) => {
     ed.append(bar);
     modal = { save: () => go.click() };
     openLib(ed);
+  }
+
+  // Skills kept in ~/.agents/skills (tnt1223 on Discord): agents that read
+  // that folder themselves have each whatever is ticked, so none can be
+  // turned off for one of them. Manage in magpie moves them into the
+  // library's own folder, asking first and saying where they go; the
+  // agents that read them there are ticked, and keep them till unticked.
+  function handOverButton(skills) {
+    const one = skills.length === 1;
+    const b = button(one ? t("Manage in magpie") : t("Manage {n} in magpie", { n: skills.length }), one ? "lib-handover" : "action lib-updall lib-handover", (e) => {
+      e.stopPropagation();
+      confirmHandOver(skills);
+    });
+    b.title = one ? t("Move it out of ~/.agents/skills into magpie's library, so you choose which agents get it")
+      : t("Move these {n} from ~/.agents/skills into magpie's library, so you choose which agents get them", { n: skills.length });
+    return b;
+  }
+
+  function confirmHandOver(skills) {
+    const one = skills.length === 1, s = skills[0];
+    const ed = el("div", "editor lib-editor lib-handover-ask");
+    const head = el("div", "ehead");
+    head.append(glyph(GLYPH.skill), el("b", "", one ? t("Manage {name} in magpie?", { name: s.name }) : t("Manage {n} skills in magpie?", { n: skills.length })));
+    ed.append(head);
+    const readers = [...new Set(skills.flatMap((x) => x.always || []))].map(nameOf).filter(Boolean).join(", ");
+    // the entry only links to a folder elsewhere: only the link goes
+    ed.append(el("p", "lib-confirm", one
+      ? (s.sharedElsewhere ? t("Its entry in ~/.agents/skills, a link to {path}, is taken away. The folder stays where it is, and the library links to it.", { path: tilde(s.source) })
+        : t("Its folder moves from {from} into magpie's library folder, {to}.", { from: tilde(s.shared), to: tilde(libSkillPath(s.name)) }))
+      : t("Their folders move from ~/.agents/skills into magpie's library folder, {to}. One that only links there to a folder elsewhere keeps that folder; only the link goes.", { to: tilde(libSkillPath("")) })));
+    if (readers) ed.append(el("p", "lib-confirm", one
+      ? t("{agents} read ~/.agents/skills themselves. They keep it, ticked here, and you can turn it off for any of them, or on this computer only.", { agents: readers })
+      : t("{agents} read ~/.agents/skills themselves. They keep them, ticked here, and you can turn each off for any of them, or on this computer only.", { agents: readers })));
+    ed.append(el("p", "lib-confirm lib-muted", one
+      ? t("To put it back: {cmd}", { cmd: "magpie library skill hand-back " + s.name })
+      : t("To put one back: {cmd}", { cmd: "magpie library skill hand-back <name>" })));
+    const bar = el("div", "bar");
+    const go = button(t("Move into the library"), "primary", async () => {
+      go.disabled = true;
+      if (await handOverSkills(skills.map((x) => x.name))) closeLibModal(true);
+      else go.disabled = false;
+    });
+    bar.append(el("span", "grow"), button(t("Cancel"), "", closeLibModal), go);
+    ed.append(bar);
+    modal = { save: () => go.click() };
+    openLib(ed);
+  }
+
+  // where the library keeps a skill's folder: skills/<name> in its own
+  function libSkillPath(name) {
+    const dir = lib.dir || "", sep = dir.includes("\\") ? "\\" : "/";
+    return dir + sep + "skills" + (name ? sep + name : "");
+  }
+
+  async function handOverSkills(names) {
+    if (changing) return false;
+    changing = true;
+    page.setAttribute("aria-busy", "true");
+    status(t("Saving…"), "", 120000);
+    try {
+      const v = await api("library/skills/hand-over", { names });
+      take(v);
+      status("");
+      const res = v.result || {}, no = res.unmoved || [];
+      const moved = names.filter((x) => !no.some((p) => p.what === "skill:" + x));
+      const done = moved.length === 1 ? t("{name} is in magpie's library now", { name: moved[0] }) : t("{n} skills are in magpie's library now", { n: moved.length });
+      if (no.length) status((moved.length ? done + " · " : "") + t("{name} wasn't moved: {error}", { name: no[0].what.replace(/^skill:/, ""), error: no[0].error }) + (no.length > 1 ? " " + t("(and {n} more)", { n: no.length - 1 }) : ""), "warn", 10000);
+      else report(res, done);
+      return true;
+    } catch (e) {
+      status(e.message, "err", 6000);
+      return false;
+    } finally {
+      changing = false;
+      page.removeAttribute("aria-busy");
+      render();
+    }
   }
 
   function confirmRemoveSkill(s) {
@@ -4854,9 +5735,11 @@ magpie.plugin("library", (ctx) => {
   // What the market offers: popular and featured ones until the reader
   // searches. Kept across renders; asked for the first time a tab shows it.
   const market = {
-    mcp: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, custom: null },
-    skills: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0 },
+    mcp: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, custom: null, shown: 0 },
+    skills: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, shown: 0 },
   };
+  // how many cards a list shows at first, and each Show more adds
+  const MARKET_PAGE = 60;
   const asked = new Set(); // skills whose description has been asked for
 
   async function fetchMarket(kind) {
@@ -4868,6 +5751,7 @@ magpie.plugin("library", (ctx) => {
       const r = await api("library/market/" + (kind === "mcp" ? "servers" : "skills") + "?q=" + encodeURIComponent(m.q.trim()));
       if (seq !== m.seq) return;
       m.items = r.items || [];
+      m.shown = MARKET_PAGE;
       m.error = r.error || "";
       // the source that didn't answer when the rest did (#1589)
       m.failed = r.failed ? { source: r.failed, cause: r.cause || "" } : null;
@@ -4980,7 +5864,25 @@ magpie.plugin("library", (ctx) => {
       grid.append(el("div", "mk-msg", q ? t("Nothing matches “{q}”.", { q }) : t("Nothing to show.")));
       return;
     }
-    for (const x of m.items) grid.append(kind === "mcp" ? serverCard(x) : skillCard(x));
+    for (const x of m.items.slice(0, m.shown)) grid.append(kind === "mcp" ? serverCard(x) : skillCard(x));
+    moreCards(kind, grid);
+  }
+
+  // The rest of a long list, a page at a time: the cards added under the
+  // ones shown, which stay where they are.
+  function moreCards(kind, grid) {
+    const m = market[kind];
+    const left = m.items.length - m.shown;
+    if (left <= 0) return;
+    const more = button(t("Show more ({n} left)", { n: left.toLocaleString(intlLang()) }), "mk-more", () => {
+      const from = m.shown;
+      m.shown += MARKET_PAGE;
+      more.before(...m.items.slice(from, m.shown).map((x) => kind === "mcp" ? serverCard(x) : skillCard(x)));
+      more.remove();
+      moreCards(kind, grid);
+      if (kind === "skills") describeSkills();
+    });
+    grid.append(more);
   }
 
   // An address searched for that nothing listed is at: say so, over the
@@ -5062,6 +5964,7 @@ magpie.plugin("library", (ctx) => {
     const meta = el("div", "mk-meta");
     if (x.publisher) meta.append(el("span", "mk-pub", x.publisher));
     meta.append(el("span", "mk-badge", runsLabel(x)));
+    if (x.unready) { const u = el("span", "mk-badge mk-unready", t("Not set up yet")); u.title = t(x.unready); meta.append(u); }
     if (needsKey(x)) { const k = el("span", "mk-badge mk-needs"); k.append(svg(GLYPH.key, 11, 1.5)); k.title = t("Needs {what} to add", { what: x.inputs.filter((i) => i.required).map((i) => t(i.label)).join(", ") }); meta.append(k); }
     who.append(meta);
     top.append(logo(x.icon, x.title || x.name), who);
@@ -5103,7 +6006,17 @@ magpie.plugin("library", (ctx) => {
     ed.append(head);
     if (x.description) ed.append(el("p", "mk-about", about(x)));
     if (x.signIn) ed.append(el("p", "mk-hint", t("Each agent asks you to sign in, in the browser, the first time it uses it.")));
-    if (x.optIn) ed.append(el("p", "mk-hint", t("Pick the agents that may generate images: each image costs what the model set in Settings → Images charges.")));
+    if (x.name === "magpie-browser") {
+      ed.append(el("p", "mk-hint", t("Pick the agents that may use your browser: they act in your tabs, signed in as you are.")));
+      ed.append(browserSetup());
+    } else if (x.name === "magpie-web-search") {
+      ed.append(el("p", "mk-hint", t("Pick the agents that may search with it: each search goes where Settings → Models → Web search sends it, and costs what that charges.")));
+    } else if (x.name === "magpie-vision") {
+      ed.append(el("p", "mk-hint", t("Pick the agents that may read images with it: each image goes to the Image recognition model set in Settings → Models → Images, and costs what that model charges.")));
+    } else if (x.optIn) ed.append(el("p", "mk-hint", t("Pick the agents that may generate images: each image costs what the model set in Settings → Images charges.")));
+    // one of magpie's own that can't answer yet says why, and is added all
+    // the same: it answers once that is set up, its tools saying how
+    if (x.unready) ed.append(el("p", "mk-hint mk-unready", t(x.unready)));
     const firsts = [];
     for (const i of x.inputs || []) {
       const f = field2("", i.placeholder || (i.where === "env" ? i.key : ""), (v) => { values[i.key] = v.trim(); });
@@ -5142,6 +6055,65 @@ magpie.plugin("library", (ctx) => {
     if (firsts.length) requestAnimationFrame(() => firsts[0].focus());
   }
 
+  // Magpie Browser's extension: whether it is connected, and setting it up
+  // in the user's own browser, where their sign-ins are
+  function browserSetup() {
+    const box = el("div", "mk-browser");
+    const state = el("div", "mk-browser-state");
+    const steps = el("ol", "mk-browser-steps");
+    const go = button(t("Set up the extension…"), "action", async () => {
+      go.disabled = true;
+      try {
+        draw(await api("library/browser/setup", {}));
+        steps.hidden = false;
+      } catch (e) { status(e.message, "err"); }
+      go.disabled = false;
+    });
+    const draw = (b) => {
+      state.replaceChildren();
+      const dot = el("span", "mk-browser-dot" + (b.connected ? " on" : ""));
+      state.append(dot, el("span", "", b.connected
+        ? t("Connected to your browser") + (b.extension ? " · " + b.extension : "")
+        : b.written ? t("Not connected: load the folder below in your browser, and keep that browser open") : t("Not set up: set up the extension in Chrome, Edge, Arc, Brave or another Chromium browser")));
+      go.textContent = b.written ? t("Show the extension folder") : t("Set up the extension…");
+      steps.replaceChildren(
+        el("li", "", t("Open chrome://extensions (edge://extensions in Edge) in the browser you use every day.")),
+        el("li", "", t("Turn on Developer mode.")),
+        el("li", "", b.drag ? t("Drag the folder below onto that page.")
+          : t("Drag the folder from the window that opened onto that page, or click Load unpacked and choose {dir}.", { dir: tilde(b.dir) })),
+      );
+      folder.title = t("Drag onto chrome://extensions");
+      folder.lastChild.textContent = tilde(b.dir);
+      folder.dataset.drag = b.drag ? "1" : "";
+      if (b.connected) steps.hidden = true;
+      else if (b.written) steps.hidden = false;
+      folder.hidden = steps.hidden || !b.drag;
+    };
+    // the folder itself, dragged out of the window as Finder drags it: the
+    // mouse that goes down on it and moves hands it to the system's drag
+    const folder = el("div", "mk-browser-folder");
+    folder.append(svg(GLYPH.folder, 22, 1.2), el("span", "mk-browser-folder-name", "Magpie Browser Extension"), el("span", "mk-browser-folder-path mono"));
+    let from = null;
+    folder.addEventListener("pointerdown", (e) => { if (e.button === 0) { from = [e.clientX, e.clientY]; e.preventDefault(); } });
+    folder.addEventListener("pointermove", (e) => {
+      if (!from || Math.hypot(e.clientX - from[0], e.clientY - from[1]) < 4) return;
+      from = null;
+      api("library/browser/drag", {}).catch((err) => status(err.message, "err"));
+    });
+    for (const ev of ["pointerup", "pointercancel"]) folder.addEventListener(ev, () => { from = null; });
+    folder.addEventListener("dragstart", (e) => e.preventDefault());
+    steps.hidden = true;
+    folder.hidden = true;
+    box.append(state, steps, folder, go);
+    const poll = async () => {
+      if (!box.isConnected) return;
+      try { draw(await api("library/browser")); } catch {}
+      setTimeout(poll, 3000);
+    };
+    requestAnimationFrame(poll);
+    return box;
+  }
+
   function extLink(href, text) {
     const a = el("a", "mk-ext");
     a.href = href;
@@ -5167,7 +6139,8 @@ magpie.plugin("library", (ctx) => {
     d.title = x.description || "";
     const foot = el("div", "mk-foot");
     // magpie's own skill has no count until skills.sh lists it
-    if (!x.featured || x.installs) {
+    // a trending skill's recent count isn't all its installs: none is told
+    if (x.installs) {
       const n = el("span", "mk-installs");
       n.append(svg(GLYPH.down, 11, 1.5), el("span", "", compact(x.installs)));
       n.title = t("{n} installs", { n: x.installs.toLocaleString(intlLang()) });
@@ -5197,7 +6170,7 @@ magpie.plugin("library", (ctx) => {
     who.append(el("div", "mk-name big", x.name));
     const meta = el("div", "mk-meta");
     meta.append(el("span", "mk-pub", x.source));
-    if (!x.featured || x.installs) meta.append(el("span", "mk-badge", t("{n} installs", { n: compact(x.installs) })));
+    if (x.installs) meta.append(el("span", "mk-badge", t("{n} installs", { n: compact(x.installs) })));
     if (x.official) meta.append(el("span", "mk-badge", t("Official")));
     who.append(meta);
     head.append(logo(x.icon, x.source), who);
@@ -5270,10 +6243,11 @@ magpie.plugin("library", (ctx) => {
       document.addEventListener("visibilitychange", () => { if (!document.hidden) quietLoad(); });
       window.addEventListener("focus", quietLoad);
     },
-    open: () => (loading = load()),
+    open: () => (loading = load("open")),
     relang: () => load(),
     // one of the market's servers up close, from another page (Settings ›
-    // Images' Magpie Image, #2091): its sheet over the MCP servers tab, to
+    // Images' Magpie Image, #2091, Magpie Image Recognition, and Settings ›
+    // Models' Magpie Web Search): its sheet over the MCP servers tab, to
     // pick the agents that get it; one already in the library is on that
     // tab's list, which opens with nothing over it
     server: async (name) => {

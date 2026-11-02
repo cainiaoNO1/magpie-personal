@@ -122,6 +122,49 @@ func TestLeastUsedAndOrdered(t *testing.T) {
 	}
 }
 
+// A seat that tells no share of its allowance — a pay-as-you-go key, a
+// prepaid wallet, an account whose use wasn't read — has Used read 0, and
+// by that 0 alone it went first, burning paid balance while subscription
+// quota sat idle (#4535). It goes after those whose share was told and has
+// room, and before those running low or spent, as Smart and Pace keep the
+// unknown; a learning account still goes first, once. Of the shareless, a
+// wallet goes by what it has left and a key by what magpie sent it lately.
+func TestLeastUsedSeatsWithNoShare(t *testing.T) {
+	now := time.Now()
+	sub := func(key string, used float64) Seat {
+		return Seat{Key: key, Known: true, Used: used, Soon: []time.Time{now.Add(48 * time.Hour)}}
+	}
+	key := Seat{Key: "key"} // a pay-as-you-go key: no window, so Used reads 0
+	s := []Seat{key, sub("sub", 5)}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"sub", "key"}) {
+		t.Fatalf("a key with no share went first: %v", got)
+	}
+	// a wallet has no share either, but what it has left still orders it
+	// behind a told share, and before a key that told nothing at all
+	wallet := Seat{Key: "wallet", Known: true, Left: 50, LeftIn: "prov\x00usd"}
+	s = []Seat{key, wallet, sub("sub", 5)}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"sub", "wallet", "key"}) {
+		t.Fatalf("wallet: %v, want [sub wallet key]", got)
+	}
+	// one running low or spent is kept for when the others can't, past a
+	// key: its share is nearly gone, but it isn't gone
+	s = []Seat{key, sub("fine", 5), sub("low", 92), sub("spent", 99)}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"fine", "key", "low", "spent"}) {
+		t.Fatalf("low and spent: %v, want [fine key low spent]", got)
+	}
+	// one learning goes first, once, as in Smart and Pace
+	learns := Seat{Key: "learns", Learns: true}
+	s = []Seat{key, learns, sub("sub", 5)}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"learns", "sub", "key"}) {
+		t.Fatalf("learns: %v, want [learns sub key]", got)
+	}
+	// those with a told share go by it as before
+	s = []Seat{sub("much", 80), sub("little", 10)}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"little", "much"}) {
+		t.Fatalf("told shares: %v, want [little much]", got)
+	}
+}
+
 // Weekly pace: the most of a week left per hour first; one running low
 // after, whatever its pace.
 func TestPace(t *testing.T) {
@@ -147,5 +190,24 @@ func TestWeighted(t *testing.T) {
 	}
 	if firsts["a"] != 4 || firsts["b"] != 2 || firsts["c"] != 2 {
 		t.Fatalf("by weight: %v, want a 4, b 2, c 2", firsts)
+	}
+}
+
+// Of those all but used up, one that goes on on its credits (a Codex
+// account holding them) goes before those with nothing left, though it
+// has used more, in Smart, Weekly pace and Least used alike; still after
+// every one with room or running low, its allowance spent before its
+// credits are.
+func TestCreditsFirstOfTheSpent(t *testing.T) {
+	s := []Seat{
+		{Key: "spent", Used: 98},
+		{Key: "credits", Used: 100, Credits: true},
+		{Key: "low", Used: 92, Credits: true},
+		{Key: "fine", Used: 20},
+	}
+	for name, st := range map[string]Strategy{"smart": Smart, "pace": Pace, "least used": LeastUsed} {
+		if got := keys(s, Apply(st, "p", s)); !slices.Equal(got, []string{"fine", "low", "credits", "spent"}) {
+			t.Errorf("%s: %v", name, got)
+		}
 	}
 }

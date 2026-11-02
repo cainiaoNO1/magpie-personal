@@ -60,6 +60,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const width of [1000, 380]) {
         const page = await (await browser.newContext({ viewport: { width, height: 640 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(10000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message + " " + e.stack));
         await page.route("**/*", serve(lang));
@@ -122,6 +123,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await rows.count(), 100);
 
         // the folder's box and the bar pick every session, drawn or not
+        await view.locator(".sm-select").click();
         await view.locator(".sm-folder-check").first().check();
         assert.equal(await view.locator(".sm-bar .sm-count").textContent(), w.picked);
         await view.locator(".sm-bar .sm-check").check();

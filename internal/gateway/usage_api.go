@@ -22,12 +22,12 @@ import (
 // accounts is someone else's to use: it is told its own calls alone, from
 // /v1/magpie/usage/requests, and not the summary of everyone's.
 
-const usageRefused = "magpie's usage is told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)"
+const usageRefused = "magpie's usage is told to another machine only when magpie is shared on the local network (Settings → Network and sharing → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)"
 
 // heldKey: the request's gateway key is held to a budget, models or
 // accounts, and so sees only its own usage.
 func heldKey(who access.Identity) bool {
-	return who.KeyID != "" && (len(who.Limits()) > 0 || len(who.Models) > 0 || len(who.Accounts) > 0)
+	return who.KeyID != "" && (who.Limited() || len(who.Models) > 0 || len(who.Accounts) > 0)
 }
 
 // heldRefused is what a held key is told where this magpie's own accounts

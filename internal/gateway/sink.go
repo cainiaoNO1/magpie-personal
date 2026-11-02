@@ -13,13 +13,15 @@ package gateway
 // that one's rest ends.
 //
 // What sank is remembered in memory, until magpie restarts — or until it
-// sinks again, which sends it to the back once more. Nothing else changes:
+// sinks again, which sends it to the back once more, or its rest is
+// lifted by hand (Unrest), which puts it back in its place. Nothing else changes:
 // a resting one still waits behind every one ready (restLast), an account
 // out of quota or credit rests as before and doesn't sink, and with Sink
 // off the order is the routing's alone.
 
 import (
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,10 +47,36 @@ func sink(key string, now time.Time) {
 	sunk.Unlock()
 }
 
-// sunkAt is when a candidate sank, if it did.
+// unsink takes what rests by key off the back of the orders that sink,
+// its rest lifted by hand (Unrest): the next request asks it in its
+// place, as the lift says.
+func unsink(key string) {
+	sunk.Lock()
+	delete(sunk.m, key)
+	sunk.Unlock()
+}
+
+// unsinkAll is unsink for key and each of its models (restID, key/model):
+// UnrestAll's lift of them all.
+func unsinkAll(key string) {
+	sunk.Lock()
+	for k := range sunk.m {
+		if k == key || strings.HasPrefix(k, key+"/") {
+			delete(sunk.m, k)
+		}
+	}
+	sunk.Unlock()
+}
+
+// sunkAt is when a candidate sank, if it did: its model alone, as
+// another magpie's model rate limited there sinks (remoteModelRest,
+// #2167), or its whole key or account.
 func sunkAt(c candidate) (sinking, bool) {
 	sunk.Lock()
 	defer sunk.Unlock()
+	if s, ok := sunk.m[c.restID()]; ok {
+		return s, true
+	}
 	s, ok := sunk.m[c.restKey()]
 	return s, ok
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // Target is where one agent keeps each of the three: an empty path is
@@ -56,6 +57,25 @@ type Target struct {
 	// after the user's, but never moves the user's own lines out of it
 	// (ImportInstructions), as the agent reads who its owner is there.
 	Profile bool
+	// Unreached, for an agent in a WSL distro, is why its folder there
+	// can't be opened (agent.WSLOpen): a link the distro couldn't
+	// resolve. Nothing is written to it; each sync says so.
+	Unreached error
+}
+
+// unreached says whether t's folder can't be opened, and, once in res,
+// why.
+func (r *Result) unreached(t *Target) bool {
+	if t.Unreached == nil {
+		return false
+	}
+	for _, p := range r.Problems {
+		if p.Agent == t.Agent.ID && p.What == "wsl" {
+			return true
+		}
+	}
+	r.fail(t.Agent.ID, "wsl", t.Unreached)
+	return true
 }
 
 func home() string { h, _ := os.UserHomeDir(); return h }
@@ -87,6 +107,12 @@ func codebuddyMCP(dir string) string {
 	if base == "" {
 		base = home()
 	}
+	return codebuddyMCPIn(dir, base)
+}
+
+// codebuddyMCPIn is codebuddyMCP with base as where .codebuddy.json is
+// beside: a WSL distro's home for the CodeBuddy Code there.
+func codebuddyMCPIn(dir, base string) string {
 	all := []string{filepath.Join(dir, ".mcp.json"), filepath.Join(dir, "mcp.json"), filepath.Join(base, ".codebuddy.json")}
 	for _, p := range all {
 		if _, err := os.Stat(p); err == nil {
@@ -175,7 +201,7 @@ func targetOf(a *agent.Agent) *Target {
 		// Pi 0.99 reads MCP servers itself, from its mcp.json; before it,
 		// and while an MCP extension replaces its own (pi-mcp-adapter,
 		// pi-mcp-extension), each extension reads its own file (pimcp.go)
-		t.MCP, t.MCPVia = piMCP(h, d, piVersion(a))
+		t.MCP, t.MCPVia = piMCP(h, d, piVersion(a), piGlobalRoots())
 		t.Skills = filepath.Join(d, "skills")
 	case "dsh":
 		// DeepSeek Harness reads $DSH_HOME/AGENTS.md and $DSH_HOME/skills;
@@ -251,7 +277,11 @@ func targetOf(a *agent.Agent) *Target {
 		// its own would hide Claude Code's from it — and ~/.config/agents/
 		// skills, ~/.agents/skills (kimi_cli/skill), wherever KIMI_SHARE_DIR
 		// is; before its 1.x brand/generic split, only the first of all five.
-		// The new Kimi Code (2.x) reads its own and ~/.agents/skills only.
+		// The new Kimi Code (2.x) reads its own folder of skills
+		// ($KIMI_CODE_HOME/skills, else ~/.kimi-code/skills, docs/
+		// customization/skills.md "Skill Locations") and ~/.agents/skills:
+		// its skills go into its own, for one in the shared folder reaches
+		// every reader of it whatever the library ticks (#4379).
 		//
 		// Its MCP servers are the mcp.json in its folder, which the old
 		// kimi-cli (fastmcp's MCPConfig) and the new Kimi Code read alike.
@@ -262,7 +292,7 @@ func targetOf(a *agent.Agent) *Target {
 			// user-wide one (loadAgentsMdForRoots in packages/agent-core-v2/
 			// src/agent/profile/context.ts, MoonshotAI/kimi-code afd95f64)
 			t.Instructions = filepath.Join(a.Dir, "AGENTS.md")
-			t.Skills = sharedSkillsDir()
+			t.Skills = filepath.Join(a.Dir, "skills")
 		} else if d := filepath.Join(h, ".config", "agents", "skills"); isDir(d) {
 			t.Skills = d
 		} else {
@@ -459,6 +489,19 @@ func targetOf(a *agent.Agent) *Target {
 		// ProjectSettingsContent.context_servers, zed-industries/zed
 		// 2c99f547; lc on Discord)
 		t.MCP = &mcpFile{Path: a.Path, Format: fmtZed}
+	case "kiro-cli":
+		// Kiro CLI — and the Kiro IDE, which reads the same files — finds
+		// its global skills in ~/.kiro/skills, its user-wide MCP servers
+		// in ~/.kiro/settings/mcp.json, mcpServers of command/args/env or
+		// url/headers that hot-reloads, and ~/.kiro/steering/AGENTS.md of
+		// its global steering, always included (kiro.dev/docs/skills,
+		// /docs/mcp/configuration, /docs/steering; #4769). The app is
+		// found by the kiro-cli program alone (apps): ~/.kiro is Kiro
+		// Crew's and the Kiro IDE's too
+		d := filepath.Join(h, ".kiro")
+		t.Instructions = filepath.Join(d, "steering", "AGENTS.md")
+		t.MCP = &mcpFile{Path: filepath.Join(d, "settings", "mcp.json"), Format: fmtKiro}
+		t.Skills = filepath.Join(d, "skills")
 	case "claude-desktop":
 		// Claude Desktop reads only commands from its file: a remote server
 		// is added in its own Connectors settings. In its 3p mode (magpie's
@@ -592,37 +635,127 @@ func wslTargetOf(a *agent.Agent) *Target {
 		return nil
 	}
 	t := &Target{Agent: a, Copy: true}
+	// a folder there that is a link is opened where it leads (#4502)
+	j := func(elem ...string) string { return wslOpen(t, filepath.Join(elem...)) }
 	id, _, _ := strings.Cut(a.ID, "@")
 	switch id {
 	case "claude":
-		d := filepath.Join(h, ".claude")
+		d := j(h, ".claude")
 		t.Instructions = filepath.Join(d, "CLAUDE.md")
-		t.MCP = &mcpFile{Path: filepath.Join(h, ".claude.json"), Format: fmtClaude, WSL: true, Distro: a.WSL, Home: linuxHome(h)}
+		t.MCP = &mcpFile{Path: j(h, ".claude.json"), Format: fmtClaude}
 		t.Skills = filepath.Join(d, "skills")
 		t.Settings = filepath.Join(d, "settings.json")
 	case "codex":
-		d := filepath.Join(h, ".codex")
+		d := j(h, ".codex")
 		t.Instructions = filepath.Join(d, "AGENTS.md")
 		t.Override = filepath.Join(d, "AGENTS.override.md")
-		t.MCP = &mcpFile{Path: filepath.Join(d, "config.toml"), Format: fmtCodex, WSL: true, Distro: a.WSL, Home: linuxHome(h)}
+		t.MCP = &mcpFile{Path: filepath.Join(d, "config.toml"), Format: fmtCodex}
 		t.Skills = filepath.Join(d, "skills")
 	case "pi":
-		// its MCP servers go where the Pi installed there reads them,
-		// which its version decides (piMCP), and that isn't known here
-		d := filepath.Join(h, ".pi", "agent")
+		// its MCP servers go where the Pi installed there reads them, as on
+		// this machine (piMCP): its version is what the distro's pi said
+		// at the probe, and its extensions are those its settings.json and
+		// the distro's npm folders have (leokon on Discord: only the
+		// Windows Pi was offered MCP servers)
+		d := j(h, ".pi", "agent")
 		t.Instructions = firstThere(d, "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 		t.Override = filepath.Join(d, "AGENTS.override.md")
+		t.MCP, t.MCPVia = piMCP(h, d, piVersion(a), wslPiRoots(h))
 		t.Skills = filepath.Join(d, "skills")
 	case "omo":
-		d := filepath.Join(h, ".omo", "agent")
+		d := j(h, ".omo", "agent")
 		t.Instructions = firstThere(d, "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 		t.Override = filepath.Join(d, "AGENTS.override.md")
-		t.MCP = &mcpFile{Path: filepath.Join(d, "mcp.json"), Format: fmtPiNative, WSL: true, Distro: a.WSL, Home: linuxHome(h)}
+		t.MCP = &mcpFile{Path: filepath.Join(d, "mcp.json"), Format: fmtPiNative}
 		t.Skills = filepath.Join(d, "skills")
+	case "gemini":
+		// as targetOf's, under the distro's home
+		d := j(h, ".gemini")
+		t.Instructions = filepath.Join(d, "GEMINI.md")
+		t.MCP = &mcpFile{Path: filepath.Join(d, "settings.json"), Format: fmtGemini}
+		t.Skills = filepath.Join(d, "skills")
+	case "agy":
+		d := j(h, ".gemini", "config")
+		t.Instructions = filepath.Join(d, "GEMINI.md")
+		t.MCP = &mcpFile{Path: filepath.Join(d, "mcp_config.json"), Format: fmtAntigravity}
+		t.Skills = filepath.Join(d, "skills")
+	case "crush":
+		// its crush.json is the distro's ~/.config/crush's (agent.crushIn),
+		// CRUSH.md and skills beside it
+		d := filepath.Dir(a.Path)
+		t.Instructions = filepath.Join(d, "CRUSH.md")
+		t.MCP = &mcpFile{Path: a.Path, Format: fmtCrush}
+		t.Skills = filepath.Join(d, "skills")
+		t.SkillsAlso = []string{"claude@" + strings.SplitN(a.ID, "@", 2)[1]}
+	case "cline":
+		// beside its providers.json; the distro's CLINE_MCP_SETTINGS_PATH
+		// isn't read
+		t.MCP = &mcpFile{Path: filepath.Join(filepath.Dir(a.Path), "cline_mcp_settings.json"), Format: fmtCline}
+		t.Skills = filepath.Join(a.Dir, "skills")
+	case "codebuddy":
+		t.MCP = &mcpFile{Path: codebuddyMCPIn(a.Dir, h), Format: fmtClaude}
+		t.Skills = filepath.Join(a.Dir, "skills")
+		t.Instructions = firstThere(a.Dir, "CODEBUDDY.md", "CODEBUDDY.mdc")
+	case "kimi":
+		// its folder is the distro's (agent.kimiDir); the new Kimi Code's
+		// AGENTS.md is in it. The skills it shares with other agents (the
+		// distro's ~/.agents/skills) aren't given here
+		t.MCP = &mcpFile{Path: filepath.Join(a.Dir, "mcp.json"), Format: fmtKimi}
+		if filepath.Base(a.Dir) == ".kimi-code" {
+			t.Instructions = filepath.Join(a.Dir, "AGENTS.md")
+		}
+	case "goose":
+		// its config.yaml is the distro's ~/.config/goose's; the skills it
+		// reads first are the distro's ~/.agents/skills, which aren't
+		// given here
+		t.Instructions = filepath.Join(filepath.Dir(a.Path), ".goosehints")
+		t.MCP = &mcpFile{Path: a.Path, Format: fmtGoose}
 	default:
 		return wslOwnFolder(a)
 	}
+	wslOpened(t)
+	if t.MCP != nil {
+		// a Windows program isn't given to it (mcpFile.side)
+		t.MCP.WSL, t.MCP.Distro, t.MCP.Home = true, a.WSL, linuxHome(h)
+	}
 	return t
+}
+
+// wslOpen is path, one of t's in a WSL distro, where magpie can open it
+// (agent.WSLOpen): below a link the distro has, where the link leads,
+// since nothing below one can be opened through \\wsl.localhost. A link
+// that couldn't be resolved leaves path as it is and t unreached.
+func wslOpen(t *Target, path string) string {
+	if path == "" {
+		return ""
+	}
+	if err := t.Agent.Unreached(); err != nil && t.Unreached == nil {
+		t.Unreached = err
+	}
+	o, err := agent.WSLOpen(t.Agent, path)
+	if err != nil {
+		if t.Unreached == nil {
+			t.Unreached = err
+		}
+		return path
+	}
+	return o
+}
+
+// wslOpened opens each of t's paths where magpie can (wslOpen): a link
+// below the agent's folder, its skills folder one, as well as the folder.
+func wslOpened(t *Target) {
+	for _, p := range []*string{&t.Instructions, &t.Override, &t.Skills, &t.Settings} {
+		*p = wslOpen(t, *p)
+	}
+	if t.MCP != nil {
+		t.MCP.Path = wslOpen(t, t.MCP.Path)
+		for _, ps := range [][]string{t.MCP.Also, t.MCP.Extra} {
+			for i := range ps {
+				ps[i] = wslOpen(t, ps[i])
+			}
+		}
+	}
 }
 
 // ownFolder are the agents that keep all the library gives them in their
@@ -650,6 +783,7 @@ func wslOwnFolder(a *agent.Agent) *Target {
 		return nil
 	}
 	t.Agent, t.Copy = a, true
+	wslOpened(t)
 	if t.MCP != nil {
 		t.MCP.WSL, t.MCP.Distro, t.MCP.Home = true, a.WSL, linuxHome(a.Home)
 	}
@@ -662,7 +796,8 @@ func wslOwnFolder(a *agent.Agent) *Target {
 }
 
 // apps are what the library can give MCP servers to that aren't agents
-// magpie sets up: known by the folder they keep their settings in.
+// magpie sets up: known by the folder they keep their settings in
+// (Claude Desktop), or by their program alone (Kiro CLI).
 func apps() []*agent.Agent {
 	// Desktop's own folder (%APPDATA%\Claude on Windows, the MSIX
 	// package's for a packaged Desktop, which doesn't see a file written
@@ -673,9 +808,25 @@ func apps() []*agent.Agent {
 	if !isDir(dir) && isDir(d.ThreeP) {
 		dir = d.ThreeP
 	}
-	return []*agent.Agent{
+	out := []*agent.Agent{
 		{ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Dir: dir, Path: filepath.Join(dir, "claude_desktop_config.json")},
 	}
+	// Kiro CLI (#4769) is no agent magpie wires a model into, but the
+	// library can give it skills, MCP servers and instructions. It is
+	// found by the kiro-cli program alone — PATH, ~/.local/bin, Kiro
+	// CLI.app, where provider.KiroExecutable looks — never by ~/.kiro,
+	// which Kiro Crew and the Kiro IDE keep too. Bin is the path itself,
+	// so a copy the installer put where magpie's PATH doesn't reach is
+	// found as it was (Detected looks a Bin up by PATH alone). It is
+	// listed when kiro-cli isn't found too, and then not Detected, so not
+	// a target: held still lists one uninstalled with what magpie gave it,
+	// for that to be unticked and taken out of ~/.kiro
+	bin := provider.KiroExecutable()
+	if bin == "" {
+		bin = "kiro-cli"
+	}
+	out = append(out, &agent.Agent{ID: "kiro-cli", Name: "Kiro CLI", Icon: "kiro-color", Bin: bin})
+	return out
 }
 
 // Targets are the agents on this machine that magpie can give any of the
@@ -688,7 +839,17 @@ func Targets() []*Target { return targets(false) }
 func everyTarget() []*Target { return targets(true) }
 
 func targets(gone bool) []*Target {
+	out, _ := targetsAsleep(gone)
+	return out
+}
+
+// targetsAsleep is targets, and the agents in WSL distros that aren't
+// running now: none is a target, as its files can't be opened without
+// starting the distro, but the page lists them (asleepView). Each running
+// one's places are kept for when it is stopped (keepShape).
+func targetsAsleep(gone bool) ([]*Target, []*agent.Agent) {
 	var out []*Target
+	var asleep []*agent.Agent
 	own := map[string]bool{}
 	for _, a := range apps() {
 		own[a.ID] = true
@@ -711,6 +872,11 @@ func targets(gone bool) []*Target {
 		if !gone && a.CLIMissing() {
 			continue
 		}
+		if isAsleep(a) {
+			asleep = append(asleep, a)
+			noteUp(a.WSL, false)
+			continue
+		}
 		if t := targetOf(a); t != nil && t.open() {
 			out = append(out, t)
 		}
@@ -724,7 +890,12 @@ func targets(gone bool) []*Target {
 		}
 	}
 	readsWith(out)
-	return out
+	for _, t := range out {
+		if t.Agent.WSL != "" {
+			keepShape(t)
+		}
+	}
+	return out, asleep
 }
 
 // held are the agents not among have (Targets) — uninstalled, or gone for
@@ -742,7 +913,7 @@ func (l *Library) held(have []*Target) []*Target {
 		if a := l.Applied[id]; a != nil && (len(a.Skills) > 0 || len(a.MCP) > 0 || len(a.Hooks) > 0) {
 			return true
 		}
-		return slices.ContainsFunc(l.Skills, func(s *Skill) bool { return slices.Contains(s.Agents, id) }) ||
+		return slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.gives(id) }) ||
 			slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) ||
 			slices.ContainsFunc(l.Hooks, func(h *Hook) bool { return slices.Contains(h.Agents, id) })
 	}
@@ -761,8 +932,9 @@ func (l *Library) held(have []*Target) []*Target {
 }
 
 // readsShared are the agents that read ~/.agents/skills as well as their
-// own folder (each one's docs or source).
-var readsShared = []string{"codex", "gemini", "opencode", "deveco", "crush", "dsh", "commandcode", "devin", "droid", "cline", "grok", "grok-app", "fx", "alma"}
+// own folder (each one's docs or source): Kimi Code's own is
+// ~/.kimi-code/skills besides it (#4379).
+var readsShared = []string{"codex", "gemini", "opencode", "deveco", "crush", "dsh", "commandcode", "devin", "droid", "cline", "grok", "grok-app", "fx", "alma", "kimi"}
 
 // readsWith adds to each agent's SkillsAlso the agents whose folder it
 // reads skills from too: one that is the very same folder (Kimi Code's,
@@ -821,11 +993,12 @@ func targetByID(id string) *Target {
 // then given nothing.
 func Takes(q, kind string) (string, error) {
 	var a *agent.Agent
-	for _, app := range apps() {
-		if strings.EqualFold(app.ID, q) || strings.EqualFold(app.Name, q) {
-			a = app
+	for _, x := range apps() {
+		if strings.EqualFold(x.ID, q) || strings.EqualFold(x.Name, q) {
+			a = x
 		}
 	}
+	app := a != nil
 	if a == nil {
 		var err error
 		if a, err = agent.Find(q); err != nil {
@@ -833,6 +1006,11 @@ func Takes(q, kind string) (string, error) {
 		}
 	}
 	what := map[string]string{"instructions": "instructions", "mcp": "MCP servers", "skills": "skills"}[kind]
+	// an app found by its program alone (Kiro CLI) that isn't here: told
+	// so, not recorded and then given nothing, as Targets leaves it out
+	if app && a.Bin != "" && !a.Detected() {
+		return "", fmt.Errorf("%s isn't installed here; nothing reads its %s until it is", a.Name, what)
+	}
 	// gone for its CLI, as Targets leaves it out (#2254): told so, not
 	// recorded and then given nothing ("every agent already has it")
 	if a.CLIMissing() {
@@ -840,7 +1018,13 @@ func Takes(q, kind string) (string, error) {
 	}
 	t := targetOf(a)
 	var has bool
-	if t == nil && a.WSL != "" && (a.Home == "" || !agent.WSLRunning(a.WSL)) {
+	if t == nil && isAsleep(a) {
+		// one magpie saw it give instructions, MCP servers or skills a
+		// place to is recorded, and given them when the distro next runs
+		// (Woken)
+		if sh := shapeOf(a); sh != nil && (kind == "instructions" && sh.Instructions != "" || kind == "mcp" && sh.MCP != "" || kind == "skills" && sh.Skills != "") {
+			return a.ID, nil
+		}
 		return "", fmt.Errorf("WSL %s isn't running: start it, and %s can be given %s", a.WSL, a.Name, what)
 	}
 	if t != nil {

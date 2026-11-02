@@ -2,8 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +23,7 @@ var (
 	updateExecutable  = update.Executable
 	updateCanElevate  = update.CanElevate
 	updateInContainer = gateway.InContainer
+	updatePackagedBy  = update.PackagedBy
 )
 
 // updateEveries are the intervals magpie update auto takes, by their
@@ -102,6 +107,36 @@ func updateMirrorCmd(args []string) error {
 	return nil
 }
 
+// updateChannelCmd is `magpie update channel [stable|every]`: which
+// versions an update is offered (settings.UpdateChannel, ssharpcc on X):
+// Stable, one a week and an urgent one at once, or every version as it
+// comes out. With none, it says which.
+func updateChannelCmd(args []string) error {
+	s := settings.Load()
+	if len(args) > 1 {
+		return fmt.Errorf("magpie update channel takes stable or every")
+	}
+	if len(args) == 1 {
+		switch strings.ToLower(strings.TrimSpace(args[0])) {
+		case "stable":
+			s.UpdateChannel = settings.UpdateStable
+		case "every", "all":
+			s.UpdateChannel = ""
+		default:
+			return fmt.Errorf("magpie update channel takes stable or every, not %q", args[0])
+		}
+		if err := settings.Save(s); err != nil {
+			return err
+		}
+	}
+	if s.UpdateChannel == settings.UpdateStable {
+		fmt.Println("update channel: stable", muted.Render("· a version a week, the newest out three days as the week began, and an urgent one at once · magpie update channel every: each one as it comes out"))
+		return nil
+	}
+	fmt.Println("update channel: every version", muted.Render("· each one as it comes out · magpie update channel stable: one a week, an urgent one at once"))
+	return nil
+}
+
 // updateFlags takes --proxy and --mirror (each as --flag value or
 // --flag=value) out of args.
 func updateFlags(args []string) (rest []string, proxy, mirror string, err error) {
@@ -149,6 +184,9 @@ func updateCmd(args []string) error {
 	if len(args) > 1 && args[1] == "mirror" {
 		return updateMirrorCmd(args[2:])
 	}
+	if len(args) > 1 && args[1] == "channel" {
+		return updateChannelCmd(args[2:])
+	}
 	if len(args) > 2 || len(args) == 2 && args[1] != "check" {
 		return fmt.Errorf("usage: magpie update [check] [--proxy <url>] [--mirror <prefix>]")
 	}
@@ -161,7 +199,11 @@ func updateCmd(args []string) error {
 	}
 	if !update.Newer(rel.Version, version) {
 		if update.Released(version) {
-			fmt.Println(green.Render("✓"), "magpie", version, muted.Render("is the latest"))
+			if update.Stable() {
+				fmt.Println(green.Render("✓"), "magpie", version, muted.Render("is up to date on the stable channel (stable is "+rel.Version+")"))
+			} else {
+				fmt.Println(green.Render("✓"), "magpie", version, muted.Render("is the latest"))
+			}
 		} else {
 			fmt.Println("magpie", version, muted.Render("was built from source; the latest release is "+rel.Version))
 		}
@@ -190,7 +232,8 @@ func updateCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println(green.Render("✓"), "updated", tilde(app), "to", rel.Version, muted.Render("· quit and reopen magpie to use it"))
+		fmt.Println(green.Render("✓"), "updated", tilde(app), "to", rel.Version)
+		fmt.Println(muted.Render("  " + restartRunning(gateway.URL(), rel.Version)))
 		if stale := update.StaleCLI(rel.Version); stale != "" {
 			// The copy won't follow the app; the fix is the link install.sh
 			// makes. `magpie update` run from the copy can't do it (it
@@ -205,15 +248,61 @@ func updateCmd(args []string) error {
 	if exe, err := updateExecutable(); err == nil && !update.Writable(filepath.Dir(exe)) && !updateCanElevate() && updateInContainer() {
 		return fmt.Errorf("this magpie runs in a container and can't replace itself; pull the new image (docker pull ghcr.io/yetone/magpie:latest) and recreate the container")
 	}
-	if exe, err := update.Executable(); err == nil && update.Homebrew(exe) {
-		return fmt.Errorf("this magpie was installed with Homebrew; update it with: brew upgrade magpie")
+	// a package manager's binary (Homebrew's, pacman's magpie-bin from
+	// the AUR, a .deb's): replaced under it, the manager's database names
+	// the old version and its next upgrade writes over this one
+	if exe, err := updateExecutable(); err == nil {
+		if p := updatePackagedBy(exe); p != nil {
+			return fmt.Errorf("%s", p.Say())
+		}
 	}
 	fmt.Println(muted.Render("  downloading " + update.BinaryAsset() + via(ctx) + " …"))
 	if err := update.ReplaceBinary(ctx, rel); err != nil {
 		return err
 	}
 	fmt.Println(green.Render("✓"), "updated to", rel.Version)
+	fmt.Println(muted.Render("  " + restartRunning(gateway.URL(), rel.Version)))
 	return nil
+}
+
+// restartRunning asks the magpie serving the gateway at base to restart
+// into version, which this command put in (gateway.RestartPath), and
+// says what came of it. Before, the app ran on as the old version until
+// it was quit and reopened by hand (gaubeebangeel on X: an agent magpie
+// serves ran the update, and restarting magpie cut it off). The app
+// restarts as its own update does, handing the gateway over on a Mac or
+// Linux, so this command's own agent isn't cut short.
+var restartRunning = func(base, version string) string {
+	c := &http.Client{Timeout: 10 * time.Second}
+	res, err := c.Post(base+gateway.RestartPath, "application/json", strings.NewReader(`{"version":`+strconv.Quote(version)+`}`))
+	if err != nil {
+		return "magpie isn't running; it starts as " + version + " next time"
+	}
+	defer res.Body.Close()
+	var r gateway.RestartReply
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
+		return "the magpie running is too old to restart by itself: quit and reopen magpie to use it"
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<16)).Decode(&r); err != nil || res.StatusCode != http.StatusOK {
+		return fmt.Sprintf("the magpie running didn't restart (%s): quit and reopen magpie to use it", res.Status)
+	}
+	carried := ""
+	if r.Handover {
+		carried = ", handing its gateway over: nothing in flight is cut"
+	}
+	switch r.State {
+	case "restarting":
+		return "magpie " + r.Version + " restarts into " + version + " now" + carried
+	case "waiting":
+		n := 0
+		if r.Busy != nil {
+			n = r.Busy.Requests + r.Busy.Tools
+		}
+		return fmt.Sprintf("magpie %s restarts into %s once the %d request(s) it would cut short are done%s", r.Version, version, n, carried)
+	case "unsupported":
+		return "the magpie serving the gateway (" + r.Version + ", magpie serve) doesn't restart by itself: restart it the way you started it to use " + version
+	}
+	return "the magpie serving the gateway (" + r.Version + ") runs from another copy, which wasn't updated: update that one, or restart it"
 }
 
 // via says the mirror a download goes through, if any.

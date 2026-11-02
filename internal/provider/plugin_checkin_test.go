@@ -113,12 +113,17 @@ func TestPluginCheckinRunsAsTheBuiltinsDo(t *testing.T) {
 	}
 	failed := 0
 	for k := range got {
-		if strings.Contains(k, "check-in is down") || strings.Contains(k, "no outcome") {
+		if strings.Contains(k, "check-in is down") || strings.Contains(k, "the plugin answered") {
 			failed++
 		}
 	}
 	if failed != 2 {
 		t.Fatalf("the failures (ck-throw, ck-odd): %+v", rs)
+	}
+	// an outcome magpie doesn't know keeps the plugin's message, marked as
+	// the plugin's own word, so "failed" can't read as contradicting it (#3650)
+	if _, ok := got[CheckinFailed+`:the plugin answered "yes": the daily credits were refreshed`]; !ok {
+		t.Fatalf("ck-odd's message: %+v", rs)
 	}
 	if p := pressed(t, presses); len(p) != len(keys) {
 		t.Fatalf("pressed %q", p)
@@ -129,16 +134,17 @@ func TestPluginCheckinRunsAsTheBuiltinsDo(t *testing.T) {
 	if rs := loop.checkinNow(ctx, false); len(rs) != len(keys) || len(pressed(t, presses)) != len(keys) {
 		t.Fatalf("a minute on: %+v, pressed %q", rs, pressed(t, presses))
 	}
-	// past wbCheckinRetry: the failures only, not the captcha
+	// past wbCheckinRetry: the failures, and the done given before noon
+	// (#3326), not the captcha
 	now = now.Add(wbCheckinRetry)
 	loop.checkinNow(ctx, false)
-	if p := pressed(t, presses)[len(keys):]; strings.Join(slices.Sorted(slices.Values(p)), ",") != "ck-odd,ck-throw" {
+	if p := pressed(t, presses)[len(keys):]; strings.Join(slices.Sorted(slices.Values(p)), ",") != "ck-done,ck-odd,ck-throw" {
 		t.Fatalf("past the retry, pressed again %q", p)
 	}
 	// the next Beijing day: each again
 	now = time.Date(2026, 10, 7, 0, 5, 0, 0, beijing)
 	loop.checkinNow(ctx, false)
-	if p := pressed(t, presses); len(p) != 2*len(keys)+2 {
+	if p := pressed(t, presses); len(p) != 2*len(keys)+3 {
 		t.Fatalf("the next day, pressed %q", p)
 	}
 
@@ -492,9 +498,10 @@ func pluginCheckinCounter(id string, outcome *string, calls *int) pluginCheckinP
 // magpie's own Qoder check-in is. A campaign can open mid-day, so a done or
 // inactive read before it was kept for the whole Beijing day, even on a
 // press. Now the loop asks again 30 minutes after the last answer, not
-// before, and a press asks at once.
+// before, and a press asks at once. ZCode's gift plans are rechecked the
+// same way (plugins#503).
 func TestPluginCheckinQoderRechecksCampaigns(t *testing.T) {
-	for _, id := range []string{"qoder", QoderCNID} {
+	for _, id := range []string{"qoder", QoderCNID, "zcode"} {
 		for _, first := range []string{CheckinInactive, CheckinDone} {
 			// each: wait this long, press or not, then the outcome shown
 			// and the asks so far
@@ -538,26 +545,230 @@ func TestPluginCheckinQoderRechecksCampaigns(t *testing.T) {
 	}
 }
 
-// Every other plugin's check-in is settled for the Beijing day: neither
-// the loop after 30 minutes nor a press asks again (#2696 changes Qoder's
-// alone).
+// Every other plugin's check-in is settled for the Beijing day by a claim,
+// or by a done, inactive or ineligible answered from noon Beijing on: the
+// loop doesn't ask again after 30 minutes (#2696 changes Qoder's, plugins#503 ZCode's).
+// A press asks again for any of those but a claim: the record is not the
+// vendor's answer now (#3326).
 func TestPluginCheckinOthersSettledForTheDay(t *testing.T) {
-	for _, first := range []string{CheckinInactive, CheckinDone, CheckinClaimed} {
+	for _, first := range []string{CheckinInactive, CheckinDone, CheckinIneligible, CheckinClaimed} {
 		t.Run(first, func(t *testing.T) {
 			claudeHome(t)
-			now := time.Date(2026, 10, 18, 1, 0, 0, 0, time.UTC)
+			now := time.Date(2026, 10, 18, 4, 0, 0, 0, time.UTC) // 12:00 Beijing
 			outcome, calls := first, 0
 			p := pluginCheckinCounter("fakeco", &outcome, &calls)
 			p.checkiner(func() time.Time { return now }).checkinNow(context.Background(), false)
 			outcome = CheckinClaimed
 			for _, step := range []time.Duration{31 * time.Minute, 5 * time.Hour} {
 				now = now.Add(step)
-				for _, press := range []bool{false, true} {
-					got := p.checkiner(func() time.Time { return now }).checkinNow(context.Background(), press)
-					if len(got) != 1 || got[0].Outcome != first || calls != 1 {
-						t.Fatalf("press=%v at %s: got %+v after %d asks; want %s kept after 1", press, now, got, calls, first)
+				got := p.checkiner(func() time.Time { return now }).checkinNow(context.Background(), false)
+				if len(got) != 1 || got[0].Outcome != first || got[0].Again || calls != 1 {
+					t.Fatalf("loop at %s: got %+v after %d asks; want %s kept after 1", now, got, calls, first)
+				}
+			}
+			got := p.checkiner(func() time.Time { return now }).checkinNow(context.Background(), true)
+			want, wantCalls := CheckinClaimed, 2
+			if first == CheckinClaimed {
+				wantCalls = 1
+			}
+			if len(got) != 1 || got[0].Outcome != want || calls != wantCalls {
+				t.Fatalf("press at %s: got %+v after %d asks; want %s after %d", now, got, calls, want, wantCalls)
+			}
+		})
+	}
+}
+
+// #3326 (connoryang331): at 00:00:28 Beijing AutoClaw CN, WorkBuddy,
+// CodeArts, Trae CN, MiniMax and Raccoon answered "already in" (done) for
+// accounts whose day's credits were still to claim; magpie kept it as the
+// day's, the loop never asked again, and a press answered from the record.
+// An answer magpie saw no claim for, given before noon Beijing, is asked
+// again every 30 minutes; a press asks at once.
+func TestPluginCheckinEarlyDoneAskedAgain(t *testing.T) {
+	early := time.Date(2026, 10, 23, 0, 0, 28, 0, beijing)
+	run := func(p pluginCheckinProvider, now time.Time, press bool) WorkBuddyCheckin {
+		t.Helper()
+		got := p.checkiner(func() time.Time { return now }).checkinNow(context.Background(), press)
+		if len(got) != 1 {
+			t.Fatalf("at %s: %+v", now, got)
+		}
+		return got[0]
+	}
+	t.Run("loop", func(t *testing.T) {
+		claudeHome(t)
+		outcome, calls := CheckinDone, 0
+		p := pluginCheckinCounter("autoclaw-cn", &outcome, &calls)
+		now := early
+		if r := run(p, now, false); r.Outcome != CheckinDone || !r.Again || calls != 1 {
+			t.Fatalf("at midnight: %+v after %d asks", r, calls)
+		}
+		// shown so on the card too, and in Settings
+		if r := shownCheckins(pluginCheckinPath())["autoclaw-cn|ann"]; !r.Again {
+			t.Fatalf("kept: %+v", r)
+		}
+		if r := run(p, now.Add(29*time.Minute), false); r.Outcome != CheckinDone || !r.Again || calls != 1 {
+			t.Fatalf("29 minutes on: %+v after %d asks", r, calls)
+		}
+		now = now.Add(wbCheckinEvery)
+		if r := run(p, now, false); r.Outcome != CheckinDone || !r.Again || calls != 2 {
+			t.Fatalf("30 minutes on: %+v after %d asks", r, calls)
+		}
+		// the vendor's day turns
+		outcome = CheckinClaimed
+		now = now.Add(wbCheckinEvery)
+		if r := run(p, now, false); r.Outcome != CheckinClaimed || r.Again || calls != 3 {
+			t.Fatalf("after the vendor's turn: %+v after %d asks", r, calls)
+		}
+		// a claim settles the day, for the loop and a press
+		for _, step := range []time.Duration{wbCheckinEvery, 5 * time.Hour} {
+			now = now.Add(step)
+			for _, press := range []bool{false, true} {
+				if r := run(p, now, press); r.Outcome != CheckinClaimed || calls != 3 {
+					t.Fatalf("press=%v at %s: %+v after %d asks", press, now, r, calls)
+				}
+			}
+		}
+	})
+	t.Run("press", func(t *testing.T) {
+		claudeHome(t)
+		outcome, calls := CheckinDone, 0
+		p := pluginCheckinCounter("autoclaw-cn", &outcome, &calls)
+		run(p, early, false)
+		outcome = CheckinClaimed
+		if r := run(p, time.Date(2026, 10, 23, 10, 54, 0, 0, beijing), true); r.Outcome != CheckinClaimed || !r.Asked || calls != 2 {
+			t.Fatalf("pressed at 10:54: %+v after %d asks", r, calls)
+		}
+	})
+	t.Run("done all day", func(t *testing.T) {
+		claudeHome(t)
+		outcome, calls := CheckinDone, 0
+		p := pluginCheckinCounter("autoclaw-cn", &outcome, &calls)
+		var last WorkBuddyCheckin
+		for now := early; wbCheckinDay(now) == "2026-10-23"; now = now.Add(wbCheckinEvery) {
+			last = run(p, now, false)
+		}
+		// 00:00:28 to 11:30:28 provisional, 12:00:28 the day's
+		if calls != 25 || last.Again || last.Outcome != CheckinDone {
+			t.Fatalf("%d asks, last %+v", calls, last)
+		}
+	})
+	t.Run("done after magpie's claim", func(t *testing.T) {
+		claudeHome(t)
+		outcome, calls := CheckinClaimed, 0
+		// Qoder's is rechecked after a claim, and then answers done
+		p := pluginCheckinCounter("qoder", &outcome, &calls)
+		run(p, early, false)
+		outcome = CheckinDone
+		if r := run(p, early.Add(wbCheckinEvery), false); r.Outcome != CheckinDone || r.Again || r.Claimed.IsZero() || calls != 2 {
+			t.Fatalf("done after the claim: %+v after %d asks", r, calls)
+		}
+	})
+}
+
+// A plugin whose vendor's day turns at another hour says when (until):
+// Qoder's daily credits open at 10:00 UTC+8 and stay open until 09:59 the
+// next day (sdytman on Discord). A check-in before 10:00 meets the day
+// before's campaign; magpie asks again as the plugin said, a minute past
+// 10:00, not the next Beijing day, and not before, whatever the machine's
+// zone; a failure in the gap is asked again then too.
+func TestPluginCheckinAsksAgainAtUntil(t *testing.T) {
+	presses := pluginCheckinSandbox(t, "ck-until")
+	s := settings.Load()
+	s.PluginCheckins = map[string]bool{"fakeco": true}
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	answer := func(outcome string, until time.Time) {
+		t.Helper()
+		b, _ := json.Marshal(map[string]any{"outcome": outcome, "credit": 100, "until": until.UTC().Format(time.RFC3339)})
+		if err := os.WriteFile(presses+".until", b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the plugin's answer at t: before 10:00 Beijing, the day before's
+	// campaign (claimed at its first ask, done after), until today's 10:01
+	opens := func(at time.Time) time.Time {
+		b := at.In(beijing)
+		o := time.Date(b.Year(), b.Month(), b.Day(), 10, 1, 0, 0, beijing)
+		if !at.Before(o) {
+			o = o.AddDate(0, 0, 1)
+		}
+		return o
+	}
+	defer func(l *time.Location) { time.Local = l }(time.Local)
+	for _, zone := range []*time.Location{time.UTC, time.FixedZone("UTC-8", -8*3600), beijing} {
+		t.Run(zone.String(), func(t *testing.T) {
+			time.Local = zone
+			if err := os.Remove(pluginCheckinPath()); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			_ = os.Remove(presses)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			now := time.Date(2026, 10, 28, 9, 27, 0, 0, beijing).In(zone)
+			c := pluginCheckiner{now: func() time.Time { return now }, only: func(id string) bool { return PluginCheckinOn(settings.Load(), id) }}
+			var l wbCheckinLoop
+			var at []string
+			claimed := map[string]bool{}
+			end := time.Date(2026, 10, 29, 10, 30, 0, 0, beijing)
+			for ; now.Before(end); now = now.Add(time.Minute) {
+				o := opens(now)
+				if campaign := o.AddDate(0, 0, -1).Format("01-02"); claimed[campaign] {
+					answer(CheckinDone, o)
+				} else {
+					answer(CheckinClaimed, o)
+				}
+				for _, r := range l.tick(ctx, c) {
+					if !r.Asked {
+						continue
+					}
+					at = append(at, now.In(beijing).Format("01-02 15:04"))
+					if r.ValidUntil.IsZero() || !r.ValidUntil.Equal(o) {
+						t.Fatalf("at %v: until %v, want %v (%+v)", now, r.ValidUntil, o, r)
+					}
+					if r.Outcome == CheckinClaimed {
+						claimed[o.AddDate(0, 0, -1).Format("01-02")] = true
 					}
 				}
+			}
+			// 09:27 claims the 10-27 campaign, 10:01 the 10-28 one, the
+			// Beijing day's turn asks once (done), 10:01 claims 10-29's
+			if want := []string{"10-28 09:27", "10-28 10:01", "10-29 00:00", "10-29 10:01"}; !slices.Equal(at, want) {
+				t.Fatalf("asked at %q, want %q", at, want)
+			}
+			if p := pressed(t, presses); len(p) != 4 {
+				t.Fatalf("pressed %q", p)
+			}
+			if len(claimed) != 3 {
+				t.Fatalf("claimed %v", claimed)
+			}
+
+			// in the gap (09:59:30, yesterday's closed, today's not open):
+			// a failure, asked again at 10:01, not half an hour on
+			_ = os.Remove(presses)
+			l = wbCheckinLoop{}
+			now = time.Date(2026, 10, 30, 9, 59, 30, 0, beijing).In(zone)
+			b, _ := json.Marshal(map[string]any{"outcome": CheckinFailed, "message": "today's credits aren't offered yet", "until": opens(now).UTC().Format(time.RFC3339)})
+			if err := os.WriteFile(presses+".until", b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if rs := l.tick(ctx, c); len(rs) != 1 || rs[0].Outcome != CheckinFailed || !rs[0].Asked {
+				t.Fatalf("the gap: %+v", rs)
+			}
+			answer(CheckinClaimed, opens(now).AddDate(0, 0, 1))
+			var again []string
+			for now = now.Add(30 * time.Second); now.Before(time.Date(2026, 10, 30, 10, 2, 0, 0, beijing)); now = now.Add(30 * time.Second) {
+				for _, r := range l.tick(ctx, c) {
+					if r.Asked {
+						again = append(again, now.In(beijing).Format("15:04:05"))
+					}
+				}
+			}
+			if !slices.Equal(again, []string{"10:01:00"}) {
+				t.Fatalf("after the gap, asked at %q, want 10:01:00", again)
+			}
+			if p := pressed(t, presses); len(p) != 2 {
+				t.Fatalf("after the gap, pressed %q", p)
 			}
 		})
 	}

@@ -11,10 +11,12 @@ package steady
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 )
 
@@ -32,6 +34,10 @@ const (
 	goneTries = 15
 	gonePause = time.Millisecond
 )
+
+// errPathNotFound is Windows' ERROR_PATH_NOT_FOUND: a folder on the way to
+// the file isn't there (ERROR_FILE_NOT_FOUND, 2, is the file alone).
+const errPathNotFound = syscall.Errno(3)
 
 // windows is whether files behave as Windows' do; a test sets it.
 var windows = runtime.GOOS == "windows"
@@ -51,10 +57,14 @@ func retry(f func() error) error {
 	return err
 }
 
-// retryGone is retry, waiting out a moment of the file not there too.
+// retryGone is retry, waiting out a moment of the file not there too,
+// unless its folder isn't there either: nothing is being renamed into it.
+// Most agents aren't installed, and the first look at each of their files
+// waited the whole 15ms (#1665: ~22ms an agent each catalog sync, 2.6s a
+// round of 116 on Windows).
 func retryGone(f func() error) error {
 	err := retry(f)
-	for i := 0; err != nil && windows && errors.Is(err, fs.ErrNotExist) && i < goneTries; i++ {
+	for i := 0; err != nil && windows && errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errPathNotFound) && i < goneTries; i++ {
 		time.Sleep(gonePause)
 		err = retry(f)
 	}
@@ -82,6 +92,41 @@ func ReadThere(p string) ([]byte, error) {
 		return err
 	})
 	return b, err
+}
+
+// ReadThereInto is ReadThere into buf's room, grown when the file needs
+// more: for a caller that reads one file again and again only to compare
+// it, which a new buffer each time made the bulk of what magpie allocated
+// as it started (a 1.5 MB config.toml read 150 times over).
+func ReadThereInto(p string, buf []byte) ([]byte, error) {
+	var b []byte
+	err := retryGone(func() (err error) {
+		b, err = readInto(p, buf[:0])
+		return err
+	})
+	return b, err
+}
+
+// readInto is os.ReadFile into buf; a test stands in for it.
+var readInto = func(p string, buf []byte) ([]byte, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := f.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // ReadFile is os.ReadFile, waiting out a file being replaced.

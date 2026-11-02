@@ -6,6 +6,7 @@ package tui
 // the terminal.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -63,12 +64,21 @@ func (m *model) reloadLibrary() {
 		if s.Command != "" {
 			what = strings.TrimSpace(s.Command + " " + strings.Join(s.Args, " "))
 		}
+		if s.Local {
+			what = "this computer only · " + what
+		}
 		m.lib = append(m.lib, libRow{kind: "mcp", name: s.Name, about: what, on: s.Agents, bad: len(s.Problems)})
 	}
 	for _, s := range v.Skills {
 		r := libRow{kind: "skill", name: s.Name, about: s.Description, on: s.Agents, bad: len(s.Problems)}
 		if s.Missing {
 			r.about, r.bad = "its folder is gone", r.bad+1
+		} else if s.Gone != "" {
+			r.about, r.bad = "removed from "+s.Source+" · d takes it out", r.bad+1
+		}
+		if s.OffHere {
+			// ticked agents are other computers' too; none gets it here
+			r.about = "off on this computer · magpie library skill on-here " + s.Name
 		}
 		m.lib = append(m.lib, r)
 	}
@@ -159,7 +169,15 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.flash, m.flashOK = "fetching "+r.name+" from GitHub again…", true
-		return m, libCmd(func() (*library.Result, error) { return library.UpdateSkill(r.name, false) }, "updated "+r.name)
+		return m, libCmd(func() (*library.Result, error) {
+			res, err := library.UpdateSkill(r.name, false)
+			var gone *library.GoneError
+			if errors.As(err, &gone) {
+				// removed from its source: kept till the user takes it out
+				err = fmt.Errorf("%w · d takes it out", err)
+			}
+			return res, err
+		}, "updated "+r.name)
 	case "i":
 		if r.own {
 			m.flash, m.flashOK = r.name+" is put there by the agent's app itself, each time it starts: it stays as it is", false
@@ -405,8 +423,9 @@ func saveServer(old *library.Server, line string) tea.Cmd {
 		was, done := "", "added "+s.Name+" · ↵ on it gives it to agents"
 		if old != nil {
 			was, done = old.Name, "saved "+s.Name
-			// and its OAuth app, which only the GUI edits
-			s.Agents, s.Env, s.Headers, s.OAuth = old.Agents, old.Env, old.Headers, old.OAuth
+			// and its OAuth app and startup timeout, which only the GUI edits
+			// and whether it is kept to this computer, and out of the hub
+			s.Agents, s.Env, s.Headers, s.OAuth, s.StartupTimeout, s.Local, s.Hub = old.Agents, old.Env, old.Headers, old.OAuth, old.StartupTimeout, old.Local, old.Hub
 		}
 		return libCmd(func() (*library.Result, error) { return library.SaveServer(was, s) }, done)()
 	}
@@ -431,8 +450,14 @@ func (m *model) openProbe(p *library.Probe) {
 	var items []agent.Option
 	for _, c := range p.Candidates {
 		note := c.Description
-		if c.Have {
+		switch {
+		case c.Have && c.As != "":
+			note = "in the library as " + c.As + " · " + note
+		case c.Have:
 			note = "in the library already · " + note
+		case c.As != "":
+			// another skill from elsewhere has its name
+			note = "adds as " + c.As + " · " + note
 		}
 		v := c.Path
 		if v == "" {

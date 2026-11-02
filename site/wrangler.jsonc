@@ -4,6 +4,9 @@
   "name": "usemagpie",
   "main": "worker.js",
   "compatibility_date": "2026-09-01",
+  // the contributors page's list, from git history (credits-cli.mjs); a
+  // build that can't read git or GitHub keeps the last list, or none
+  "build": { "command": "node credits-cli.mjs wall" },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
@@ -14,5 +17,9 @@
     { "pattern": "usemagpie.ai", "custom_domain": true },
     { "pattern": "www.usemagpie.ai", "custom_domain": true }
   ],
+  // the ledger of releases the Stable channel is chosen from (worker.js,
+  // "The Stable channel"), kept by the cron every quarter hour
+  "kv_namespaces": [{ "binding": "LEDGER", "id": "716b22ec7d4c496abb7b3dc085258fde" }],
+  "triggers": { "crons": ["*/15 * * * *"] },
   "observability": { "enabled": true }
 }

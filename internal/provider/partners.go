@@ -1,11 +1,13 @@
 package provider
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/source"
 )
 
@@ -68,9 +71,17 @@ type partnerFeed struct {
 // partner ever listed, so a provider added from one that has since left
 // still finds its preset (its endpoints, regions and key page).
 type partnerCache struct {
-	At       time.Time          `json:"at"`
-	Partners []Partner          `json:"partners"`
-	Seen     map[string]Partner `json:"seen,omitempty"`
+	At       time.Time `json:"at"`
+	Partners []Partner `json:"partners"`
+	// Tried is when the last fetch started, and Error how it ended, ""
+	// once it got the list (At is then its time) or while it is still
+	// out. So the file tells a fetch that failed (Error) from one that
+	// never came back (Tried after At, no Error) and from none asked
+	// (Tried old): an app that kept an old list for days left nothing to
+	// tell them apart (#3362).
+	Tried time.Time          `json:"tried,omitzero"`
+	Error string             `json:"error,omitempty"`
+	Seen  map[string]Partner `json:"seen,omitempty"`
 	// Noticed are the partners the add sheet has listed to the user; one
 	// listed since is new, and the add button says so (NoticePartners).
 	Noticed []string `json:"noticed,omitempty"`
@@ -81,12 +92,15 @@ var (
 	partnerState   *partnerCache // nil until read from disk
 	partnerNext    time.Time     // the next fetch, when none is running
 	partnerFetches bool
+	partnerLogged  string // the failure logged last, so a long one is logged once
 )
 
-const (
-	partnerEvery = 6 * time.Hour
-	partnerRetry = 10 * time.Minute
-)
+// A list is fetched again after partnerEvery, so a partner added reaches
+// an app left running within the hour; the list is a couple of KB and its
+// icons aren't fetched again (partnerIcon). A var, so a test can shorten it.
+var partnerEvery = time.Hour
+
+const partnerRetry = 10 * time.Minute
 
 var partnerID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,40}$`)
 
@@ -106,8 +120,9 @@ func partnersSource() string {
 }
 
 // Partners are the partners listed now, in the list's order: what was
-// fetched last, never waited for. A list older than six hours is fetched
-// again behind the call, and the page asked again shows it.
+// fetched last, never waited for. A list this process hasn't fetched, or
+// fetched an hour ago, is fetched again behind the call, and the page
+// asked again shows it.
 func Partners() []Partner {
 	if partnersSource() == "off" {
 		return nil
@@ -154,6 +169,42 @@ func PartnersNow(wait time.Duration) []Partner {
 	return Partners()
 }
 
+// KeepPartnersFresh fetches the partner list when the magpie serving the
+// gateway starts, and again whenever it is due (every hour, ten minutes
+// after a failed fetch), whether or not a page asks for it, so a partner
+// added reaches an app left running within the hour, and the list kept on
+// disk is fresh for the next start.
+func KeepPartnersFresh(ctx context.Context) {
+	if partnersSource() == "off" {
+		return
+	}
+	t := time.NewTimer(0)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		partnerMu.Lock()
+		loadPartners()
+		due := !partnerFetches && !time.Now().Before(partnerNext)
+		if due {
+			partnerFetches = true
+		}
+		partnerMu.Unlock()
+		if due {
+			refreshPartners()
+		}
+		partnerMu.Lock()
+		wait := time.Until(partnerNext)
+		partnerMu.Unlock()
+		// a fetch Partners started is still running when partnerNext
+		// has passed: look again in a second
+		t.Reset(max(wait, time.Second))
+	}
+}
+
 // loadPartners reads the list kept on disk the first time it's asked for;
 // partnerMu held.
 func loadPartners() {
@@ -181,16 +232,26 @@ func loadPartners() {
 			delete(c.Seen, id)
 		}
 	}
+	// partnerNext stays zero: a process started fetches on its first ask,
+	// whatever the kept list's age. Waiting out the kept list's six hours
+	// held back a partner added minutes after it was fetched, restart or not.
 	partnerState = &c
-	partnerNext = c.At.Add(partnerEvery)
 }
 
 // refreshPartners fetches the list and keeps it; on a failure the list
-// held stays, and it is tried again in ten minutes.
+// held stays, and it is tried again in ten minutes. When it started and
+// how it ended are kept with the list (Tried, Error), and a failure is
+// logged once until the list is fetched again.
 func refreshPartners() {
+	partnerMu.Lock()
+	loadPartners()
+	partnerState.Tried, partnerState.Error = time.Now(), ""
+	savePartners()
+	partnerMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	list, err := fetchPartners(ctx, partnersSource())
+	src := partnersSource()
+	list, err := fetchPartners(ctx, src)
 	if err == nil {
 		for i := range list {
 			list[i].Icon = partnerIcon(ctx, list[i])
@@ -202,7 +263,17 @@ func refreshPartners() {
 	loadPartners()
 	if err != nil {
 		partnerNext = time.Now().Add(partnerRetry)
+		partnerState.Error = partnerError(err)
+		savePartners()
+		if partnerState.Error != partnerLogged {
+			partnerLogged = partnerState.Error
+			log.Printf("partners: the list couldn't be fetched from %s, asked again in %s: %s", src, partnerRetry, partnerLogged)
+		}
 		return
+	}
+	if partnerLogged != "" {
+		partnerLogged = ""
+		log.Printf("partners: the list is fetched again from %s", src)
 	}
 	now := time.Now()
 	partnerState.At, partnerState.Partners = now, list
@@ -213,10 +284,28 @@ func refreshPartners() {
 	savePartners()
 }
 
+// partnerError is err as the list keeps it: its text, cut to a size
+// that stays readable in the file.
+func partnerError(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if r := []rune(msg); len(r) > 500 {
+		msg = string(r[:500]) + "…"
+	}
+	return msg
+}
+
 // savePartners writes what is held to disk; partnerMu held.
 func savePartners() {
 	b, err := json.Marshal(partnerState)
 	if err != nil {
+		return
+	}
+	// loadPartners reads a file that doesn't parse as no list and no Seen:
+	// it is kept aside before it is written over, and not written over
+	// when it can't be read. Every try writes the file (Tried, #3362), so
+	// without this the first one, offline too, lost the presets of the
+	// partners no longer listed that providers added from them still use.
+	if lastgood.KeepUnparsed(partnerCacheFile(), lastgood.Into[partnerCache]) != nil {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(partnerCacheFile()), 0o755)
@@ -298,10 +387,18 @@ func validPartners(in []Partner) []Partner {
 		for i := range p.Regions {
 			p.Regions[i].Decide = ""
 		}
+		p.SplitAccounts = slices.ContainsFunc(p.Regions, func(r Region) bool { return placeOf(r) == "china" }) &&
+			slices.ContainsFunc(p.Regions, func(r Region) bool { return placeOf(r) == "global" })
 		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" {
-			// the first region is the default, as a built-in preset's is
-			r := p.Regions[0]
+			// the first region is the default, as a built-in preset's is,
+			// unless it is China's or Global's and the user is in the
+			// other (homeRegion): its key page, site and catalog with it
+			r := p.Regions[homeRegion(p.Regions, inMainlandChina())]
 			p.Chat, p.Responses, p.Anthropic = r.Chat, r.Responses, r.Anthropic
+			p.KeysURL, p.Website, p.Catalog = cmp.Or(r.KeysURL, p.KeysURL), cmp.Or(r.Website, p.Website), cmp.Or(r.Catalog, p.Catalog)
+			if r.Website != "" {
+				p.SiteHost = r.SiteHost
+			}
 		}
 		p.Note = p.Notes["en"]
 		if !strings.HasPrefix(p.Icon, "file:") || IconFile(strings.TrimPrefix(p.Icon, "file:")) == "" {
@@ -310,6 +407,66 @@ func validPartners(in []Partner) []Partner {
 		out = append(out, p)
 	}
 	return out
+}
+
+// homeRegion is the region a new provider of a partner starts at: the
+// first, unless the first is China's or Global's and the other is listed
+// too, when it is the one where the user is (inChina, from this
+// computer's time zone). Unknown (0) keeps the first. Kimi Code lists
+// China first, and a user abroad started at a plan that isn't theirs.
+// Only a region named for China or Global counts: "Pay as you go ·
+// China" is another plan, and "Auto" or "Direct" no place.
+func homeRegion(rs []Region, inChina int) int {
+	if len(rs) < 2 || inChina == 0 {
+		return 0
+	}
+	first := placeOf(rs[0])
+	if first == "" {
+		return 0
+	}
+	want := "global"
+	if inChina > 0 {
+		want = "china"
+	}
+	if first == want {
+		return 0
+	}
+	if i := slices.IndexFunc(rs, func(r Region) bool { return placeOf(r) == want }); i > 0 {
+		return i
+	}
+	return 0
+}
+
+// placeOf says whether a region is China's ("china"), Global's ("global")
+// or neither (""), by its id or its name.
+func placeOf(r Region) string {
+	id, name := strings.ToLower(r.ID), strings.ToLower(strings.TrimSpace(r.Name))
+	switch {
+	case id == "cn" || id == "china" || name == "china" || name == "china mainland" || name == "mainland china":
+		return "china"
+	case id == "global" || id == "intl" || name == "global" || name == "international":
+		return "global"
+	}
+	return ""
+}
+
+// inMainlandChina says whether this computer's time zone is mainland
+// China's: 1 it is, -1 it isn't, 0 unknown (no zone could be read). A
+// var, so a test sets where it is.
+var inMainlandChina = func() int { return chinaZone(cmp.Or(LocalZone(), systemZoneName())) }
+
+// chinaZone reads a time zone's name: an IANA name, or Windows' own,
+// whose China Standard Time is Beijing's (Hong Kong's too, which Windows
+// doesn't tell apart). Hong Kong, Macau and Taipei have zones of their
+// own, so they are abroad.
+func chinaZone(name string) int {
+	switch name {
+	case "":
+		return 0
+	case "Asia/Shanghai", "Asia/Urumqi", "Asia/Chongqing", "Asia/Chungking", "Asia/Harbin", "Asia/Kashgar", "PRC", "China Standard Time":
+		return 1
+	}
+	return -1
 }
 
 func checkPartner(p Partner) error {
@@ -352,19 +509,51 @@ func partnerIcon(ctx context.Context, p Partner) string {
 	if p.IconURL == "" {
 		return "generic"
 	}
+	// an icon kept from the same URL is used as it is, so an hourly fetch
+	// doesn't download it again; a partner's new logo goes at a new URL
+	partnerMu.Lock()
+	loadPartners()
+	s, ok := partnerState.Seen[p.ID]
+	partnerMu.Unlock()
+	kept := ok && s.IconURL == p.IconURL && s.Icon != "" && s.Icon != "generic"
+	if kept {
+		if f := IconFile(strings.TrimPrefix(s.Icon, iconPrefix)); f != "" {
+			if _, err := os.Stat(f); err == nil {
+				return s.Icon
+			}
+		}
+	}
 	if icon, err := fetchPartnerIcon(ctx, p.IconURL); err == nil {
 		return icon
 	}
-	partnerMu.Lock()
-	defer partnerMu.Unlock()
-	loadPartners()
-	if s, ok := partnerState.Seen[p.ID]; ok && s.IconURL == p.IconURL {
+	if kept {
 		return s.Icon
 	}
 	return "generic"
 }
 
 var fetchPartnerIcon = FetchIcon
+
+// keptPartnerIcons are the pictures the partners listed now show, which
+// pruneIcons leaves (#3424): no provider points at a partner's logo until
+// one is added from it, so the prune after any save of providers.json
+// took it once it was an hour old, and the add sheet showed the partner
+// with the generic icon until the next fetch got the logo again.
+func keptPartnerIcons() []string {
+	if partnersSource() == "off" {
+		return nil
+	}
+	partnerMu.Lock()
+	defer partnerMu.Unlock()
+	loadPartners()
+	var out []string
+	for _, p := range partnerState.Partners {
+		if name, ok := strings.CutPrefix(p.Icon, iconPrefix); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
 
 // partnerPreset is the preset of a partner listed now or before, for a
 // provider added from it: one no longer listed isn't Sponsored.
@@ -394,7 +583,7 @@ func partnerPreset(id string) *PresetDef {
 // so it is waited for first.
 func resetPartners() {
 	claimPartnerFetch()
-	partnerState, partnerNext, partnerFetches = nil, time.Time{}, false
+	partnerState, partnerNext, partnerFetches, partnerLogged = nil, time.Time{}, false, ""
 	partnerMu.Unlock()
 }
 

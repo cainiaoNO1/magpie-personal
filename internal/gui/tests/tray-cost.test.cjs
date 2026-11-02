@@ -10,7 +10,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { openPart } = require("./reader.cjs");
+const { openPart, reach } = require("./reader.cjs"); // reach: wheeled to as a reader would, rows taller since their lines wrap whole (arculongus on Discord); a Playwright scroll is undone
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -66,6 +66,7 @@ async function open(browser, lang, posts, platform, width, over) {
   await context.addInitScript((p) => Object.defineProperty(Navigator.prototype, "platform", { get: () => p }), platform);
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   await page.route("**/*", server(lang, posts, over));
   await page.goto("http://magpie.test/?view=usage");
   await page.locator("#prefs").click();
@@ -110,7 +111,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           // the cost shown, as before
           assert.equal(await opts.nth(1).evaluate((b) => b.classList.contains("on")), true, "the cost on by default");
           // the row fits: nothing cut off nor pushed past the page
-          await row.scrollIntoViewIfNeeded();
+          await reach(page, row);
           const fit = await row.evaluate((r) => {
             const b = r.getBoundingClientRect(), s = r.querySelector("#trayCostSegs").getBoundingClientRect();
             return { over: r.scrollWidth - r.clientWidth, right: s.right - b.right, page: document.documentElement.scrollWidth - document.documentElement.clientWidth };

@@ -11,7 +11,7 @@ var envLine = regexp.MustCompile(`^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=
 
 // GetEnvFile reads one key from a dotenv file.
 func GetEnvFile(path, key string) (string, bool) {
-	raw, err := Read(path)
+	raw, err := readHeld(path)
 	if err != nil {
 		return "", false
 	}
@@ -58,6 +58,7 @@ func SetEnvFile(path string, kvs ...KV) error {
 			return "", false
 		})
 	}
+	lines = markEnv(lines, string(raw))
 	return WriteAtomic(path, []byte(joinLinesLike(lines, string(raw))))
 }
 
@@ -84,7 +85,9 @@ func DelEnvFile(path string, keys ...string) error {
 	if !changed {
 		return nil
 	}
-	if strings.TrimSpace(strings.Join(out, "")) == "" {
+	// a note magpie put above a key goes with it
+	out = markEnv(out, string(raw))
+	if strings.TrimSpace(strings.Join(withoutNotes(out), "")) == "" {
 		return Remove(path)
 	}
 	return WriteAtomic(path, []byte(joinLines(out)))

@@ -12,13 +12,13 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { reach, watchSettingsReads, settingsDrawn } = require("./reader.cjs");
+const { reach, wheelTo, watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const SECRET = "sk-proj-Tr1eDq8Wm3Rt6YxN2vLp";
 const PH = "{{API_KEY_ab12cd34}}";
 
-function serve(lang, posted) {
+function serve(lang, posted, shown = { from: SECRET, to: PH }) {
   let settings = { theme: "light", lang, tray: "panel", redact: true, redactPersonal: true };
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
@@ -45,7 +45,7 @@ function serve(lang, posted) {
       const { text } = req.postDataJSON();
       posted.push(["preview", text]);
       const block = settings.redactActions?.API_KEY === "block";
-      return json({ text: text.replace(SECRET, PH), hits: text.includes(SECRET) ? [{ kind: "API_KEY", by: "rule", action: block ? "block" : "", placeholder: PH, head: "sk-p", len: SECRET.length }] : [] });
+      return json({ text: text.replaceAll(shown.from, shown.to), hits: text.includes(shown.from) ? [{ kind: "API_KEY", by: "rule", action: block ? "block" : "", placeholder: shown.to, head: shown.from.slice(0, 4), len: shown.from.length }] : [] });
     }
     if (url.pathname.startsWith("/api/")) return json({});
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
@@ -69,6 +69,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await (await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(8000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], posted = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, posted));
@@ -81,7 +82,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(await acts.locator(".mask-act").evaluateAll((rs) => rs.map((r) => r.dataset.kind)), ["API_KEY", "PRIVATE_KEY", "TOKEN", "PASSWORD", "SECRET"]);
         assert.equal(await acts.locator(".mask-act .segs .opt.on").count(), 5);
         const more = acts.locator(".mask-act-more button");
-        await reach(page, more);
+        await wheelTo(page, more, 300); // under the masking card, a long wheel down at 640px
         await more.click();
         await acts.locator('.mask-act[data-kind="EMAIL"]').waitFor();
         assert.equal(await acts.locator(".mask-act").count(), 22, "every personal kind shown");
@@ -142,4 +143,33 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
     }
   }
+}
+
+// with "Keep a key's form" on the preview hands back a made-up key of the
+// real one's form, not a {{…}} placeholder: Try it marks it all the same,
+// and only it (#3599)
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: Try it marks a made-up key`, async (t) => {
+    const REAL = "sk_w3axCByTQgK1PxqPhfKTrJOLBqz6sbZv", MADE = "sk_hYQWRBFmdHNIo5XVT2VnIIGh4mmMiJNm";
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    const page = await (await browser.newContext({ viewport: { width: 1100, height: 900 }, reducedMotion: "reduce" })).newPage();
+    page.setDefaultTimeout(8000);
+    page.setDefaultNavigationTimeout(60000);
+    const errors = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    await page.route("**/*", serve("en", [], { from: REAL, to: MADE }));
+    await watchSettingsReads(page);
+    await page.goto("http://magpie.test/?view=settings&tab=privacy");
+    await settingsDrawn(page);
+    const box = page.locator("#maskTryList textarea.mask-try-in");
+    await reach(page, box);
+    await box.fill(`OPENAI_API_KEY=${REAL} sk_not_found_here, again ${REAL}`);
+    const out = page.locator("#maskTryList .mask-try-out");
+    await out.locator(".mask-try-hits").waitFor();
+    assert.equal(await out.locator(".mask-try-text").textContent(), `OPENAI_API_KEY=${MADE} sk_not_found_here, again ${MADE}`);
+    assert.deepEqual(await out.locator("mark.mo-ph").allTextContents(), [MADE, MADE]);
+    assert.equal(await out.locator("mark.mo-ph").first().getAttribute("title"), "API keys");
+    assert.deepEqual(errors, []);
+  });
 }

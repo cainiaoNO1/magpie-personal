@@ -51,6 +51,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await browser.newPage({ viewport: { width, height: 800 } });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang));
@@ -105,6 +106,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await browser.newPage({ viewport: { width, height: 800 } });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         for (const [name, c] of Object.entries(folded)) {
@@ -155,6 +157,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await browser.newPage({ viewport: { width, height: 800 } });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         let agent = { ...codex, stale: 2, staleCopies: [{ kind: "app", since: days(3) }, { kind: "daemon", since: days(1) }] };
@@ -187,6 +190,66 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await page.locator("#status").textContent(), restarted[lang]);
         assert.equal(await page.locator(`${row} .ag-stale-copy button`).count(), 0);
         if (process.env.ARTIFACT_DIR) await page.locator(row).screenshot({ path: path.join(process.env.ARTIFACT_DIR, `daemon-restart-${engine}-${lang}-${width}.png`) });
+        assert.deepEqual(errors, []);
+      });
+    }
+  }
+}
+
+// the Codex app's line has a Restart of its own (the owner, 10-23): magpie
+// asks, then restarts only the app-server of the app named by its bundle,
+// and says its window stays (yoshi037070: a quit and open opened a new one)
+const appName = { en: "The Codex app", zh: "Codex 应用", "zh-TW": "Codex 應用", ja: "Codex アプリ", de: "Die Codex-App" };
+const cancelSays = { en: "Cancel", zh: "取消", "zh-TW": "取消", ja: "キャンセル", de: "Abbrechen" };
+const reopened = { en: "Codex app-server restarted", zh: "Codex 的 app-server 已重启", "zh-TW": "Codex 的 app-server 已重新啟動", ja: "Codex の app-server を再起動しました", de: "App-Server von Codex neu gestartet" };
+const windowStays = { en: "window stays", zh: "窗口保持不变", "zh-TW": "視窗保持不變", ja: "ウィンドウはそのまま", de: "Fenster bleibt offen" };
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    for (const width of [980, 440]) {
+      test(`${engine} ${lang} ${width}px: the app's line restarts its app-server`, async (t) => {
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+        t.after(() => browser.close());
+        const page = await browser.newPage({ viewport: { width, height: 800 } });
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        const errors = [];
+        page.on("pageerror", (e) => errors.push(e.message));
+        let agent = { ...codex, stale: 1, staleCopies: [{ kind: "app", bundle: "/Applications/Codex.app", since: days(3) }] };
+        const asked = [];
+        const fake = serve(lang);
+        await page.route("**/*", async (route) => {
+          const url = new URL(route.request().url());
+          if (url.pathname === "/api/codex/app/reopen") {
+            asked.push(route.request().postDataJSON());
+            agent = { ...agent, stale: 0, staleCopies: [] };
+            return route.fulfill({ json: { ok: true } });
+          }
+          if (url.pathname === "/api/state") return route.fulfill({ json: { agents: [agent], profiles: [], settings: { lang, theme: "light" } } });
+          return fake(route);
+        });
+        await page.goto("http://magpie.test/?view=agents");
+        await page.locator(`${row} .ag-conn`).waitFor();
+        await page.locator(`${row} .ag-link`).click();
+        const go = page.locator(`${row} .ag-stale-copy button`);
+        await go.waitFor();
+        assert.equal((await go.textContent()).trim(), restartSays[lang]);
+        const box = await go.boundingBox();
+        assert.ok(box.x + box.width <= width, "past the window");
+        // asked first, in magpie's own dialog (微雨南山 and stones): Cancel
+        // quits nothing
+        await go.click();
+        const ask = page.locator("dialog.action-confirm[open]");
+        await ask.waitFor();
+        assert.ok((await ask.locator("h2").textContent()).includes(appName[lang]), await ask.locator("h2").textContent());
+        assert.ok((await ask.textContent()).includes(windowStays[lang]), await ask.textContent());
+        await ask.locator("button", { hasText: cancelSays[lang] }).click();
+        await ask.waitFor({ state: "detached" });
+        assert.deepEqual(asked, []);
+        await go.click();
+        await ask.locator("button.primary").click();
+        await page.waitForFunction((r) => !document.querySelector(r + " .ag-stale-copy"), row);
+        assert.deepEqual(asked, [{ bundle: "/Applications/Codex.app" }]);
+        assert.equal(await page.locator("#status").textContent(), reopened[lang]);
         assert.deepEqual(errors, []);
       });
     }

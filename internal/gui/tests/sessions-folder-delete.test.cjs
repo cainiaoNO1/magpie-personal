@@ -111,6 +111,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
@@ -159,7 +160,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await ask.waitFor();
       };
 
-      // every folder starts with its box, before its name, inside its row
+      // no box until Select; then every folder starts with its box,
+      // before its name, inside its row
+      assert.equal(await view.locator(".sm-check, .sm-folder-check").count(), 0, "no boxes before Select");
+      await view.locator(".sm-select").click();
       const boxes = view.locator(".row.sm-folder input.sm-folder-check");
       assert.equal(await boxes.count(), 3);
       for (const b of await boxes.all()) {

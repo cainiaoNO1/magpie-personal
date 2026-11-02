@@ -182,21 +182,17 @@ func cursorParentOf(f file) string {
 // the two files, in a folder of magpie's own that close removes; a large
 // store's copy is shared while it is unchanged (cursor_snapshot.go).
 func openCursorStore(path string) (db *sql.DB, closeDB func(), err error) {
-	open := func(p, query string) (*sql.DB, error) {
-		u := url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: query}
-		if len(u.Path) >= 2 && u.Path[1] == ':' {
-			u.Path = "/" + u.Path
-		}
-		db, err := sql.Open("sqlite", u.String())
-		if err != nil {
-			return nil, err
-		}
-		if err := db.Ping(); err != nil {
-			db.Close()
-			return nil, err
-		}
-		return db, nil
-	}
+	return OpenUntouched(path)
+}
+
+// OpenUntouched opens another app's SQLite database at path to read it,
+// as openCursorStore does, without writing a byte beside it: immutable
+// with no log to replay, from a copy of it and its log with one. A
+// database in WAL mode can't be opened read-only while its app is closed
+// (SQLite would make its -shm file), so a reader that needs it read
+// whether the app runs or not opens it this way. closeDB removes the copy.
+func OpenUntouched(path string) (db *sql.DB, closeDB func(), err error) {
+	open := openSQLite
 	if fi, err := os.Stat(path + "-wal"); err != nil || fi.Size() == 0 {
 		db, err := open(path, "immutable=1")
 		if err != nil {
@@ -212,6 +208,23 @@ func openCursorStore(path string) (db *sql.DB, closeDB func(), err error) {
 		return nil, nil, err
 	}
 	return db, func() { db.Close(); os.RemoveAll(tmp) }, nil
+}
+
+// openSQLite opens the SQLite database at p, with query as its URI's.
+func openSQLite(p, query string) (*sql.DB, error) {
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: query}
+	if len(u.Path) >= 2 && u.Path[1] == ':' {
+		u.Path = "/" + u.Path
+	}
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func copyFile(from, to string) error {
@@ -232,6 +245,9 @@ func copyFile(from, to string) error {
 }
 
 func cursorFiles() []file {
+	if !Reads("cursor") {
+		return nil
+	}
 	paths, _ := filepath.Glob(filepath.Join(CursorDir(), "chats", "*", "*", "store.db"))
 	var out []file
 	for _, p := range paths {

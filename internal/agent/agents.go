@@ -17,6 +17,7 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
@@ -38,8 +39,109 @@ func init() {
 	sessions.WSLHomes = wslHomes
 	sessions.WSLRunning = WSLRunning
 	sessions.WSLOff = func() bool { return !wslLooks() }
+	// an agy conversation started on magpie's gateway is picked up again
+	// there, with the variables and --model it was started with
+	sessions.AgyStart = func() string {
+		home, _ := homes()
+		return agy(home).Launch()
+	}
 	// a Copilot CLI signed in inside a running distro (#723)
-	provider.CopilotWSLHomes = copilotWSLHomes
+	provider.CopilotWSLDirs = copilotWSLDirs
+	// the Codex app's app-server is restarted when magpie becomes Codex's
+	// provider for its used-up ChatGPT account, and when it stops being it;
+	// and when Codex is connected or disconnected, or its route otherwise
+	// changes, so a running app sends where its config now says
+	provider.CodexAppRoute = codexAppRoute
+	// but not when Codex's account is switched while its provider takes
+	// no ChatGPT account: the app-server goes by none
+	provider.CodexNoAccount = codexNoAccount
+	// and when none starts in place of the one ended, the app is
+	// reopened on Windows, where its stdout was held open
+	provider.CodexAppOpen = codexAppOpen
+	provider.CodexAppReopen = codexAppReopen
+	// and what the Codex app holds is read while Codex takes magpie's
+	// models beside its sign-in, Codex switched off in magpie or not
+	provider.CodexHoldMatters = func() bool {
+		home, _ := homes()
+		a := codex(home)
+		return a.HoldMatters != nil && a.HoldMatters()
+	}
+}
+
+// codexAppRoute is where Codex's config sends it, as the app-server reads
+// it at its start: the keys magpie writes for that, never one the Codex
+// app writes itself (model, model_reasoning_effort); and whether magpie
+// is Codex's provider for its used-up ChatGPT account (AppOut). Not known
+// when Codex's config can't be read.
+//
+// The model list (model_catalog_json, the file and what it holds) is not
+// in it. A change of route ends the app's app-server, and the ChatGPT app
+// takes that as a crash and relaunches. The catalog follows magpie's names
+// and the effort new sessions start at, which the app saves on each pick,
+// so a route that hashed it ended the app every few minutes
+// (indekkusu141209 on X, #4550). A new list is read at the app's next
+// launch, and the Agents row offers a Restart for it (StaleCopies).
+func codexAppRoute() (route string, out, known bool) {
+	// asked every 3s for as long as magpie runs: the config looked at once
+	// for its keys, not once for each (#1665)
+	defer filememo.Hold()()
+	home, _ := homes()
+	a := codex(home)
+	// opened, not read: a config.toml of 1.5 MB (Codex keeps every
+	// project's trust level in it) read whole every 3s was 1.55 GB of a
+	// live magpie's 33 GB in 53 minutes; the keys below come from filememo
+	if f, err := os.Open(a.Path); err == nil {
+		f.Close()
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", false, false
+	}
+	out = a.AppOut != nil && a.AppOut()
+	var b strings.Builder
+	for _, k := range []string{"model_provider", "openai_base_url"} {
+		v, _ := edit.GetTOMLTop(a.Path, k)
+		b.WriteString(k + "=" + v + "\n")
+	}
+	t, _ := edit.GetTOMLTable(a.Path, "model_providers."+magpieID)
+	b.WriteString("magpie.base_url=" + t["base_url"] + "\n")
+	// and whether it requires OpenAI auth, which decides whether the app
+	// has its ChatGPT account at all (openaiAuth in codex.go): read as the
+	// app-server starts, like the rest
+	b.WriteString("magpie.requires_openai_auth=" + t["requires_openai_auth"] + "\n")
+	if out {
+		b.WriteString("out\n")
+	}
+	return b.String(), out, true
+}
+
+// codexNoAccount is whether the provider Codex's config.toml names takes
+// no ChatGPT account: a model_provider whose [model_providers] table
+// doesn't say requires_openai_auth = true (magpie's with the user's own
+// false, or magpie as the provider with no sign-in to keep). Codex then
+// sends the table's own key and its app-server reads no account
+// (codex-rs ModelProviderInfo::account_state, resolve_provider_auth), so
+// switching the account in auth.json changes nothing a running Codex
+// goes by. The built-in openai provider, a provider with no table here, a
+// profile (which may name another provider) or a config that can't be
+// read is false: those may go by the account.
+func codexNoAccount() bool {
+	defer filememo.Hold()()
+	home, _ := homes()
+	a := codex(home)
+	if _, err := os.ReadFile(a.Path); err != nil {
+		return false
+	}
+	if p, _ := edit.GetTOMLTop(a.Path, "profile"); p != "" {
+		return false
+	}
+	id, _ := edit.GetTOMLTop(a.Path, "model_provider")
+	if id == "" || id == "openai" {
+		return false
+	}
+	t, err := edit.GetTOMLTable(a.Path, "model_providers."+id)
+	if err != nil || t == nil {
+		return false
+	}
+	return t["requires_openai_auth"] != "true"
 }
 
 // others are clients that reach the gateway without being agents magpie
@@ -52,6 +154,15 @@ var others = []*Agent{
 	// ("pi-desktop/0.1.0"), it is told apart from Pi by that name, which
 	// Pi's "pi-" would take otherwise (#1966, dgmico)
 	{ID: "pi-desktop", Name: "PI-Desktop", Icon: "pi", UA: []string{"pi-desktop"}},
+	// Kimi Code Desktop runs Kimi Code's engine on ~/.kimi-code, so it
+	// reaches magpie through Kimi Code's config, under a client name of
+	// its own ("kimi-code-desktop/…", jiabubu on Discord). Its icon is the
+	// app's own, from KimiCode-1.2.1-win-x64.exe's build/icon.ico.
+	{ID: "kimi-code-desktop", Name: "Kimi Code Desktop", Icon: "kimi-code-desktop", UA: []string{"kimi-code-desktop"}},
+	// Raft (slock's raft-computer) runs Pi in each of its agents' folders;
+	// Sessions lists those as Raft's (internal/sessions/raft.go), while
+	// their requests say "pi (…)" and are Pi's
+	{ID: "raft", Name: "Raft", Icon: "generic"},
 }
 
 // Clients is everyone whose requests the gateway knows by name: every
@@ -87,6 +198,21 @@ func homes() (home, cfg string) {
 
 // builtins are the agents magpie has wiring of its own for.
 func builtins(home, cfg string) []*Agent {
+	return append(onMachine(home, cfg), wslAgents()...)
+}
+
+// local is All() without the agents in WSL distros, which wsl.exe is asked
+// for: what start-up moves look in, on every command, `magpie version`
+// too, and the moves came before WSL agents. A wsl.exe that hangs held each
+// command 20s, its two listings' timeouts.
+func local() []*Agent {
+	home, cfg := homes()
+	own := onMachine(home, cfg)
+	return append(own, pluggedAgents(home, own, nil)...)
+}
+
+// onMachine are builtins but those in WSL.
+func onMachine(home, cfg string) []*Agent {
 	return append([]*Agent{
 		claude(home),
 		claudeDesktop(home),
@@ -94,6 +220,7 @@ func builtins(home, cfg string) []*Agent {
 		codex(home),
 		gemini(home),
 		agy(home),
+		antigravity(home),
 		opencode(home, cfg),
 		openChamber(home, cfg),
 		mimocode(home, cfg),
@@ -101,6 +228,7 @@ func builtins(home, cfg string) []*Agent {
 		pi(home),
 		stepcode(home),
 		mothx(home),
+		penguin(home),
 		aside(home),
 		omo(home),
 		primeAgent(home),
@@ -130,6 +258,8 @@ func builtins(home, cfg string) []*Agent {
 		empryo(home),
 		ante(home),
 		astrbot(home),
+		qwenpaw(home),
+		openClaw(home),
 		jcode(home),
 		miniMax(home),
 		droid(home),
@@ -144,15 +274,19 @@ func builtins(home, cfg string) []*Agent {
 		codebuddy(home),
 		pencil(home),
 		openPencil(home, cfg),
+		openBot(home, cfg),
+		newMax(home),
 		raycast(home),
+		kiroCrew(home),
 		t3code(home),
 		hanako(home),
 		atomcode(home),
 		snow(home),
 		alma(),
 		cindy(),
+		aionui(),
 		lody(home),
-	}, append(ompProfiles(home), wslAgents()...)...)
+	}, append(ompProfiles(home), qwenpawAgents(home)...)...)
 }
 
 // ---- accessors -------------------------------------------------------------
@@ -314,32 +448,47 @@ func ownOptionsFrom(native func(p string) []catalog.Model, authFile string, cur 
 	sort.Strings(providers)
 	var out []Option
 	for _, p := range providers {
-		name := catalog.ProviderName(p)
-		if name == "" {
-			name = nativeProviderNames[p]
+		if native == nil {
+			out = append(out, ownBuilt.shared(p, func() []Option { return ownProvider(nil, p) })...)
+		} else {
+			out = append(out, ownProvider(native, p)...)
 		}
-		if name == "" {
-			name = p
-		}
-		var ms []catalog.Model
-		if native != nil {
-			ms = native(p)
-		}
-		if len(ms) == 0 {
-			ms = catalog.Provider(p)
-		}
-		if len(ms) == 0 {
-			ms = codexServed(p)
-		}
-		opts := group(name, options(ms, p+"/"))
-		if ic := providerIcon(p); ic != "" {
-			for i := range opts {
-				opts[i].GroupIcon = ic
-			}
-		}
-		out = append(out, opts...)
 	}
 	return out
+}
+
+// ownBuilt is ownProvider's options built last per provider, for agents
+// without a registry of their own: Goose's model field asked them each
+// poll, for the picker and again for Drift, each provider's models made
+// into options anew, 20 MB of forty polls with real accounts.
+var ownBuilt stampedLists[Option]
+
+// ownProvider is the options of one provider an agent reaches on its own.
+func ownProvider(native func(p string) []catalog.Model, p string) []Option {
+	name := catalog.ProviderName(p)
+	if name == "" {
+		name = nativeProviderNames[p]
+	}
+	if name == "" {
+		name = p
+	}
+	var ms []catalog.Model
+	if native != nil {
+		ms = native(p)
+	}
+	if len(ms) == 0 {
+		ms = catalog.Provider(p)
+	}
+	if len(ms) == 0 {
+		ms = codexServed(p)
+	}
+	opts := group(name, options(ms, p+"/"))
+	if ic := providerIcon(p); ic != "" {
+		for i := range opts {
+			opts[i].GroupIcon = ic
+		}
+	}
+	return opts
 }
 
 // ---- agents ----------------------------------------------------------------
@@ -362,7 +511,10 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 	models := magpieModels(catalog) // the catalog is the agent's
 	switch shape {
 	case "opencode":
-		ms := map[string]any{}
+		// models in the order magpieModels has them (#4575): OpenCode lists
+		// the models in the file's key order, and a map's keys marshal
+		// sorted — the variants under each kept theirs since #713
+		ms := orderedJSON{}
 		for _, m := range models {
 			e := map[string]any{"name": m.Name}
 			// modalities alone says a model takes images: OpenCode 1 takes
@@ -382,7 +534,13 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 				e["reasoning"] = true
 			}
 			e["variants"] = openCodeVariants(m.Efforts, m.CodexFast)
-			ms[m.ID] = e
+			// OpenCode counts a session's cost by it, in USD per million
+			// tokens (models.dev's cost; OpenCode 2.0.25 reads input,
+			// output, cache_read, cache_write), and counted 0 without it
+			if p := m.Price; p != nil {
+				e["cost"] = map[string]any{"input": p.Input, "output": p.Output, "cache_read": p.CacheRead, "cache_write": p.CacheWrite}
+			}
+			ms = append(ms, jsonPair{m.ID, e})
 		}
 		return map[string]any{"npm": "@ai-sdk/openai-compatible", "name": "magpie",
 			"options": map[string]any{"baseURL": gw + "/v1", "apiKey": openCodeKeyAt(catalog, gw)}, "models": ms}
@@ -401,8 +559,15 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 			if tokens == 0 {
 				tokens = 16384
 			}
-			ms = append(ms, map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": tokens,
-				"can_reason": len(m.Efforts) > 0})
+			cm := map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": tokens,
+				"can_reason": len(m.Efforts) > 0}
+			// Crush counts a session's cost by it (catwalk's cost_per_1m_*,
+			// Crush 0.39.3): in_cached is a cache write, out_cached a read
+			if p := m.Price; p != nil {
+				cm["cost_per_1m_in"], cm["cost_per_1m_out"] = p.Input, p.Output
+				cm["cost_per_1m_in_cached"], cm["cost_per_1m_out_cached"] = p.CacheWrite, p.CacheRead
+			}
+			ms = append(ms, cm)
 		}
 		if ms == nil {
 			ms = []map[string]any{}
@@ -411,7 +576,7 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 	case "pi":
 		var ms []map[string]any
 		for _, m := range models {
-			ms = append(ms, piModelJSON(m, gw, true))
+			ms = append(ms, piModelJSON(piAsked(catalog, m), gw, true))
 		}
 		if ms == nil {
 			ms = []map[string]any{}
@@ -465,12 +630,16 @@ func openCodeKept(path string, value func() any) func() any {
 		}
 		var have map[string]json.RawMessage
 		block, _ := v.(map[string]any)
-		ms, _ := block["models"].(map[string]any)
+		ms, _ := block["models"].(orderedJSON)
 		if json.Unmarshal([]byte(raw), &have) != nil || ms == nil {
 			return v
 		}
 		for id, h := range have {
-			e, _ := ms[id].(map[string]any)
+			i := slices.IndexFunc(ms, func(p jsonPair) bool { return p.k == id })
+			if i < 0 {
+				continue
+			}
+			e, _ := ms[i].v.(map[string]any)
 			ours, ok := e["variants"].(orderedJSON)
 			var was struct {
 				Variants json.RawMessage `json:"variants"`
@@ -514,9 +683,34 @@ func objectPairs(raw []byte) orderedJSON {
 	return out
 }
 
+// piAsked is m as agentID's models.json can ask it: without the Gemini API
+// where nothing that reads the file can be trusted to stream
+// google-generative-ai, so such a model stays on the provider's Chat,
+// which the gateway translates.
+//
+//   - StepCode registers no google-generative-ai stream, only Pi's
+//     anthropic-messages, openai-completions and openai-responses
+//     (packages/providers/src/compat.ts BUILTIN_APIS, Step-Code at
+//     90a57820), though its docs list it (#3282).
+//   - Pi's own agent folder is read by every app that runs Pi's SDK on it,
+//     not by Pi alone. Raft (slock's raft-daemon, the Pi runtime of its
+//     agents) opens ~/.pi/agent/models.json (or PI_CODING_AGENT_DIR's) and
+//     hands every request its own fetch (installProviderHttpClient), which
+//     pi-ai's Google adapter refuses before sending: "Custom fetch is not
+//     supported by the Google Generative AI adapter" (pi-ai 0.83.0 and
+//     1.4.0, api/google-generative-ai.js; yunfei9958 on X). Per-request
+//     fetch is a feature of Pi's SDK, so any other host of it can do the
+//     same. OmO's and Prime Agent's folders are their own, and keep it.
+func piAsked(agentID string, m catalog.Model) catalog.Model {
+	if agentID == "stepcode" || agentID == "pi" {
+		m.APIs = slices.DeleteFunc(slices.Clone(m.APIs), func(a string) bool { return a == string(provider.Gemini) })
+	}
+	return m
+}
+
 // piModelJSON is one of magpie's models as an entry of Pi's models.json.
-// native asks it on the API its provider speaks natively (a model's own
-// api and baseUrl); without it the model is left on the provider's
+// native selects the model's preferred gateway API (its own api and
+// baseUrl); without it the model is left on the provider's
 // openai-completions (Pencil, pencil.go).
 func piModelJSON(m catalog.Model, gw string, native bool) map[string]any {
 	// reasoning lets Pi offer its thinking levels for the model: as
@@ -537,17 +731,35 @@ func piModelJSON(m catalog.Model, gw string, native bool) map[string]any {
 	switch {
 	case !native:
 	case slices.Contains(m.APIs, string(provider.Responses)):
+		// strict left out of a tool of a turn asked there is taken as a
+		// strict-mode schema, every property required, optional ones
+		// filled (#3055): pi-ai says strict: false on an ordinary tool
+		// only when the model's compat says so
 		e["api"] = "openai-responses"
+		e["compat"] = map[string]any{"supportsStrictMode": true}
 	case slices.Contains(m.APIs, string(provider.Anthropic)):
 		e["api"], e["baseUrl"] = "anthropic-messages", gw
 		if gateway.AdaptiveThinking(m.ID) {
 			e["compat"] = map[string]any{"forceAdaptiveThinking": true}
 		}
+	case slices.Contains(m.APIs, string(provider.Gemini)):
+		e["api"], e["baseUrl"] = "google-generative-ai", gw+"/v1beta"
 	}
 	if m.Images {
 		e["input"] = []string{"text", "image"}
 	}
 	if levels := piThinkingLevels(m.Efforts, e["api"] == "anthropic-messages" && gateway.ThinksOnlyWhenAsked(m.ID)); levels != nil {
+		// on google-generative-ai Pi resolves a level through the map to
+		// one of Gemini's four (pi-ai's resolveGoogleThinkingLevel) and
+		// throws before sending on any other name, so a level the model
+		// calls something else (xhigh, max) is hidden there (#3282)
+		if e["api"] == "google-generative-ai" {
+			for l, v := range levels {
+				if s, ok := v.(string); ok && l != "off" && !slices.Contains([]string{"minimal", "low", "medium", "high"}, strings.ToLower(s)) {
+					levels[l] = nil
+				}
+			}
+		}
 		e["thinkingLevelMap"] = levels
 	}
 	// without it Pi takes every model for a 128K one, and compacts
@@ -713,11 +925,32 @@ func (o orderedJSON) MarshalJSON() ([]byte, error) {
 	return append(b, '}'), nil
 }
 
+// modelEffort is the model's own name for level, one of pi-ai's (none for
+// its off): level itself when efforts name it, else the one of efforts
+// that names it in a vendor's words (catalog.EffortAliases: Trae's light
+// and extra_high, as Our Free Model's plugin lists them), "" when it takes
+// none such. dsh and Pi offered only the levels named in pi-ai's words, so
+// such a model's light, high and extra_high showed in dsh as high alone
+// (nianshou5 on Discord). The name returned is what the agent sends, so
+// the vendor gets the level in the words it listed.
+func modelEffort(efforts []string, level string) string {
+	if slices.Contains(efforts, level) {
+		return level
+	}
+	for _, e := range efforts {
+		if catalog.EffortLevel(e) == level {
+			return e
+		}
+	}
+	return ""
+}
+
 // piThinkingLevels is the thinkingLevelMap for a model's efforts: every one
 // of Pi's levels (piLevels, pi-ai's EXTENDED_THINKING_LEVELS), the model's
-// own mapped to themselves and the others null. Pi builds /thinking from
-// the map (getSupportedThinkingLevels): a level set to null is hidden and
-// skipped, while one left out is offered (all but xhigh and max), so a map
+// own mapped to its name for it (modelEffort) and the others null. Pi
+// builds /thinking from the map (getSupportedThinkingLevels): a level set
+// to null is hidden and skipped, while one left out is offered (all but
+// xhigh and max), so a map
 // naming only max had Pi offer minimal and medium too, which the vendor
 // turned away (#243). Pi's off is the model's none when it takes one. A
 // model without none has off hidden — Pi's off asks a Responses model for
@@ -735,11 +968,11 @@ func piThinkingLevels(efforts []string, claudeOff bool) map[string]any {
 	}
 	levels := map[string]any{}
 	for _, l := range piLevels {
-		e := l
+		w := l
 		if l == "off" {
-			e = "none"
+			w = "none"
 		}
-		if slices.Contains(efforts, e) {
+		if e := modelEffort(efforts, w); e != "" {
 			levels[l] = e
 		} else {
 			levels[l] = nil
@@ -769,7 +1002,7 @@ func openCodeLike(at place, id, name, icon, bin, dir, auth string, ua []string, 
 	provider := openCodeKept(path, func() any { return magpieProviderJSONAt("opencode", id, at.gw()) })
 	opts := func(key string) func(map[string]string) []Option {
 		return func(cur map[string]string) []Option {
-			return append(ownOptions(auth, cur[key]), viaMagpie(id, magpieID+"/")...)
+			return withVia(ownOptions(auth, cur[key]), id, magpieID+"/")
 		}
 	}
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
@@ -808,6 +1041,7 @@ func openCodeLike(at place, id, name, icon, bin, dir, auth string, ua []string, 
 			return wiringOff(name, path, func(k string) (string, bool) { return edit.GetJSON(path, "provider."+magpieID+".options."+k) },
 				"baseURL", at.v1(), "apiKey", openCodeKeyAt(id, at.gw()))
 		},
+		ListOnly: true,
 		Sync: func() error {
 			// a model of magpie's chosen, but its provider gone from the
 			// file: put it back, or the agent has nothing to send it to
@@ -910,7 +1144,7 @@ func opencode(home, cfg string) *Agent {
 // distro's variables, aren't read; OpenChamber, a Windows app, isn't there.
 func opencodeIn(at place) *Agent {
 	return openCodeLike(at, "opencode", "OpenCode", "opencode", "opencode",
-		filepath.Join(at.home, ".config", "opencode"), filepath.Join(at.home, ".local", "share", "opencode", "auth.json"),
+		at.join(".config", "opencode"), at.join(".local", "share", "opencode", "auth.json"),
 		[]string{"opencode"}, "oc")
 }
 
@@ -918,7 +1152,7 @@ func opencodeIn(at place) *Agent {
 // MIMOCODE_HOME isn't read there.
 func mimocodeIn(at place) *Agent {
 	return openCodeLike(at, "mimocode", "MiMo Code", "mimocode", "mimo",
-		filepath.Join(at.home, ".config", "mimocode"), filepath.Join(at.home, ".local", "share", "mimocode", "auth.json"),
+		at.join(".config", "mimocode"), at.join(".local", "share", "mimocode", "auth.json"),
 		[]string{"mimocode"}, "mimo")
 }
 
@@ -995,7 +1229,7 @@ func piDir(at place) string {
 			return d
 		}
 	}
-	return filepath.Join(at.home, ".pi", "agent")
+	return at.join(".pi", "agent")
 }
 
 // homeDir is the folder an agent's variable names, "~" and "~/…" expanded
@@ -1131,6 +1365,7 @@ func piLikeKeyed(at place, id, name, dir string, key func() string) *Agent {
 			return wiringOff(name, modelsPath, func(k string) (string, bool) { return edit.GetJSON(modelsPath, "providers."+magpieID+"."+k) },
 				"baseUrl", at.v1(), "apiKey", key())
 		},
+		ListOnly: true,
 		Sync: func() error {
 			if err := syncJSON(modelsPath, "providers."+magpieID, block); err != nil {
 				return err
@@ -1183,7 +1418,7 @@ func piLikeKeyed(at place, id, name, dir string, key func() string) *Agent {
 					return piScopeWith(path, v)
 				},
 				Options: func(cur map[string]string) []Option {
-					return append(ownOptionsFrom(piRegistry(id), auth, cur["model"]), viaMagpie(id, magpieID+"/")...)
+					return withVia(ownOptionsFrom(piRegistry(id), auth, cur["model"]), id, magpieID+"/")
 				},
 			},
 			{
@@ -1235,7 +1470,7 @@ func goose(home, cfg string) *Agent { return gooseIn(here(home), cfg) }
 // layout and its custom provider names the gateway as the distro reaches
 // it, with the key it takes from there.
 func gooseIn(at place, cfg string) *Agent {
-	path := filepath.Join(cfg, "goose", "config.yaml")
+	path := filepath.Join(at.open(filepath.Join(cfg, "goose")), "config.yaml")
 	if runtime.GOOS == "windows" && at.spell == nil {
 		if app := appdir.Getenv("APPDATA"); app != "" {
 			path = filepath.Join(app, "Block", "goose", "config", "config.yaml")
@@ -1260,7 +1495,8 @@ func gooseIn(at place, cfg string) *Agent {
 			return wiringOff("Goose", provider, func(k string) (string, bool) { return edit.GetJSON(provider, k) },
 				"base_url", at.v1(), "headers.Authorization", "Bearer "+gooseKey(at))
 		},
-		Sync: func() error { return syncGooseProvider(provider, at) },
+		ListOnly: true,
+		Sync:     func() error { return syncGooseProvider(provider, at) },
 		// goose loads custom_providers when it starts
 		Notice: func() string {
 			if p, _ := gooseActive(path); p == gooseProviderID && Running(`Goose\.app/`, `(^|/)goose( |$)`) {
@@ -1302,7 +1538,7 @@ func gooseIn(at place, cfg string) *Agent {
 				// only the native providers this goose is set up with (#987:
 				// every one of four was listed, OpenRouter's hundreds of
 				// models on a goose that had only magpie)
-				return append(ownOptions("", cur["model"], gooseConfigured(path, keyEnv)...), viaMagpie("goose", gooseProviderID+"/")...)
+				return withVia(ownOptions("", cur["model"], gooseConfigured(path, keyEnv)...), "goose", gooseProviderID+"/")
 			},
 		}, {
 			// GOOSE_THINKING_EFFORT, the effort goose asks of a model that
@@ -1372,6 +1608,11 @@ func copilot(home string) *Agent {
 		// folder says nothing of the CLI: its settings.json or the copilot
 		// command does (#1495)
 		dirShared: true,
+		// VS Code 1.143 ships a copilot launcher of its own in
+		// bin\copilot-shim in its install folder, which is on the user's
+		// PATH, and running it only asks for the CLI to be installed
+		// (#3269): a command of the editor's is not the CLI
+		binNot: editorLauncher,
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: jsonGet(path, "model"),
@@ -1406,6 +1647,71 @@ func copilot(home string) *Agent {
 	}
 }
 
+// editorLauncher reports whether bin is a launcher an editor ships beside
+// itself, not the CLI it is named after (#3269): an editor's install is
+// told by the product.json it keeps beside its program, as
+// vscodeCodeBinary tells one. VS Code 1.143 puts its copilot launcher in
+// <install>\bin\copilot-shim, with <install>\resources\app\product.json
+// in a Windows or Linux install; a Mac's app keeps bin in
+// Contents/Resources/app, beside product.json. So only bin's own folder
+// and the two above it are looked in, never further up, where a folder of
+// the user's (a home, a checkout of an editor's source) may hold a
+// product.json of its own. A link on PATH is judged where it points.
+// A copilot a user installed itself, in npm's global folder, Homebrew's,
+// winget's Links or scoop's shims, is still the CLI.
+//
+// VS Code's versioned Windows layout (1.139's win32VersionedUpdate) moves
+// that product.json one level under the install root: the app's payload
+// lives in a folder named for the build's commit — the short hash, ten
+// lowercase hex digits, 2c33b50b16 for 1.144.0 — with resources\app under
+// it and bin beside it (microsoft/vscode#343045; Tony-ooo's 1.144.0, whose
+// every product.json the six places above miss, #3269). A folder of the
+// user's beside bin is not named as a commit's short hash is, so the cap
+// keeps its meaning: nothing wider than the same three folders is read.
+func editorLauncher(bin string) bool {
+	if real, err := filepath.EvalSymlinks(bin); err == nil {
+		bin = real
+	}
+	dir, err := filepath.Abs(filepath.Dir(bin))
+	if err != nil {
+		return false
+	}
+	for range 3 {
+		if isFile(filepath.Join(dir, "product.json")) ||
+			isFile(filepath.Join(dir, "resources", "app", "product.json")) {
+			return true
+		}
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() && commitHashName(e.Name()) &&
+					isFile(filepath.Join(dir, e.Name(), "resources", "app", "product.json")) {
+					return true
+				}
+			}
+		}
+		up := filepath.Dir(dir)
+		if up == dir {
+			break
+		}
+		dir = up
+	}
+	return false
+}
+
+// commitHashName is whether a folder is named as a build's short commit
+// hash is: ten lowercase hexadecimal digits (16507d91be, 2c33b50b16).
+func commitHashName(name string) bool {
+	if len(name) != 10 {
+		return false
+	}
+	for _, c := range []byte(name) {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
 func crush(home, cfg string) *Agent {
 	path := filepath.Join(cfg, "crush", "crush.json")
 	// Crush saves the models its own picker chooses to its data file, and
@@ -1431,8 +1737,8 @@ func crush(home, cfg string) *Agent {
 // place for it.
 func crushIn(at place) *Agent {
 	// Crush's data file is in Linux's place there too
-	return crushAt(at, filepath.Join(at.home, ".config", "crush", "crush.json"),
-		filepath.Join(at.home, ".local", "share", "crush", "crush.json"))
+	return crushAt(at, at.join(".config", "crush", "crush.json"),
+		at.join(".local", "share", "crush", "crush.json"))
 }
 
 // crushAt is Crush with its config at path and its data file at data,
@@ -1481,7 +1787,7 @@ func crushAt(at place, path, data string) *Agent {
 					}
 				}
 			}
-			return append(ownOptions("", cur[key], extra...), viaMagpie("crush", magpieID+"/")...)
+			return withVia(ownOptions("", cur[key], extra...), "crush", magpieID+"/")
 		}
 	}
 	// replacePick puts v in place of the whole models.<type> object in the
@@ -1541,6 +1847,7 @@ func crushAt(at place, path, data string) *Agent {
 			return wiringOff("Crush", path, func(k string) (string, bool) { return get("providers." + magpieID + "." + k) },
 				"base_url", at.v1(), "api_key", at.gwKey())
 		},
+		ListOnly: true,
 		Sync: func() error {
 			return syncJSON(path, "providers."+magpieID, provider)
 		},

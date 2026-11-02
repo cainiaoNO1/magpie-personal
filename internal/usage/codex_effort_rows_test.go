@@ -8,6 +8,7 @@ import (
 	"slices"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/yetone/magpie/internal/sessions"
 )
@@ -52,6 +53,12 @@ func TestCodexEffortRowsAreTheWholeLedgers(t *testing.T) {
 				t.Fatalf("%s, %s:\n got %+v\nwant %+v", p, name, got, whole)
 			}
 		}
+		// read through the request index, as CodexModelEffort builds it
+		// (#3493): the same sums as the whole ledger's thread rows
+		want := codexModelEffort(threadRows(ledgerOfAt(p, Filter{}, now, sessions.Calls)))
+		if got := codexEffortOfIndex(readRequestState(now), p, now); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s through the index:\n got %+v\nwant %+v", p, got, want)
+		}
 	}
 }
 
@@ -82,11 +89,15 @@ func TestCodexModelEffortLetsUnrelatedCallsGo(t *testing.T) {
 	if got := CodexModelEffort(All); len(got["main-a"]) != 1 {
 		t.Fatalf("main-a's consumption: %+v", got)
 	}
-	visit := measure(func() { Visit(time.Time{}, func(Record) {}) })
+	// a packed row a call: the bar was a visit of the log, but a visit
+	// decodes into a lent buffer now (#2278), and took 74 KB or 289 KB as
+	// a pool kept it or not
+	rows := uint64(calls+1) * uint64(unsafe.Sizeof(packedRow{}))
 	build := measure(func() { CodexModelEffort(All) })
-	t.Logf("a build allocated %d bytes, a visit %d", build, visit)
-	// the visit itself, the thread's own rows and the sets of its ids
-	if build > visit+visit/2+256<<10 {
-		t.Fatalf("a build over %d unrelated calls allocated %d bytes, a visit of the log %d", calls, build, visit)
+	t.Logf("a build allocated %d bytes, the log's rows are %d", build, rows)
+	// the thread's own rows and the sets of its ids, less than a packed
+	// row for each unrelated call
+	if build > rows {
+		t.Fatalf("a build over %d unrelated calls allocated %d bytes, a packed row each is %d", calls, build, rows)
 	}
 }

@@ -214,6 +214,14 @@ func (s *signInFlow) pluginDone(saved plugin.Saved, err error) {
 // method does, beside the accounts signed in already; it gives the
 // provider's magpie id.
 func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]string, key string) (string, error) {
+	// with subscription accounts off, a key is refused as a browser
+	// sign-in is (StartPluginSignInWith), but for a public plugin's: one
+	// saved would be signed in and listed nowhere
+	if settings.AccountDiscoveryOff() {
+		if pp, ok := PluginOf(PluginID(id)); !ok || !publicPlugin(pp) {
+			return "", errAccountDiscoveryOff
+		}
+	}
 	if strings.TrimSpace(key) == "" {
 		pp, ok := PluginOf(PluginID(id))
 		if !ok || method < 0 || method >= len(pp.Methods) || pp.Methods[method].Type != "api" || !pp.Methods[method].Keyless {
@@ -255,7 +263,7 @@ func pluginUsing(saved plugin.Saved, user string) bool {
 func pluginUser(saved plugin.Saved) string {
 	for _, pp := range plugin.Cached() {
 		if pp.ID == saved.Provider {
-			return pluginLabels(pp)[saved.Account]
+			return pluginNames(pp)[saved.Account]
 		}
 	}
 	return ""

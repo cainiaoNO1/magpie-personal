@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -288,6 +290,25 @@ func TestAsyncGatewayOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// a key of the user's own value, made for a friend, is a named key too
+	friend, err := access.Update("add-key", access.Change{Name: "Friend", Secret: "a-friends-own-key-0042"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the sharing key magpie makes and writes into this computer's agents
+	if err := access.ConfigureLAN(true, false); err != nil {
+		t.Fatal(err)
+	}
+	mine := access.LANSecret()
+	if mine == "" || mine == key {
+		t.Fatalf("no default sharing key: %q", mine)
+	}
+	// this computer's own network address, and a WSL distro's NAT network
+	oldOwn, oldNets := ownAddr, WSLNets
+	ownAddr = func(a netip.Addr) bool { return a == netip.MustParseAddr("192.168.50.7") }
+	_, wslNet, _ := net.ParseCIDR("172.28.80.1/20")
+	WSLNets = func() []*net.IPNet { return []*net.IPNet{wslNet} }
+	t.Cleanup(func() { ownAddr, WSLNets = oldOwn, oldNets })
 	abs := filepath.Join(t.TempDir(), "origin.hooks.mjs")
 	script := `export function onRequest(body,ctx){ctx.state.origin=ctx.origin;body.origin=ctx.origin;return body}
 export async function onResponse(reply,ctx){await fetch(ctx.options.url,{method:"POST",body:JSON.stringify({origin:ctx.origin,before:ctx.state.origin}),signal:ctx.signal})}`
@@ -314,6 +335,15 @@ export async function onResponse(reply,ctx){await fetch(ctx.options.url,{method:
 		{"named-loopback", "127.0.0.1:1234", "", key, "0", "gateway-key"},
 		{"remote", "10.0.0.1:1234", "", key, "0", "gateway-key"},
 		{"proxy", "127.0.0.1:1234", "X-Forwarded-For", key, "0", "gateway-key"},
+		{"friend-own-value", "10.0.0.1:1234", "", friend, "0", "gateway-key"},
+		{"magpie-key-loopback", "127.0.0.1:1234", "", mine, "0", "magpie-key"},
+		{"magpie-key-own-address", "192.168.50.7:1234", "", mine, "0", "magpie-key"},
+		{"magpie-key-wsl-nat", "172.28.80.9:1234", "", mine, "0", "magpie-key"},
+		// the same key copied to another computer (Gateway keys' Copy) or
+		// handed to a friend is not the owner's own agent
+		{"magpie-key-elsewhere", "10.0.0.1:1234", "", mine, "0", "gateway-key"},
+		{"magpie-key-proxied", "127.0.0.1:1234", "X-Forwarded-For", mine, "0", "gateway-key"},
+		{"magpie-key-trusted-proxy", "127.0.0.1:1234", "Forwarded", mine, "1", "gateway-key"},
 		{"trusted-proxy", "127.0.0.1:1234", "Forwarded", "", "1", "remote"},
 		{"trusted-tunnel", "127.0.0.1:1234", "Tailscale-User-Login", "", "1", "remote"},
 		{"unknown-peer", "malformed", "", "", "0", "remote"},
@@ -432,5 +462,54 @@ export async function onResponse(reply,ctx){await fetch(ctx.options.url,{method:
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("onResponse never ran after the client hung up on a whole reply")
+	}
+}
+
+// A hooks package with its own page saves its options from that page. The
+// host hands each hook the options it loaded with, so the save starts the
+// host again; one that didn't left the hook on the old options until magpie
+// restarted (magpie-community/plugins#117's PowerContext page).
+func TestGatewayHookSeesOptionsSavedFromItsPage(t *testing.T) {
+	t.Setenv("MAGPIE_BUN", testenv.Bun(t))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Cleanup(plugin.Settle)
+	dir := filepath.Join(t.TempDir(), "paged-hook")
+	if err := os.MkdirAll(filepath.Join(dir, "page"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"package.json":    `{"name":"paged-hook","version":"0.0.1","magpie":{"hooks":"./paged.hooks.mjs","page":{"title":"Paged","file":"page/index.html"}}}`,
+		"paged.hooks.mjs": `export function onRequest(body,ctx){body.tag=ctx.options.tag;return body}`,
+		"page/index.html": `<!doctype html><title>Paged</title>`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := plugin.Add(t.Context(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := plugin.SetOptions(dir, map[string]any{"tag": "first"}); err != nil {
+		t.Fatal(err)
+	}
+	tag := func() any {
+		req := httptest.NewRequest("POST", "http://127.0.0.1/v1/chat/completions", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		var got map[string]any
+		w := httptest.NewRecorder()
+		_, b, done := gatewayHooks(w, req, provider.Chat, []byte(`{"model":"fake/m1","messages":[{"role":"user","content":"hello"}]}`))
+		done()
+		json.Unmarshal(b, &got)
+		return got["tag"]
+	}
+	if got := tag(); got != "first" {
+		t.Fatalf("tag=%v before the page saved, want first", got)
+	}
+	if err := plugin.SetPageOptions(dir, map[string]any{"tag": "second"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tag(); got != "second" {
+		t.Fatalf("tag=%v after the page saved, want second", got)
 	}
 }

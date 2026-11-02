@@ -4,8 +4,8 @@
 // In the editor the matched models follow those named, marked "by pattern",
 // with an off switch and no Remove; a pattern is added and removed in its
 // own box, its models coming and going with it. Saved, the group sends the
-// models it names and its patterns, never what they matched. In English and
-// Chinese.
+// models it names and its patterns, never what they matched, and the
+// order of them all (placed). In English and Chinese.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -68,6 +68,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 2000 }, reducedMotion: "reduce" })).newPage();
       t.after(() => browser.close());
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
@@ -95,6 +96,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await pbox.locator("input").fill("*-free");
       await pbox.locator("button", { hasText: w.add }).click();
       assert.deepEqual(await names(), ["claude-opus-5-5", "a:free", "c:free", "d-free"]);
+      // a re: pattern matches in any case, as a glob does, and (?-i) makes
+      // case matter (provider.compilePattern; usrname1833 on Discord)
+      await pbox.locator("input").fill("re:(?-i)OR/B");
+      await pbox.locator("button", { hasText: w.add }).click();
+      assert.equal(await pbox.locator(".fbrow.none", { hasText: "re:(?-i)OR/B" }).count(), 1, "(?-i) keeps case");
+      assert.deepEqual(await names(), ["claude-opus-5-5", "a:free", "c:free", "d-free"]);
+      await pbox.locator("input").fill("re:OR/B");
+      await pbox.locator("button", { hasText: w.add }).click();
+      assert.deepEqual(await names(), ["claude-opus-5-5", "a:free", "b", "c:free", "d-free"], "re: in any case, in the catalog's order");
+      for (const p of ["re:OR/B", "re:(?-i)OR/B"]) {
+        await pbox.locator(".fbrow", { has: page.locator("code", { hasText: new RegExp("^" + p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$") }) }).locator("button", { hasText: w.remove }).click();
+      }
+      assert.deepEqual(await names(), ["claude-opus-5-5", "a:free", "c:free", "d-free"]);
       // one that is no pattern is refused, the box keeping it
       await pbox.locator("input").fill("or/b");
       await pbox.locator("button", { hasText: w.add }).click();
@@ -112,6 +126,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.waitForFunction(() => !document.querySelector(".rt-gedit"));
       const sent = posts.find((p) => p.path === "/api/groups/save");
       assert.deepEqual(sent.body.members, ["an/claude-opus-5-5"], "only the models named are sent");
+      assert.deepEqual(sent.body.placed, ["an/claude-opus-5-5", "zen/d-free"], "and the order of them all");
       assert.deepEqual(sent.body.match, ["nope/*", "*-free"]);
       assert.deepEqual(sent.body.off, ["zen/d-free"], "a matched model may be off");
 

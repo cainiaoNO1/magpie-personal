@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -81,6 +82,7 @@ func trashJSON(looks map[string]*agent.Agent) []trashedJSON {
 }
 
 func sessionManageRoutes(mux *http.ServeMux, w Windows) {
+	sessionReadsRoutes(mux)
 	mux.HandleFunc("POST /api/sessions/relocate-claude", func(rw http.ResponseWriter, r *http.Request) {
 		var in sessions.ClaudeRelocation
 		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 16384)).Decode(&in); err != nil {
@@ -115,20 +117,30 @@ func sessionManageRoutes(mux *http.ServeMux, w Windows) {
 	// manage is the agents with sessions, and every session of ?agent=
 	// (the one with the most when none is named), and the trash.
 	mux.HandleFunc("GET /api/sessions/manage", func(rw http.ResponseWriter, r *http.Request) {
+		// the Codex app's list forgets the threads deleted before it
+		// was told of each delete, once a run
+		sessions.TidyCodexCatalog()
+		defer sessions.OneListing()()
 		looks := agentLooks()
 		out := struct {
-			Agents    []manageAgentJSON `json:"agents"`
-			Agent     string            `json:"agent"`
-			Sessions  []managedJSON     `json:"sessions"`
-			Terminal  bool              `json:"terminal"`
-			Trash     []trashedJSON     `json:"trash"`
-			TrashDir  string            `json:"trashDir"`
-			Recording bool              `json:"recording"`
+			Agents   []manageAgentJSON `json:"agents"`
+			Agent    string            `json:"agent"`
+			Sessions []managedJSON     `json:"sessions"`
+			Terminal bool              `json:"terminal"`
+			Trash    []trashedJSON     `json:"trash"`
+			TrashDir string            `json:"trashDir"`
+			// Home: the home folder, which a folder's row says as ~
+			Home      string `json:"home,omitempty"`
+			Recording bool   `json:"recording"`
 			// Recorded: some gateway conversation text is kept, to delete
 			Recorded bool `json:"recorded"`
-		}{Agents: []manageAgentJSON{}, Sessions: []managedJSON{}, Terminal: runtime.GOOS == "darwin" && !isWeb(w),
+			// Reads: which agents' own sessions magpie may read; the page
+			// asks first when nothing is decided (asked false)
+			Reads readsJSON `json:"reads"`
+		}{Reads: readsNow(), Agents: []manageAgentJSON{}, Sessions: []managedJSON{}, Terminal: runtime.GOOS == "darwin" && !isWeb(w),
 			Trash: trashJSON(looks), TrashDir: tilde(sessions.TrashDir()), Recording: settings.Load().GatewayConversations,
 			Recorded: sessions.HasGatewayConversations()}
+		out.Home, _ = os.UserHomeDir()
 		want := r.URL.Query().Get("agent")
 		gateway := listedGateway(usage.GatewaySessions(time.Time{}, nil))
 		// a gateway session its agent keeps too is counted once; only the
@@ -207,7 +219,7 @@ func sessionManageRoutes(mux *http.ServeMux, w Windows) {
 			vias := usage.Vias(since.Add(-time.Minute))
 			for _, s := range list {
 				s.Path = tilde(s.Path)
-				out.Sessions = append(out.Sessions, managedJSON{Managed: s, Via: vias.Of(s.Agent + "|" + s.ID)})
+				out.Sessions = append(out.Sessions, managedJSON{Managed: s, Via: viaOf(vias, s.Session)})
 			}
 			sizes := sessions.GatewaySizes()
 			for _, g := range gateway {

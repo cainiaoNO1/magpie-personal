@@ -163,6 +163,9 @@ func (p Provider) alsoOn() []Provider {
 		}
 		if agent == "codex" {
 			a.sign = codexSign(func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, agent, user) })
+			a.renew = func(ctx context.Context, stale string) (string, string, error) {
+				return renewSavedLoginFrom(ctx, agent, user, stale)
+			}
 		}
 		q := p
 		q.Account = &a
@@ -203,6 +206,18 @@ func savedLoginToken(ctx context.Context, agent, user string) (tok, accountID st
 // refuses is kept on the account as lapsed, until one goes through or it is
 // signed in again.
 func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, accountID string, err error) {
+	return renewSaved(ctx, agent, user, force, "")
+}
+
+// renewSavedLoginFrom refreshes the saved sign-in whose access token stale
+// the backend just called expired while it had time left (#2973), unless
+// it was renewed since: the token saved by now is returned then, its
+// refresh token being the one spent already.
+func renewSavedLoginFrom(ctx context.Context, agent, user, stale string) (tok, accountID string, err error) {
+	return renewSaved(ctx, agent, user, false, stale)
+}
+
+func renewSaved(ctx context.Context, agent, user string, force bool, stale string) (tok, accountID string, err error) {
 	ctx = ViaLogin(ctx, agent, user) // refreshed through the account's own proxy
 	savedTokenMu.Lock()
 	defer savedTokenMu.Unlock()
@@ -218,6 +233,37 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 	if l == nil {
 		return "", "", fmt.Errorf("no saved %s account %q", agent, user)
 	}
+	if agent == "codex" && heldByCodex(*l) {
+		// the account Codex is signed in to now (switched to since this
+		// was asked for, or the copy kept of it as it was): one sign-in in
+		// two places, whose refresh token a refresh here would spend under
+		// Codex. Codex's own auth.json then holds a dead one, and the app
+		// of an edu or business workspace, which reads its workspace's
+		// settings with it at start, stays paused on "无法加载组织设置"
+		// (万贤凯 on Discord). So it is renewed where Codex keeps it, as
+		// Codex's own (codexTokenRenewing), and the copy is left as it is:
+		// a switch away saves it afresh from Codex's.
+		return codexTokenRenewing(ctx, codexHome(), stale)
+	}
+	if home := codexHeldIn(*l); home != "" {
+		// the same for an account Codex is signed in to in another of
+		// its folders (CODEX_HOME=~/.codex-work): Codex there refreshes
+		// it too, so magpie renews it in that folder, never in a copy
+		// whose refresh token would sign that Codex out
+		tok, accountID, err := codexTokenRenewing(ctx, home, stale)
+		if err != nil {
+			// said with no command to run (charliepu on Discord, Windows:
+			// "run CODEX_HOME=… codex login"): a refusal marks the account
+			// signed out on its row (codexSignInRead), whose Sign in again
+			// runs magpie's own sign-in and writes it back to home (addLogin)
+			err = fmt.Errorf("%s, signed in to Codex in %s: %w", user, home, err)
+			if errors.As(err, new(refreshRefused)) {
+				err = codexHeldRefusal{err}
+			}
+			return "", "", err
+		}
+		return tok, accountID, nil
+	}
 	var auth []byte
 	switch agent {
 	case "codex":
@@ -230,10 +276,20 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 		if accountID == "" {
 			accountID = claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
 		}
-		if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); !force && (exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute) {
+		if stale != "" {
+			if a.Tokens.AccessToken != stale {
+				return a.Tokens.AccessToken, accountID, nil
+			}
+		} else if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); !force && (exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute) {
 			return a.Tokens.AccessToken, accountID, nil
 		}
-		if tok, err = codexRefresh(ctx, raw); err != nil {
+		reason := codexRefreshExpiry
+		if stale != "" {
+			reason = codexRefreshRecovery
+		} else if force {
+			reason = forcedReason(ctx)
+		}
+		if tok, err = codexRefresh(ctx, raw, reason); err != nil {
 			return "", "", savedRefreshFailed(agent, user, err)
 		}
 		if auth, err = json.MarshalIndent(raw, "", "  "); err != nil {
@@ -254,6 +310,29 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 	}
 	return tok, accountID, writeLogins(ls)
 }
+
+// heldByCodex says the saved ChatGPT account l is the one Codex is signed
+// in to: the same login, or the same refresh token. Asked under
+// savedTokenMu, which a switch holds too, so it can't change before the
+// refresh it decides is done.
+func heldByCodex(l savedLogin) bool {
+	live, ok := liveLogin("codex")
+	if !ok {
+		return false
+	}
+	if sameLogin(live, l) {
+		return true
+	}
+	return sameRefresh(live.Auth, l.Auth)
+}
+
+// codexHeldRefusal is a refresh OpenAI refused for an account Codex is
+// signed in to in another of its folders (codexHeldIn). savedRefreshFailed
+// doesn't mark it, magpie's copy not being the sign-in, so codexSignInRead
+// marks it signed out as it does Codex's own.
+type codexHeldRefusal struct{ error }
+
+func (e codexHeldRefusal) Unwrap() error { return e.error }
 
 // savedRefreshFailed words a saved account's failed refresh. One the vendor
 // refused is marked lapsed on the account: that sign-in is gone and has to be

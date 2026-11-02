@@ -28,13 +28,13 @@ func init() { provider.ReckonHolds = WithWindowHolds }
 func WithWindowHolds(qs []provider.SubscriptionQuota, now time.Time) []provider.SubscriptionQuota {
 	since, ok := holdsSince(qs, now)
 	if !ok { // none can be reckoned: each one only says why
-		return windowHolds(qs, now, time.Time{}, nil, nil, nil, func(func(Record)) {})
+		return windowHolds(qs, now, time.Time{}, nil, provider.Renames{}, nil, func(func(Record)) {})
 	}
 	s := readLogSnapshot()
 	hist := provider.QuotaHistories(since, "", "")
 	started := withRecordedWindowStarts(qs, hist, now)
 	dry := dryRuns(started, hist, now)
-	out := windowHolds(started, now, s.firstOwn, apiPricer(), provider.Renamed(), dry, func(fn func(Record)) { s.visit(since, fn) })
+	out := windowHolds(started, now, s.firstOwn, apiPricer(), provider.UsageRenames(), dry, func(fn func(Record)) { s.visit(since, fn) })
 	return withSpansOf(out, qs)
 }
 
@@ -70,7 +70,11 @@ func holdsBounds(q provider.SubscriptionQuota, w provider.QuotaWindow, at time.T
 	if q.Error != "" || q.From != "" || q.User == "" || q.Balance != "" {
 		return time.Time{}, time.Time{}, "-"
 	}
-	if w.Unlimited || w.Aside || w.Family != "" || w.Pool != "" || math.IsNaN(w.Used) {
+	// An Antigravity pool's window is told, by its models' calls (max2020 on
+	// Discord); the models' own windows drawing on it, and a pool whose
+	// models aren't known, aren't.
+	pool := w.PoolWindow() && len(provider.PoolMembers(q.Windows, w)) > 0
+	if w.Unlimited || w.Aside && !pool || w.Family != "" || w.Pool != "" && !pool || math.IsNaN(w.Used) {
 		return time.Time{}, time.Time{}, "-"
 	}
 	if w.Used < provider.HoldsFloor {
@@ -177,7 +181,7 @@ func dryRuns(qs []provider.SubscriptionQuota, hist []provider.QuotaHistory, now 
 // call in one of its account's dry runs that may have been paid otherwise:
 // one where the vendor answered a call after a reading of none left, or
 // where no reading with some left is known before it.
-func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf func(Record) *catalog.Price, renamed map[string]string, dry map[string][]dryRun, read func(func(Record))) []provider.SubscriptionQuota {
+func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf func(Record) *catalog.Price, renamed provider.Renames, dry map[string][]dryRun, read func(func(Record))) []provider.SubscriptionQuota {
 	type slot struct{ q, w int }
 	type span struct{ start, end time.Time }
 	want := map[slot]span{}
@@ -217,10 +221,16 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 		if r.IsRejected() || r.IsReported() || r.Input+r.Output == 0 {
 			return
 		}
-		if next, ok := renamed[r.Provider]; ok {
-			r.Provider = next
+		// who answered, not who a merge shows it under (Renames.Own)
+		r.Provider = renamed.Own(r.Provider, r.Time)
+		// the call answers as the account it went out as, or, when it went
+		// on a key (which names no account, #557), as the key: a plan's
+		// card is on the key, named as the ledger names it (#3747)
+		who := r.Account()
+		if who == "" {
+			who = r.ProviderKeyName
 		}
-		acct := r.Provider + "\x00" + strings.ToLower(r.Account())
+		acct := r.Provider + "\x00" + strings.ToLower(who)
 		var runs []runKey
 		for i, d := range dry[acct] {
 			if !d.holds(r.Time) {
@@ -234,7 +244,7 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 		}
 		for _, s := range byAccount[acct] {
 			b := want[s]
-			if r.Time.Before(b.start) || r.Time.After(b.end) || !qs[s.q].Windows[s.w].Counts(r.Model) {
+			if r.Time.Before(b.start) || r.Time.After(b.end) || !qs[s.q].Windows[s.w].CountsIn(qs[s.q].Windows, r.Model) {
 				continue
 			}
 			inRun[s] = append(inRun[s], runs...)
@@ -296,29 +306,42 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 // apiPricer is each call's model at its API list price: its maker's, else
 // the provider's own list, else the maker's of the model the user said it
 // is the same as (provider.SamePriceIn), never a price the user set for the
-// subscription (which may well be nothing) nor a rate it bills at. A price
-// of nothing at all is no API price.
+// subscription (which may well be nothing) nor a rate it bills at. A model
+// none of those prices is priced as the model the reply named (Served), as
+// the ledger is (#1498). A price of nothing at all is no API price.
 func apiPricer() func(Record) *catalog.Price {
 	st := settings.Load()
-	prices := map[[2]string]*catalog.Price{}
-	return func(r Record) *catalog.Price {
-		k := [2]string{r.Provider, r.Model}
-		if pr, ok := prices[k]; ok {
-			return pr
-		}
-		var pr *catalog.Price
-		v, ok := provider.MakerPrice(r.Model)
+	prices := map[[3]string]*catalog.Price{}
+	one := func(providerID, model string) *catalog.Price {
+		v, ok := provider.MakerPrice(model)
 		if !ok || v.Cost(1e6, 1e6, 0, 0) == 0 {
 			ok = false
-			if p, err := provider.Find(r.Provider); err == nil {
-				v, ok = p.ListPrice(r.Model)
+			if p, err := provider.Find(providerID); err == nil {
+				v, ok = p.ListPrice(model)
 			}
 		}
 		if !ok || v.Cost(1e6, 1e6, 0, 0) == 0 { // the model the user said it is (#2344)
-			v, ok = provider.SamePriceIn(st, r.Provider, r.Model)
+			v, ok = provider.SamePriceIn(st, providerID, model)
 		}
-		if ok && v.Cost(1e6, 1e6, 0, 0) > 0 {
-			pr = &v
+		if !ok || v.Cost(1e6, 1e6, 0, 0) == 0 {
+			return nil
+		}
+		pr := v
+		return &pr
+	}
+	return func(r Record) *catalog.Price {
+		served := strings.TrimSpace(r.Served)
+		if served == r.Model {
+			served = ""
+		}
+		id := r.priceID()
+		k := [3]string{id, r.Model, served}
+		if pr, ok := prices[k]; ok {
+			return pr
+		}
+		pr := one(id, r.Model)
+		if pr == nil && served != "" {
+			pr = one(id, served)
 		}
 		prices[k] = pr
 		return pr

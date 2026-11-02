@@ -44,6 +44,12 @@ const modelUsage = `usage:
   magpie model output <provider/model>           the most a reply of it may hold, and what you said
   magpie model output <provider/model> <n>       say the most, as 128000 or 128k; '<provider>/*' is every model
   magpie model output <provider/model> --reset   take your limit off this model
+  magpie model spec <provider/model>             its context window, max output, vision and reasoning levels
+  magpie model spec <provider/model> [--context <n>] [--output <n>] [--vision on|off] [--reasoning <levels>]
+                                                 say any of them at once, e.g. --reasoning low-high; auto as a
+                                                 value goes back to the vendor's list (magpie model spec --help)
+  magpie model spec <provider/model> --reset     take every value you set off this model
+  magpie model specs                             the models you gave a spec
   magpie model wire <provider/model>             the name the vendor is asked for, and the one you gave
   magpie model wire <provider/model> <name>      ask for the model by this name, for a relay that serves it
   magpie model wire '<provider>/*' <name>        ask for every model of that provider by this name; a * in
@@ -53,7 +59,28 @@ const modelUsage = `usage:
                                                  id of its own for a provider that has since been deleted,
                                                  and says when there was no name of its own to take away
   magpie model wires                             the names your vendors are asked for models by
+  magpie model id <provider/model>               the id magpie lists the model by, and the provider's own
+  magpie model id <provider/model> <id>          list the model by this id at that provider, e.g.
+                                                 relay-a/deepseek-v4.1-flash-1017 deepseek-v4.1-flash: agents,
+                                                 /v1/models, routing groups, the groups magpie finds, gateway keys
+                                                 and Usage all use it, and relay-a is still asked for
+                                                 deepseek-v4.1-flash-1017. One id is one model of a provider: the
+                                                 latest model given an id has it, and a model of the provider's
+                                                 own with that id is not listed while another is. A provider of
+                                                 your own (a key) only
+  magpie model id <provider/model> --reset       list it by the provider's own id again
+  magpie model ids                               the models you list by an id of your own
   magpie model names                             the models you named or narrowed
+  magpie model alias <model> <name>              count the model's usage under another model id in Usage,
+                                                 Sessions and the usage summaries, e.g. deepseek-v4.1-flash
+                                                 deepseek-flash: two ids of one model are one row. Each call is
+                                                 still priced by the id it was made under. Requests, routing and
+                                                 the agents' model lists never change. Ids match as the routing
+                                                 groups match them: a vendor/ prefix, case, "_" or a snapshot
+                                                 date make no difference
+  magpie model alias <model>                     the name the model's usage is counted under
+  magpie model alias <model> --reset             count its usage under its own id again
+  magpie model aliases                           the models whose usage you count under another id
   magpie model disable <model> [<model>...]      turn models off for every request through magpie: each an id
                                                  (provider/model or a bare model id) or a glob, * any run of
                                                  characters and ? one, as '*fable*'. A disabled model leaves
@@ -66,13 +93,15 @@ const modelUsage = `usage:
                                                  own, a name you gave a model just as you wrote it, "Opus 5.5",
                                                  the others as on; off, "Sol" alone — but two a list would name
                                                  the same keep it
-  magpie model compact [on|off|<size>]           whether Codex and Claude Code compact a long conversation at
-                                                 272K: on, as by default, for a model of a longer window (in
-                                                 Claude Code, a Claude model runs to its own); off, at the
-                                                 model's whole window, 1M for a [1m] one; a size such as 500k
-                                                 compacts there instead. The app's Settings → Long
-                                                 conversations is the same switch; a provider's own Compact
-                                                 at (its editor) comes before it
+  magpie model compact [on|off|<size>]           whether Codex, Claude Code and Grok Build compact a long
+                                                 conversation at 272K: on, as by default, for a model of a
+                                                 longer window (in Claude Code, a Claude model runs to its
+                                                 own); off, at the model's whole window, 1M for a [1m] one; a
+                                                 size such as 500k compacts there instead. The app's Long
+                                                 conversations, in Codex's, Claude Code's and Grok Build's
+                                                 settings on the Agents page,
+                                                 is the same switch; a provider's own Compact at (its
+                                                 editor) comes before it
 
   Each is looked for in this order: this model, then <provider id>/*, then the provider's own
   list, then models.dev. --reset removes only the first, and says so when a <provider id>/* value
@@ -117,6 +146,18 @@ func modelCmd(args []string) error {
 		return modelOutput(args[1:])
 	case "wire", "upstream":
 		return modelWire(args[1:])
+	case "spec", "specs-of":
+		return modelSpec(args[1:])
+	case "specs":
+		return modelSpecs()
+	case "id":
+		return modelID(args[1:])
+	case "ids":
+		return modelIDs()
+	case "alias":
+		return modelUsageAlias(args[1:])
+	case "aliases":
+		return modelUsageAliases()
 	case "disable":
 		return modelDisable(args[1:])
 	case "enable":
@@ -209,9 +250,12 @@ func modelEfforts(args []string) error {
 		return err
 	}
 	id := p.ID + "/" + model
-	all := p.Efforts(model)
+	all := p.Known(model) // the model's own, the kept ones bold below
 	rest := args[1:]
-	given := len(p.Known(model)) == 0 // levels aren't known: those it has are the user's
+	given := len(all) == 0 // levels aren't known: those it has are the user's
+	if given {
+		all = p.Efforts(model)
+	}
 	if len(rest) == 1 && slices.Contains([]string{"off", "--off"}, rest[0]) {
 		// no reasoning field at all, for a vendor that turns one away
 		// though its list says the model reasons (yuexian7 on Discord)
@@ -660,9 +704,9 @@ func modelSuffix(args []string) error {
 func modelCompact(args []string) error {
 	if len(args) == 0 {
 		if s := settings.Load(); s.FullContext {
-			fmt.Println("off", muted.Render("· Codex and Claude Code run a conversation to the model's whole window · magpie model compact on"))
+			fmt.Println("off", muted.Render("· Codex, Claude Code and Grok Build run a conversation to the model's whole window · magpie model compact on"))
 		} else {
-			fmt.Println("on", muted.Render(fmt.Sprintf("· Codex and Claude Code compact at %dK on a longer window; in Claude Code a Claude model runs to its own · magpie model compact off", s.Compact()/1000)))
+			fmt.Println("on", muted.Render(fmt.Sprintf("· Codex, Claude Code and Grok Build compact at %dK on a longer window; in Claude Code a Claude model runs to its own · magpie model compact off", s.Compact()/1000)))
 		}
 		return nil
 	}
@@ -679,16 +723,16 @@ func modelCompact(args []string) error {
 		if err := provider.SetCompactAt(n); err != nil {
 			return err
 		}
-		fmt.Println(green.Render("✓"), fmt.Sprintf("Codex and Claude Code compact at %dK on a longer window", settings.Load().Compact()/1000))
+		fmt.Println(green.Render("✓"), fmt.Sprintf("Codex, Claude Code and Grok Build compact at %dK on a longer window", settings.Load().Compact()/1000))
 		return nil
 	}
 	if err := provider.SetFullContext(full); err != nil {
 		return err
 	}
 	if full {
-		fmt.Println(green.Render("✓"), "Codex and Claude Code run a conversation to the model's whole window", muted.Render("· every turn sends all of it"))
+		fmt.Println(green.Render("✓"), "Codex, Claude Code and Grok Build run a conversation to the model's whole window", muted.Render("· every turn sends all of it"))
 	} else {
-		fmt.Println(green.Render("✓"), fmt.Sprintf("Codex and Claude Code compact at %dK again", settings.Load().Compact()/1000))
+		fmt.Println(green.Render("✓"), fmt.Sprintf("Codex, Claude Code and Grok Build compact at %dK again", settings.Load().Compact()/1000))
 	}
 	return nil
 }
@@ -771,6 +815,83 @@ func modelWires() error {
 	}
 	for _, r := range rows {
 		fmt.Println("  " + pad(r[0], w) + "  " + r[1])
+	}
+	return nil
+}
+
+// modelUsageAlias shows or sets the name a model's usage is counted under
+// (provider.SetUsageAlias).
+func modelUsageAlias(args []string) error {
+	if len(args) == 0 || len(args) > 2 {
+		return fmt.Errorf("%s", modelUsage)
+	}
+	if slices.Contains([]string{"-h", "--help", "help"}, args[0]) {
+		fmt.Println(modelUsage)
+		return nil
+	}
+	from := args[0]
+	if len(args) == 1 {
+		f, to, counted, ok, err := provider.UsageAliasFor(from)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println(bold.Render(from), muted.Render("· counted under its own id"))
+			return nil
+		}
+		line := muted.Render("· counted as ") + to
+		if counted != to {
+			line += muted.Render(" → " + counted)
+		}
+		fmt.Println(bold.Render(f), line)
+		return nil
+	}
+	if isReset(args[1:]) {
+		changed, err := provider.SetUsageAlias(from, "")
+		if err != nil {
+			return err
+		}
+		if !changed {
+			fmt.Println(muted.Render(from + " was counted under its own id already"))
+			return nil
+		}
+		fmt.Println(bold.Render(from), muted.Render("· counted under its own id again"))
+		return nil
+	}
+	to := args[1]
+	changed, err := provider.SetUsageAlias(from, to)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		fmt.Println(muted.Render(from + " was counted as " + to + " already"))
+		return nil
+	}
+	fmt.Println(bold.Render(from), muted.Render("· counted as ")+to, muted.Render("in Usage and Sessions; requests still ask for "+from))
+	return nil
+}
+
+// modelUsageAliases lists the models whose usage is counted under another id.
+func modelUsageAliases() error {
+	s, err := settings.LoadChecked()
+	if err != nil {
+		return err
+	}
+	m := s.UsageAliases
+	rows := make([][2]string, 0, len(m))
+	w := 0
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		if n := strings.TrimSpace(m[k]); n != "" {
+			rows = append(rows, [2]string{k, n})
+			w = max(w, len(k))
+		}
+	}
+	if len(rows) == 0 {
+		fmt.Println(muted.Render("no model is counted under another id yet · magpie model alias <model> <name>"))
+		return nil
+	}
+	for _, r := range rows {
+		fmt.Println("  " + pad(r[0], w) + "  → " + r[1])
 	}
 	return nil
 }

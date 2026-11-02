@@ -1,6 +1,8 @@
 package sessions
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +21,23 @@ func TestQoderUsageAfterWindowLoss(t *testing.T) {
 				writeLines(t, path, string(claudeUsageLine(at, "a", "r", "m", Tokens{Input: 100, Output: 1}, "", true)))
 				List(0)
 				if restart {
+					// A sessions.json from before the window was kept (#3493).
 					Saved()
+					b, err := os.ReadFile(CachePath())
+					if err != nil {
+						t.Fatal(err)
+					}
+					var c map[string]any
+					dec := json.NewDecoder(bytes.NewReader(b))
+					dec.UseNumber()
+					if err := dec.Decode(&c); err != nil {
+						t.Fatal(err)
+					}
+					delete(c["files"].(map[string]any)[path].(map[string]any), "claude")
+					b, _ = json.Marshal(c)
+					if err := os.WriteFile(CachePath(), b, 0o644); err != nil {
+						t.Fatal(err)
+					}
 					Reset()
 					List(0)
 				} else {
@@ -34,7 +52,7 @@ func TestQoderUsageAfterWindowLoss(t *testing.T) {
 				}
 				appendText(t, path, string(claudeUsageLine(at.Add(time.Second), "a", "r", "m", Tokens{Input: 100, Output: 50}, "", true))+"\n")
 				List(0)
-				if got := cache[path].Models["m"]; got != (Tokens{Input: 100, Output: 50}) {
+				if got := cache[path].Models.of("m"); got != (Tokens{Input: 100, Output: 50}) {
 					t.Fatalf("after window loss: %+v, want input=100 output=50", got)
 				}
 			})
@@ -103,7 +121,7 @@ func TestClaudeLargeWindowSurvivesIdleAndSmallFiles(t *testing.T) {
 			if cache[path].Named != "must resume this summary" {
 				t.Fatal("summary reparsed the large prefix")
 			}
-			if got := cache[path].Models["m"]; got != (Tokens{Input: 4001, Output: 8002}) {
+			if got := cache[path].Models.of("m"); got != (Tokens{Input: 4001, Output: 8002}) {
 				t.Fatal(got)
 			}
 			after, err := os.Stat(callCachePath(path))

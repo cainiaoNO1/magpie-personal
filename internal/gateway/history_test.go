@@ -478,3 +478,107 @@ func TestNoRouteWrittenInATestSandbox(t *testing.T) {
 		history.mu.Unlock()
 	})
 }
+
+// A look at the history reads a day's .jsonl only past what it tallied
+// before, and parses only the asked day's latest lines: a busy day's file
+// is 350 MB, and the Routing view looks every 15s (#3383). The routes
+// tallied are blanked in place behind its back, so a look that read them
+// again would count fewer.
+func TestHistoryReadsOnlyWhatWasAdded(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	day, dir := time.Now().Format(dayForm), HistoryDir()
+	path := filepath.Join(dir, day+".jsonl")
+	os.MkdirAll(dir, 0o700)
+	at := time.Now().Add(-time.Hour)
+	line := func(id int) string {
+		b, _ := json.Marshal(Route{ID: int64(id), Model: "m", Time: at.Add(time.Duration(id) * time.Millisecond)})
+		return string(b) + "\n"
+	}
+	var b strings.Builder
+	n := historyMax + historySlack + 50
+	for i := 1; i <= n; i++ {
+		b.WriteString(line(i))
+	}
+	os.WriteFile(path, []byte(b.String()), 0o600)
+	if days, rs, cut := History(day); len(days) != 1 || days[0].Requests != n || len(rs) != historyMax || !cut || rs[0].ID != int64(n-historyMax+1) {
+		t.Fatalf("days %+v, %d routes from %v, cut %v", days, len(rs), rs[0].ID, cut)
+	}
+	blank := bytes.Repeat([]byte(" "), len(line(1))-1)
+	f, _ := os.OpenFile(path, os.O_WRONLY, 0)
+	f.WriteAt(blank, 0)
+	// a route added, and one being written
+	f.WriteAt([]byte(line(n+1)+line(n + 2)[:20]), int64(b.Len()))
+	f.Close()
+	days, _, _ := History("")
+	if len(days) != 1 || days[0].Requests != n+2 {
+		t.Fatalf("days %+v, want %d requests", days, n+2)
+	}
+	f, _ = os.OpenFile(path, os.O_WRONLY, 0)
+	f.WriteAt([]byte(line(n+2)), int64(b.Len()+len(line(n+1))))
+	f.Close()
+	days, rs, _ := History(day)
+	if len(days) != 1 || days[0].Requests != n+2 || len(rs) != historyMax || rs[len(rs)-1].ID != int64(n+2) {
+		t.Fatalf("days %+v, %d routes, last %d", days, len(rs), rs[len(rs)-1].ID)
+	}
+	// written over shorter: counted again from its start
+	os.WriteFile(path, []byte(line(1)), 0o600)
+	if days, rs, cut := History(day); len(days) != 1 || days[0].Requests != 1 || len(rs) != 1 || cut {
+		t.Fatalf("written over: days %+v, %d routes, cut %v", days, len(rs), cut)
+	}
+}
+
+// BenchmarkHistoryLook is the Routing view's look with no day, every 15s,
+// at a busy day's file: 20k routes, one more since the last look.
+func BenchmarkHistoryLook(b *testing.B) {
+	b.Setenv("XDG_CONFIG_HOME", b.TempDir())
+	day, dir := time.Now().Format(dayForm), HistoryDir()
+	path := filepath.Join(dir, day+".jsonl")
+	os.MkdirAll(dir, 0o700)
+	r := Route{ID: 1, Model: "m", Time: time.Now(), Order: make([]Weighed, 40)}
+	for i := range r.Order {
+		r.Order[i] = Weighed{ID: "acct-" + strconv.Itoa(i), Provider: "codex", Name: "Codex", Icon: "/icons/codex.svg", Model: "gpt-5.5"}
+	}
+	one, _ := json.Marshal(r)
+	one = append(one, '\n')
+	os.WriteFile(path, bytes.Repeat(one, 20000), 0o600)
+	History("")
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	defer f.Close()
+	b.ResetTimer()
+	for b.Loop() {
+		f.Write(one)
+		History("")
+	}
+}
+
+// A day that is over, asked for the first time, parses only its latest
+// routes too: every route of a busy day's .gz was parsed to keep the last
+// historyMax of them, and a small server opening the Usage page's Context
+// tab ran out of memory (Yayoi_no_yume on X).
+func TestHistoryParsesOnlyAGzDaysLatest(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := HistoryDir()
+	os.MkdirAll(dir, 0o700)
+	day := time.Now().AddDate(0, 0, -2)
+	at := day.Add(-time.Hour)
+	n := historyMax + historySlack + 3000
+	var buf bytes.Buffer
+	z := gzip.NewWriter(&buf)
+	for i := 1; i <= n; i++ {
+		b, _ := json.Marshal(Route{ID: int64(i), Model: "m", Time: at.Add(time.Duration(i) * time.Millisecond)})
+		z.Write(append(b, '\n'))
+	}
+	z.Close()
+	os.WriteFile(filepath.Join(dir, day.Format(dayForm)+".jsonl.gz"), buf.Bytes(), 0o600)
+	history.mu.Lock()
+	history.counts = nil
+	historyParsed.Store(0)
+	history.mu.Unlock()
+	days, rs, cut := History(day.Format(dayForm))
+	if len(days) != 1 || days[0].Requests != n || len(rs) != historyMax || !cut || rs[len(rs)-1].ID != int64(n) || rs[0].ID != int64(n-historyMax+1) {
+		t.Fatalf("days %+v, %d routes, cut %v", days, len(rs), cut)
+	}
+	if n := historyParsed.Load(); n > historyMax+historySlack {
+		t.Fatalf("parsed %d routes for a day's latest %d", n, historyMax)
+	}
+}

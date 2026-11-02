@@ -167,7 +167,7 @@ func openChamber(home, cfg string) *Agent {
 	provider := openCodeKept(ocPath, func() any { return magpieProviderJSONFor("opencode", "opencode") })
 	opts := func(key string) func(map[string]string) []Option {
 		return func(cur map[string]string) []Option {
-			return append(ownOptions(auth, cur[key]), viaMagpie("opencode", magpieID+"/")...)
+			return withVia(ownOptions(auth, cur[key]), "opencode", magpieID+"/")
 		}
 	}
 	// stepped off magpie: its provider goes too, when nothing else in the
@@ -206,6 +206,7 @@ func openChamber(home, cfg string) *Agent {
 			return wiringOff("OpenChamber", ocPath, func(k string) (string, bool) { return edit.GetJSON(ocPath, "provider."+magpieID+".options."+k) },
 				"baseURL", gatewayV1(), "apiKey", hereKey())
 		},
+		ListOnly: true,
 		Sync: func() error {
 			if _, ok := edit.GetJSON(ocPath, "provider."+magpieID); !ok && usesMagpie(s.model(), s.small()) {
 				return edit.SetJSON(ocPath, edit.KV{Path: "provider." + magpieID, Value: provider()})

@@ -3,7 +3,11 @@
 // download links that never go stale.
 //
 //   /api/latest            {version, notes, url, published, assets: {name: {url, size, sha256}}}
-//   /api/notes?after=&upto= {releases: [{version, notes, url, published}]}, newest
+//   /api/latest?channel=stable
+//                          the same for Settings' Stable channel: a release a
+//                          week, an urgent one at once ("The Stable channel"
+//                          below), with channel and urgent; 503 while unknown
+//   /api/notes?after=&upto=&limit= {releases: [{version, notes, url, published}]}, newest
 //                          first: what changed since the version an app last ran
 //                          Both take ?lang=zh for the notes in Chinese, where a
 //                          release has them (below its <!-- lang:zh --> marker);
@@ -19,11 +23,18 @@
 //                          a picture a plugin, market or import link names,
 //                          fetched here so its host sees Cloudflare, not the
 //                          user (the app fetches every remote icon this way)
+//   /docs/contributors, /docs/zh/contributors, /docs/ja/contributors
+//                          the contributors page, its table put in from
+//                          public/contributors/<lang>.html (credits-cli.mjs
+//                          wall, at each deploy)
 //   /download              the Apple Silicon dmg
 //   /download/mac-arm64    the same;  /download/mac-intel  the Intel dmg
 //   /download/windows      the Windows app (x64);  /download/windows-arm64
 //   /download/linux        the Linux app (x86-64); /download/linux-arm64
 //   /download/<file>       any file of the newest release, by name
+//   /r/...                 the pages' PostHog snippet, passed on to PostHog
+//                          (relay, below) so a blocker that knows its host
+//                          doesn't drop the count
 //   /docs, /docs/zh, /docs/ja  the getting-started guide: /docs/start, /docs/<lang>/start
 //   /zh/, /ja/, /de/       the home page in Chinese, Japanese, German (i18n.js);
 //                          / sends a browser that prefers one of them there,
@@ -53,6 +64,9 @@ const SHORT = {
 
 // The bare docs paths open the getting-started guide.
 const DOCS = { "/docs": "/docs/start", "/docs/zh": "/docs/zh/start", "/docs/ja": "/docs/ja/start" };
+// pages that moved, from the old path (no .html) to the new one: the MCP
+// hub was renamed the MCP router
+const MOVED = { "/docs/mcp-hub": "/docs/mcp-router", "/docs/zh/mcp-hub": "/docs/zh/mcp-router", "/docs/ja/mcp-hub": "/docs/ja/mcp-router" };
 // the languages the docs are written in besides English
 const DOC_LANGS = ["zh", "ja"];
 
@@ -64,9 +78,16 @@ export default {
       return Response.redirect(url.toString(), 301);
     }
     if (url.pathname === "/api/latest") {
+      const lang = url.searchParams.get("lang");
+      // Settings' Stable channel; any other channel, or none, is every
+      // version as it comes out
+      if (url.searchParams.get("channel") === "stable") {
+        const got = await stable(ctx, env, Date.now());
+        if (!got) return json({ error: "the stable version isn't known yet" }, 503, NO_STORE);
+        return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
+      }
       const got = await latest(ctx, env);
       if (!got) return json({ error: "no release yet" }, 503, NO_STORE);
-      const lang = url.searchParams.get("lang");
       return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/partners") {
@@ -91,21 +112,34 @@ export default {
       if (!got) return json({ error: "no releases" }, 503, NO_STORE);
       const after = url.searchParams.get("after"), upto = url.searchParams.get("upto");
       const lang = url.searchParams.get("lang");
-      const pick = got.list
-        .filter((r) => (!after || newer(r.version, after)) && (!upto || !newer(r.version, upto)))
-        .map((r) => ({ ...r, notes: inLang(r.notes, lang) }));
+      // limit: the newest that many alone (Settings' "this version and the
+      // 10 before it", Linka), so an app asking for 11 isn't sent 100
+      const limit = parseInt(url.searchParams.get("limit"), 10);
+      const within = (r) => (!after || newer(r.version, after)) && (!upto || !newer(r.version, upto));
+      let pick = got.list.filter(within);
+      // the hundred newest are a day of releases: a range reaching further
+      // back (a Stable app's week, an app long unopened) is read on from
+      // the ledger
+      const oldest = got.list.at(-1);
+      const short = after ? !oldest || newer(oldest.version, after) : limit > 0 ? pick.length < limit : !pick.some((r) => r.version === upto);
+      if (short && upto) pick = [...pick, ...(await fromLedger(env, oldest && oldest.version, after, upto, limit > 0 ? limit - pick.length : LEDGER_MOST))];
+      pick = pick.slice(0, limit > 0 ? limit : undefined).map((r) => ({ ...r, notes: inLang(r.notes, lang) }));
       return json({ releases: pick }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/icon") return icon(url.searchParams.get("url"));
+    if (url.pathname.startsWith(RELAY)) return relay(req, url);
     if (url.pathname === "/download" || url.pathname.startsWith("/download/")) {
       const want = url.pathname.split("/")[2] || "mac-arm64";
       const got = await latest(ctx, env);
       const asset = got && got.rel.assets && got.rel.assets[SHORT[want] || want];
       if (!asset) return new Response("not found\n", { status: 404 });
+      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: want, file: SHORT[want] || want, client: client(req), country: country(req) }));
       return Response.redirect(asset.url, 302);
     }
     const guide = DOCS[url.pathname.replace(/\/+$/, "")];
     if (guide) return Response.redirect(new URL(guide, url).toString(), 302);
+    const moved = MOVED[url.pathname.replace(/(\.html)?\/*$/, "")];
+    if (moved) return Response.redirect(new URL(moved + url.search, url).toString(), 301);
     // an English docs page, to a browser whose language has its own: as /
     // does, until a language is picked
     const doc = url.pathname.match(/^\/docs\/([a-z-]+)(\.html)?$/);
@@ -116,7 +150,7 @@ export default {
       // a page not written in that language yet stays English
       if (DOC_LANGS.includes(lang) && (await env.ASSETS.fetch(new Request(new URL(there, url), { method: "HEAD" }))).ok)
         return new Response(null, { status: 302, headers: { Location: there + url.search, ...vary } });
-      const res = beacon(await env.ASSETS.fetch(req));
+      const res = beacon(await withWall(await env.ASSETS.fetch(req), env, url));
       const out = new Response(res.body, res);
       out.headers.append("Vary", "Accept-Language, Cookie");
       out.headers.set("Cache-Control", "no-cache");
@@ -139,7 +173,14 @@ export default {
       out.headers.append("Vary", "Accept-Language, Cookie");
       return out;
     }
-    return beacon(await env.ASSETS.fetch(req));
+    if (url.pathname === "/install.sh" && req.method === "GET")
+      ctx.waitUntil(capture("magpie site install script", { client: client(req), country: country(req) }));
+    return beacon(await withWall(await env.ASSETS.fetch(req), env, url));
+  },
+  // the cron (wrangler.jsonc's triggers) keeps the ledger the Stable
+  // channel is chosen from
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(keepLedger(env, Date.now()));
   },
 };
 
@@ -166,10 +207,13 @@ function live(p, now) {
 
 // served is the list the app gets: those whose term hasn't ended (an
 // ended one stays in partners.js, so the /go links of providers added from
-// it keep working), with their website and key page as /go links.
+// it keep working), with their website and key page as /go links. A
+// website's own host goes beside it as siteHost, for the editor's link to
+// read (www.kimi.com, not usemagpie.ai).
 export function served(list, now) {
   const go = (p, what, r) => GO + [p.id, what, r && r.id].filter(Boolean).map(encodeURIComponent).join("/");
-  const linked = (o, p, r) => ({ ...o, ...(o.website && { website: go(p, "site", r) }), ...(o.keysUrl && { keysUrl: go(p, "keys", r) }) });
+  const host = (u) => { try { return new URL(u).host; } catch { return ""; } };
+  const linked = (o, p, r) => ({ ...o, ...(o.website && { website: go(p, "site", r), siteHost: host(o.website) }), ...(o.keysUrl && { keysUrl: go(p, "keys", r) }) });
   return list
     .filter((p) => !p.until || now < Date.parse(p.until))
     .map((p) => ({ ...linked(p, p), ...(p.regions && { regions: p.regions.map((r) => linked(r, p, r)) }) }));
@@ -206,6 +250,11 @@ function fromMagpie(to) {
   } catch {
     return to;
   }
+}
+
+// client says whether a browser asked, or a command (curl, wget, a script).
+function client(req) {
+  return /^Mozilla\//.test(req.headers.get("User-Agent") || "") ? "browser" : "command";
 }
 
 function country(req) {
@@ -281,10 +330,57 @@ function translate(res, lang) {
   return rw.transform(out);
 }
 
-// beacon adds Cloudflare Web Analytics to a page. The dashboard's automatic
-// injection skips whatever a worker returns, and every page passes through
-// this one.
-const BEACON = `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c09e76abf16b40b2aa5571c196efb847"}'></script>`;
+// relay passes a request of the pages' PostHog snippet (under RELAY) on to
+// PostHog: the library and its config from the assets host, the rest from
+// the ingestion host. The visitor's address goes as X-Forwarded-For, which
+// PostHog reads for the country, and the site's cookies stay here.
+const RELAY = "/r/";
+export async function relay(req, url) {
+  const path = url.pathname.slice(RELAY.length - 1);
+  const host = /^\/(static|array)\//.test(path) ? "us-assets.i.posthog.com" : "us.i.posthog.com";
+  const headers = new Headers(req.headers);
+  for (const h of ["Cookie", "Host"]) headers.delete(h);
+  const ip = req.headers.get("CF-Connecting-IP");
+  if (ip) headers.set("X-Forwarded-For", ip);
+  const body = req.method === "GET" || req.method === "HEAD" ? null : req.body;
+  try {
+    return await fetch(`https://${host}${path}${url.search}`, { method: req.method, headers, body, redirect: "manual" });
+  } catch {
+    return new Response("", { status: 502 });
+  }
+}
+
+// beacon adds Cloudflare Web Analytics and PostHog's Web Analytics to a page.
+// The dashboard's automatic injection skips whatever a worker returns, and
+// every page passes through this one. PostHog's requests go through RELAY
+// on this site. PostHog keeps its visitor id in
+// localStorage, never a cookie: these pages vary on Cookie (the lang
+// cookie), and a per-visitor cookie would ride on every request. It isn't
+// cookieless, since cookieless drops the address before GeoIP and the
+// country with it. It sends page views and leaves, clicks (autocapture,
+// for heatmaps, dead clicks too), Web Vitals and network timings, uncaught
+// errors, and a session recording with every input masked; the recording
+// and the rest of the project's settings come from its remote config, so
+// flags aren't turned off. Nothing is loaded under Do Not Track or Global
+// Privacy Control. Its project is the daily count's.
+const WEB_ANALYTICS = `<script>if(!(navigator.doNotTrack=="1"||window.doNotTrack=="1"||navigator.globalPrivacyControl)){!function(t,e){var o,n,p,r;e.__SV||(window.posthog&&window.posthog.__loaded)||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+" (stub)"},o="capture register unregister opt_out_capturing opt_in_capturing has_opted_out_capturing set_config".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);posthog.init("${POSTHOG_KEY}",{api_host:location.origin+"/r",ui_host:"https://us.posthog.com",persistence:"localStorage",person_profiles:"identified_only",capture_pageview:true,capture_pageleave:true,autocapture:true,enable_heatmaps:true,capture_dead_clicks:true,capture_exceptions:true,capture_performance:{web_vitals:true,network_timing:true},session_recording:{maskAllInputs:true},disable_surveys:true,respect_dnt:true})}</script>`;
+const BEACON = `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c09e76abf16b40b2aa5571c196efb847"}'></script>` + WEB_ANALYTICS;
+
+// The contributors page: its #wall gets the table credits-cli.mjs rendered
+// for that language at deploy. Without it (a deploy that couldn't build
+// it) the page keeps the line it is written with.
+const WALL_PAGE = /^\/docs\/(?:(zh|ja)\/)?contributors(?:\.html)?$/;
+export async function withWall(res, env, url) {
+  const m = url.pathname.match(WALL_PAGE);
+  if (!m || !res.ok || !(res.headers.get("Content-Type") || "").startsWith("text/html")) return res;
+  let table = "";
+  try {
+    const got = await env.ASSETS.fetch(new Request(new URL(`/contributors/${m[1] || "en"}.html`, url)));
+    if (got.ok) table = await got.text();
+  } catch {}
+  if (!table.includes("<table")) return res;
+  return new HTMLRewriter().on("#wall", { element: (el) => el.setInnerContent(table, { html: true }) }).transform(res);
+}
 
 function beacon(res) {
   if (!(res.headers.get("Content-Type") || "").startsWith("text/html")) return res;
@@ -362,10 +458,12 @@ function api(path, env) {
   return fetch(`https://api.github.com/repos/${REPO}/${path}`, { headers });
 }
 
-async function fromAPI(env) {
+// fromAPI is a release from GitHub's API: the newest, or the one path names
+// (releases/tags/v0.1.2), or null.
+async function fromAPI(env, path = "releases/latest") {
   let res;
   try {
-    res = await api("releases/latest", env);
+    res = await api(path, env);
   } catch (e) {
     console.log("github api", e);
     return null;
@@ -399,10 +497,17 @@ async function fromPages() {
     console.log("github latest redirect", res.status);
     return null;
   }
-  const [sums, feed] = await Promise.all([checksums(tag), fromFeed()]);
+  const feed = await fromFeed();
+  return fromSums(tag, (feed || []).find((r) => r.version === tag.replace(/^v/, "")));
+}
+
+// fromSums is tag's release from its SHA256SUMS alone, with its notes and
+// date from entry ({notes, published}) where there is one: every file, its
+// size unknown (0). null when SHA256SUMS can't be read.
+async function fromSums(tag, entry) {
+  const sums = await checksums(tag);
   if (!sums) return null;
   const url = `https://github.com/${REPO}/releases/tag/${tag}`;
-  const entry = (feed || []).find((r) => r.version === tag.replace(/^v/, ""));
   const rel = { version: tag.replace(/^v/, ""), notes: entry ? entry.notes : "", url, published: entry ? entry.published : null, assets: {} };
   for (const [name, sha256] of Object.entries(sums)) {
     rel.assets[name] = { url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, size: 0, sha256 };
@@ -445,6 +550,229 @@ async function releases(ctx, env) {
   const got = { list, degraded: true };
   remember(ctx, "releases", got, BRIEF);
   return got;
+}
+
+// The Stable channel (Settings' Update channel, ssharpcc on X): magpie
+// releases many times a day, and someone who reads every changelog before
+// updating wants fewer, older ones. /api/latest?channel=stable is the
+// update feed for them, chosen here from the release list and never by
+// hand:
+//
+//   - once a week, as the week turns (Monday 00:00 UTC), Stable becomes
+//     the newest release that was out SOAK (three days) by then;
+//   - an urgent release (a security hole, a ban risk, lost data) is Stable
+//     as soon as it is out, until a weekly pick passes it.
+//
+// A release is urgent when its notes have a line that starts with
+// URGENT_MARK: "**Urgent release:** why". magpie-releases' release run
+// writes it from an `Urgent:` trailer on any commit since the version
+// before, and it can be added to a published release's notes by hand
+// (gh release edit) within a day, while the release is on the ledger's
+// first page. GitHub releases are never marked pre-release for this:
+// /download and the Latest mark go by them.
+//
+// A hundred releases are a day or so of magpie, so the list GitHub's API
+// gives in one ask doesn't reach a week back. The ledger does: a KV
+// namespace (LEDGER) the cron fills every quarter hour, its "index" every
+// release of the last LEDGER_DAYS ({v, p: published, u: urgent}, newest
+// first) and "notes:<UTC day>" each day's notes by version, which
+// /api/notes reads for a range older than the hundred newest. Without the
+// ledger, or one that doesn't reach back to the week's cut, Stable isn't
+// known and the feed says so (503) rather than guess. The Docker image's
+// stable tag follows this feed (.github/workflows/docker-stable.yml).
+const DAY = 86400e3;
+const SOAK = 3 * DAY;
+const LEDGER_DAYS = 45;
+const LEDGER_REACH = 21 * DAY; // how far back the cron fills the ledger
+const LEDGER_PAGES = 4; // GitHub API asks one cron run makes at most
+const LEDGER_MOST = 1500; // releases /api/notes reads from the ledger at most
+export const URGENT_MARK = "**Urgent release:**";
+
+// urgentIn says whether a release's notes mark it urgent: a line (or a
+// quoted one) that starts with URGENT_MARK, in any case.
+export function urgentIn(notes) {
+  return /^[ \t]*(?:>[ \t]*)?\*\*urgent release:\*\*/im.test(notes || "");
+}
+
+// weekStart is the Monday 00:00 UTC on or before now, in ms.
+export function weekStart(now) {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - ((d.getUTCDay() + 6) % 7) * DAY;
+}
+
+// stableOf is the Stable release at now among list ([{version, published,
+// urgent}], any order): the newer of the newest release out SOAK before
+// this week began and the newest urgent one. null when the list doesn't
+// reach back to that cut and has no urgent release either: unknown.
+export function stableOf(list, now) {
+  const cut = weekStart(now) - SOAK;
+  let weekly = null, rush = null, reaches = false;
+  for (const r of list) {
+    const at = Date.parse(r.published);
+    if (!(at <= now)) continue; // a date not known, or not yet
+    if (at <= cut) {
+      reaches = true;
+      if (!weekly || newer(r.version, weekly.version)) weekly = r;
+    }
+    if (r.urgent && (!rush || newer(r.version, rush.version))) rush = r;
+  }
+  if (!reaches) return rush;
+  return rush && newer(rush.version, weekly.version) ? rush : weekly;
+}
+
+// readIndex is the ledger's index, null when there is no ledger, and
+// undefined when it can't be read: unknown, never an empty one.
+async function readIndex(env, cacheTtl) {
+  if (!env || !env.LEDGER) return null;
+  try {
+    const ix = await env.LEDGER.get("index", cacheTtl ? { type: "json", cacheTtl } : { type: "json" });
+    if (ix === null) return { list: [] };
+    return Array.isArray(ix && ix.list) ? ix : undefined;
+  } catch (e) {
+    console.log("ledger index", e);
+    return undefined;
+  }
+}
+
+// stable is the Stable release, condensed as latest's is: {rel, degraded},
+// or null when it isn't known. rel also says it is Stable's (channel) and
+// whether it went there as urgent.
+async function stable(ctx, env, now) {
+  const hit = await cached("stable");
+  if (hit && hit.rel && hit.rel.version) return hit;
+  const ix = await readIndex(env, 60);
+  if (!ix) return null;
+  const pick = stableOf(ix.list.map((r) => ({ version: r.v, published: r.p, urgent: !!r.u })), now);
+  if (!pick) return null;
+  const tag = "v" + pick.version;
+  let rel = await fromAPI(env, "releases/tags/" + tag), degraded = false;
+  if (!rel) {
+    // the API said no: the files from SHA256SUMS, the notes from the ledger
+    const [entry] = await fromLedger(env, null, null, pick.version, 1);
+    rel = await fromSums(tag, entry && entry.version === pick.version ? entry : { notes: "", published: pick.published });
+    degraded = true;
+  }
+  if (!rel) return null;
+  const got = { rel: { ...rel, channel: "stable", urgent: !!pick.urgent }, degraded };
+  remember(ctx, "stable", got, degraded ? BRIEF : TTL);
+  return got;
+}
+
+// fromLedger is the notes of the releases the ledger has older than below
+// (every one when null), after after (exclusive, "" for any) up to upto,
+// newest first, at most most: [{version, notes, url, published}].
+async function fromLedger(env, below, after, upto, most) {
+  const ix = await readIndex(env, 300);
+  if (!ix || !(most > 0)) return [];
+  const want = ix.list
+    .filter((r) => (!below || newer(below, r.v)) && (!after || newer(r.v, after)) && !newer(r.v, upto))
+    .sort((a, b) => (newer(a.v, b.v) ? -1 : newer(b.v, a.v) ? 1 : 0))
+    .slice(0, most);
+  const days = [...new Set(want.map((r) => dayOf(r.p)))];
+  const books = await Promise.all(days.map((d) => env.LEDGER.get("notes:" + d, { type: "json", cacheTtl: 300 }).catch(() => null)));
+  const by = Object.fromEntries(days.map((d, i) => [d, books[i] || {}]));
+  return want.map((r) => ({ version: r.v, notes: by[dayOf(r.p)][r.v] || "", url: `https://github.com/${REPO}/releases/tag/v${r.v}`, published: r.p }));
+}
+
+function dayOf(iso) {
+  return String(iso || "").slice(0, 10);
+}
+
+// keepLedger is the cron's run: GitHub's newest hundred releases into the
+// ledger (or the releases feed's ten, when the API says no), the pages
+// after them while the ledger has a hole or doesn't yet reach
+// LEDGER_REACH back, at most LEDGER_PAGES asks. A ledger that can't be
+// read is left alone, never written over as an empty one.
+export async function keepLedger(env, now) {
+  const ix = await readIndex(env);
+  if (!ix) return;
+  const kv = env.LEDGER;
+  const had = new Map(ix.list.map((r) => [r.v, r]));
+  const got = new Map(); // version: {version, notes, published}
+  let asks = 0, bottom = !!ix.bottom;
+  const page = async (n) => {
+    asks++;
+    let res;
+    try {
+      res = await api(`releases?per_page=100&page=${n}`, env);
+    } catch (e) {
+      console.log("ledger page", n, e);
+      return null;
+    }
+    if (!res.ok) {
+      console.log("ledger page", n, res.status);
+      return null;
+    }
+    const rels = (await res.json())
+      .filter((r) => !r.draft && !r.prerelease)
+      .map((r) => ({ version: r.tag_name.replace(/^v/, ""), notes: r.body || "", published: r.published_at }));
+    if (rels.length < 100) bottom = true;
+    for (const r of rels) got.set(r.version, r);
+    return rels;
+  };
+  const first = await page(1);
+  if (!first) for (const r of (await fromFeed()) || []) got.set(r.version, r);
+  // a hole (the cron stopped for a day): the pages after the first until
+  // one meets what the ledger had
+  let n = 1;
+  for (let last = first; last && last.length === 100 && had.size && !last.some((r) => had.has(r.version)) && asks < LEDGER_PAGES; ) last = await page(++n);
+  // reaching back: the page where the ledger's oldest is, then on
+  const oldest = () => {
+    let o = null;
+    for (const r of [...had.values(), ...[...got.values()].map((g) => ({ v: g.version, p: g.published }))]) if (!o || newer(o.v, r.v)) o = r;
+    return o;
+  };
+  let deep = Math.max(n + 1, Math.floor((had.size || got.size) / 100) + 1);
+  while (first && !bottom && asks < LEDGER_PAGES) {
+    const o = oldest();
+    if (o && Date.parse(o.p) <= now - LEDGER_REACH) break;
+    if (!(await page(deep++))) break;
+  }
+  // the index: what was had, what came, nothing older than LEDGER_DAYS
+  const keep = now - LEDGER_DAYS * DAY;
+  const merged = new Map(had);
+  for (const r of got.values()) {
+    // the feed's date is when the release was last edited: the API's, or
+    // the one the ledger has, is when it came out
+    const was = merged.get(r.version);
+    merged.set(r.version, { v: r.version, p: !first && was ? was.p : r.published, u: urgentIn(r.notes) });
+  }
+  const list = [...merged.values()]
+    .filter((r) => r.v && Date.parse(r.p) >= keep)
+    .sort((a, b) => (newer(a.v, b.v) ? -1 : newer(b.v, a.v) ? 1 : 0));
+  const next = { list, bottom };
+  if (JSON.stringify(next) !== JSON.stringify({ list: ix.list, bottom: !!ix.bottom })) await kv.put("index", JSON.stringify(next));
+  // each day's notes, written where they changed
+  const days = new Map();
+  for (const r of got.values()) {
+    // by the day the index has it out (the feed's date is its last edit)
+    const p = merged.get(r.version).p;
+    if (!p || Date.parse(p) < keep) continue;
+    const d = dayOf(p);
+    if (!days.has(d)) days.set(d, []);
+    days.get(d).push(r);
+  }
+  for (const [d, rels] of days) {
+    const key = "notes:" + d;
+    let book;
+    try {
+      book = (await kv.get(key, { type: "json" })) || {};
+    } catch (e) {
+      console.log("ledger notes", d, e);
+      continue; // unreadable: left as it is
+    }
+    let changed = false;
+    for (const r of rels) {
+      // the feed's notes (HTML made markdown, the Chinese marker guessed)
+      // never replace the API's
+      if (!first && book[r.version]) continue;
+      if (book[r.version] !== r.notes) {
+        book[r.version] = r.notes;
+        changed = true;
+      }
+    }
+    if (changed) await kv.put(key, JSON.stringify(book), { expirationTtl: (LEDGER_DAYS + 15) * 86400 });
+  }
 }
 
 // fromFeed is the newest releases from GitHub's releases feed (Atom), which

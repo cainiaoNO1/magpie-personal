@@ -30,9 +30,7 @@ func besideFake(t *testing.T, id string, up http.Handler) string {
 	t.Setenv("FAKE_ID", id)
 	t.Setenv("FAKE_RESPONSES", "1")
 	t.Cleanup(plugin.Settle)
-	srv := httptest.NewServer(up)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAKE_BASE", srv.URL+"/v1")
+	testenv.FakeVendor(t, up)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	abs, _ := filepath.Abs("../plugin/testdata/fake/index.js")
@@ -321,6 +319,26 @@ func TestGrokPluginNonStreamEndedShort(t *testing.T) {
 	rec := httptest.NewRecorder()
 	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
 	if rec.Code != 502 || !strings.Contains(rec.Body.String(), "ended before it was complete") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+// A gathered stream whose last line the upstream never ended, its
+// response.completed with no newline after it, is still read whole: a
+// relayed stream holds an unended line back from the client (#2580), but
+// what is gathered is read here, every byte of it.
+func TestGrokPluginNonStreamLastLineUnended(t *testing.T) {
+	done := `{"id":"r1","object":"response","status":"completed","model":"grok-4.7","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Found it.","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}`
+	pid := besideFake(t, "grok", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`event: response.created`+"\n"+`data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}`)+
+			`event: response.completed`+"\n"+`data: {"type":"response.completed","response":`+done+`}`)
+	}))
+	body := `{"model":"` + pid + `/fake-resp","stream":false,"input":"hi"}`
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Found it.") {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }

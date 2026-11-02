@@ -234,6 +234,18 @@ func TestVSCodeUA(t *testing.T) {
 	}
 }
 
+// VS Code's Agents window runs Codex under the name vscode_agent_host,
+// its User-Agent and originator: its calls are VS Code's, not a row of
+// their own named vscode_agent_host (justruman on Discord). VS Code's
+// Copilot-proxied Codex and Claude names are not it.
+func TestVSCodeAgentHostUA(t *testing.T) {
+	for _, ua := range []string{"vscode_agent_host/0.163.0 (Mac OS 26.2.0; arm64) unknown (vscode_agent_host; 0.1.0)", "vscode_agent_host"} {
+		if got := usage.AgentOf(ua); got != "vscode" {
+			t.Errorf("%q: %q", ua, got)
+		}
+	}
+}
+
 // VS Code Insiders is its own row (wani on Discord): its User folder is
 // "Code - Insiders" beside VS Code's "Code", connected it writes only there,
 // and its models send a token of its own, since its chat's User-Agent is
@@ -498,5 +510,85 @@ func TestVSCodeChatInstalledWithoutExtensionsJSON(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "github.copilot-chat-0.48.1", "package.json"), `{not json`)
 	if c := vscodeChatOf(dir); c.vendor != vscodeEndpoint || c.none || c.unsupported {
 		t.Fatalf("unreadable: %+v", c)
+	}
+}
+
+// the reasoning effort picked for a model in Copilot Chat's model picker,
+// which VS Code writes into magpie's group as
+// settings["<model id>"].reasoningEffort, stays through a Sync with nothing
+// changed, a Sync after the catalog changed and a model picked in magpie
+// (chim3744 on Discord: max went out as low, the first level, after each)
+func TestVSCodeKeepsThePickedEffort(t *testing.T) {
+	home := syncHome(t)
+	dir := filepath.Join(home, "vscode", "User")
+	a := vscodeAt(dir)
+	writeFile(t, a.Path, "{}\n")
+	if err := a.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	lm := filepath.Join(dir, "chatLanguageModels.json")
+	// what VS Code 1.142 writes on a pick (setModelConfiguration), with a
+	// model magpie no longer lists picked before
+	g, ok := edit.GetJSONItem(lm, vscodeGroup)
+	if !ok {
+		t.Fatalf("no group:\n%s", readFile(lm))
+	}
+	var group map[string]any
+	if err := json.Unmarshal([]byte(g), &group); err != nil {
+		t.Fatal(err)
+	}
+	group["settings"] = map[string]any{
+		"relay/glm-4.6": map[string]any{"reasoningEffort": "max"},
+		"relay/gone":    map[string]any{"reasoningEffort": "high"},
+	}
+	if err := edit.SetJSONItem(lm, vscodeGroup, group); err != nil {
+		t.Fatal(err)
+	}
+	kept := func(when string) {
+		t.Helper()
+		g, _ := edit.GetJSONItem(lm, vscodeGroup)
+		if e := gjson.Get(g, `settings.relay/glm-4\.6.reasoningEffort`).String(); e != "max" {
+			t.Fatalf("%s: the picked effort is %q, want max:\n%s", when, e, g)
+		}
+		if e := gjson.Get(g, "settings.relay/gone.reasoningEffort").String(); e != "high" {
+			t.Fatalf("%s: a gone model's effort is %q, want high:\n%s", when, e, g)
+		}
+	}
+
+	before := readFile(lm)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	kept("a sync with nothing changed")
+	if readFile(lm) != before {
+		t.Fatalf("a sync with nothing changed rewrote the file:\n%s\n---\n%s", before, readFile(lm))
+	}
+
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"glm-4.6", "other"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	kept("a sync after the catalog changed")
+	if g, _ := edit.GetJSONItem(lm, vscodeGroup); gjson.Get(g, "models.#").Int() != 2 {
+		t.Fatalf("not synced: %s", g)
+	}
+
+	if err := a.Apply("model", "magpie/relay/other"); err != nil {
+		t.Fatal(err)
+	}
+	kept("a model picked in magpie")
+
+	// a model gone from the catalog still leaves the list
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"glm-4.6"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	kept("a sync after a model went")
+	if g, _ := edit.GetJSONItem(lm, vscodeGroup); gjson.Get(g, "models.#").Int() != 1 {
+		t.Fatalf("a gone model stayed: %s", g)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/provider"
 	"gopkg.in/yaml.v3"
 )
@@ -45,9 +46,15 @@ func SyncCatalog() {
 		// the catalog built once for every agent's lists, not for each
 		// look-up of each (thousands at magpie's start, with 30 providers)
 		release := provider.Hold()
+		// and each agent's files looked at once a round, not each time
+		// one is asked about (#1665: settings.json hundreds of times a
+		// round); a write is made from what is on the disk (edit.Read)
+		unhold := filememo.Hold()
 		renaming := setToFoundGroups()
 		for _, a := range All() {
-			if a.Sync != nil {
+			// a provider named magpie written by hand is the user's, its
+			// model list too (handWired)
+			if a.Sync != nil && !a.handWired() && (!a.ListOnly || a.Wired()) {
 				_ = synced(a.Sync)
 			}
 			// a field magpie set to a found group's id before (autoref.go)
@@ -55,6 +62,7 @@ func SyncCatalog() {
 				a.renameFoundGroups()
 			}
 		}
+		unhold()
 		release()
 		syncing.Lock()
 		if !syncing.again {
@@ -65,6 +73,52 @@ func SyncCatalog() {
 		syncing.again = false
 		syncing.Unlock()
 	}
+}
+
+// soon counts the SyncCatalogSoon rounds not done yet. Not a WaitGroup:
+// a save may start one while a command's end waits for them.
+var soon struct {
+	sync.Mutex
+	n    int
+	idle *sync.Cond
+}
+
+func init() { soon.idle = sync.NewCond(&soon.Mutex) }
+
+// SyncCatalogSoon is SyncCatalog behind the caller, which is what
+// catalog.Changed is set to: a group or a provider saved answers at once,
+// and the agents' files follow a moment later. The sync builds every
+// agent's lists and writes the ones that differ. On Windows a file another
+// program holds open refuses the rename over it, and steady.Rename waits
+// half a second on each such file before giving up; in WSL each file is
+// read and written through wsl.exe and \\wsl.localhost. A save that waited
+// on it took seconds now and then on Windows, while an agent was at work
+// (CyberCaius on Discord: 路由组和供应商编辑保存有时候保存会卡很久). A sync
+// already running takes the change in its next round, as SyncCatalog does.
+func SyncCatalogSoon() {
+	soon.Lock()
+	soon.n++
+	soon.Unlock()
+	go func() {
+		defer func() {
+			soon.Lock()
+			if soon.n--; soon.n == 0 {
+				soon.idle.Broadcast()
+			}
+			soon.Unlock()
+		}()
+		SyncCatalog()
+	}()
+}
+
+// SyncCatalogSettled waits for every SyncCatalogSoon round started so far:
+// a command that saved something ends with the agents' files written.
+func SyncCatalogSettled() {
+	soon.Lock()
+	for soon.n > 0 {
+		soon.idle.Wait()
+	}
+	soon.Unlock()
 }
 
 // syncJSON rewrites the value at key of a JSON file, if the file has one

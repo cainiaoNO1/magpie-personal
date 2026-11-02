@@ -199,6 +199,11 @@ func TestCodexInstructionsSaved(t *testing.T) {
 	if got := codexInstructions("gpt-9"); got != codexcat.Prompt {
 		t.Fatalf("unknown model: %q", got)
 	}
+	// a model neither list has but Codex's bundled catalog does: that
+	// catalog's, as Codex CLI sends it, not its prompt for an unknown model
+	if got := codexInstructions("gpt-6-astra"); got != codexcat.Official("gpt-6-astra") || got == codexcat.Prompt {
+		t.Fatalf("bundled model: %.60q", got)
+	}
 	saveCodexPrompts([]byte(`{"models":[{"slug":"gpt-5.5","model_messages":{"instructions_template":"fetched"}},{"slug":"gpt-4","base_instructions":"base"}]}`))
 	if got := codexInstructions("gpt-5.5"); got != "fetched" {
 		t.Fatalf("after a fetch: %q", got)
@@ -373,5 +378,33 @@ func TestCodexBodyDropsPromptCacheOptions(t *testing.T) {
 	}
 	if m["prompt_cache_key"] != "k" {
 		t.Errorf("cache key lost: %v", m)
+	}
+}
+
+// A message's status goes with its id, and Codex's reasoning items carry
+// none, so both lose it with the id (Doby on Discord: Pi's assistant
+// message sent again with status "completed" was refused 400 "Unknown
+// parameter: 'input[8].status'"). A tool call keeps its status, as Codex
+// sends it.
+func TestCodexInputDropsStatusWithID(t *testing.T) {
+	in := []any{}
+	json.Unmarshal([]byte(`[
+	  {"role":"user","content":"hi","status":"completed"},
+	  {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"e","status":"completed"},
+	  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}],"status":"completed","id":"msg_1"},
+	  {"type":"function_call","id":"fc_1","call_id":"c1","name":"ls","arguments":"{}","status":"completed"},
+	  {"type":"local_shell_call","id":"lsh_1","call_id":"c2","status":"completed","action":{"type":"exec","command":["ls"]}},
+	  {"type":"function_call_output","call_id":"c1","output":"a"},
+	  {"type":"local_shell_call_output","call_id":"c2","output":"b"}]`), &in)
+	out := codexInput(in)
+	want := []bool{false, false, false, true, true, false, false}
+	if len(out) != len(want) {
+		t.Fatalf("items: %v", out)
+	}
+	for i, item := range out {
+		_, has := item.(map[string]any)["status"]
+		if has != want[i] {
+			t.Errorf("input[%d] status kept %v, want %v: %v", i, has, want[i], item)
+		}
 	}
 }

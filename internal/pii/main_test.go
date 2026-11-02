@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -37,8 +38,21 @@ const (
 //	ok           as pf-serve does
 //	gpudies      on the GPU, ends at its first request
 //	hang         never answers a request
+//	loadhang     never says the model is loaded
+//	slow         answers each request after 300ms
 //	noload       says it couldn't load the model
+//	badmodel     says it couldn't read the model's file, by the name
+//	             it was given
 //	novulkan     as pf-serve-vulkan, says Vulkan is missing; else ok
+//	gpuloadhang  on the GPU, never says the model is loaded; else ok
+//	asserts      fails a ggml assert at its first request
+//	gpuhang      on the GPU, never answers a request; else ok
+//	gpuhangonce  on the GPU, never answers the first request of the
+//	             test; else ok
+//	gpudiesonce  on the GPU, ends at the first request of the test;
+//	             else ok
+//
+// Like pf-serve, it first writes ggml's startup lines to stderr.
 func fakeServe(mode string) {
 	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	gpu := os.Getenv("PF_DEVICE") != "cpu"
@@ -56,9 +70,33 @@ func fakeServe(mode string) {
 		}
 	}
 	logf("start %s %s", name, device)
+	// as ggml_metal writes them on an M2, GPU or CPU alike
+	fmt.Fprintln(os.Stderr, "ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices")
+	fmt.Fprintln(os.Stderr, "ggml_metal_library_init: using embedded metal library")
+	fmt.Fprintln(os.Stderr, "ggml_metal_device_init: GPU name:   MTL0 (Apple M2)")
+	fmt.Fprintln(os.Stderr, "ggml_metal_device_init: recommendedMaxWorkingSetSize  = 12713.12 MB")
+	logf("path %s", filepath.Base(filepath.Dir(os.Args[0])))
+	logf("residency %s", os.Getenv("GGML_METAL_NO_RESIDENCY"))
+	logf("moechunk %s %s", name, os.Getenv("PF_MOE_CHUNK"))
+	// as pf-serve on Windows, whose argv is in the ANSI code page and
+	// whose ggml reads it as UTF-8: a model path with a byte outside
+	// ASCII can't be opened. And it opens the file from where it runs.
+	model := ""
+	if len(os.Args) > 1 {
+		model = os.Args[1]
+	}
+	logf("model %s", model)
+	_, err := os.Stat(model)
+	if strings.IndexFunc(model, func(r rune) bool { return r > 0x7f }) >= 0 || err != nil || mode == "badmodel" {
+		json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "failed to read GGUF: " + model})
+		os.Exit(1)
+	}
 	if mode == "noload" || mode == "novulkan" && name == "pf-serve-vulkan" {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "can't load " + mode})
 		os.Exit(1)
+	}
+	if mode == "loadhang" || mode == "gpuloadhang" && gpu {
+		time.Sleep(time.Hour)
 	}
 	json.NewEncoder(os.Stdout).Encode(map[string]any{"device": device, "gpu": gpu, "ms": 7})
 	in := bufio.NewReader(os.Stdin)
@@ -82,12 +120,26 @@ func fakeServe(mode string) {
 			texts[i] = string(b)
 		}
 		logf("request %d %q", n, texts)
+		// once: the first request of the test, on the GPU
+		once := false
+		if p := os.Getenv(fakeLog); p != "" && gpu && strings.HasSuffix(mode, "once") {
+			if f, err := os.OpenFile(p+".once", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err == nil {
+				f.Close()
+				once = true
+			}
+		}
 		switch {
-		case mode == "gpudies" && gpu:
+		case mode == "gpudies" && gpu, mode == "gpudiesonce" && once:
 			fmt.Fprintln(os.Stderr, "ggml_metal: device lost")
 			os.Exit(3)
-		case mode == "hang":
+		case mode == "hang", mode == "gpuhang" && gpu, mode == "gpuhangonce" && once:
 			time.Sleep(time.Hour)
+		case mode == "asserts":
+			fmt.Fprintln(os.Stderr, "ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_add_id'")
+			fmt.Fprintln(os.Stderr, "/ggml/src/ggml-metal/ggml-metal-ops.cpp:1234: GGML_ASSERT(ne00 % 4 == 0) failed")
+			os.Exit(3)
+		case mode == "slow":
+			time.Sleep(300 * time.Millisecond)
 		}
 		put(uint32(0))
 		for _, t := range texts {
@@ -118,13 +170,36 @@ func fakeServe(mode string) {
 // test's own; it gives the file the stand-in logs to.
 func fakeInstall(t *testing.T, mode string, vulkan bool) string {
 	t.Helper()
-	d := t.TempDir()
+	return fakeInstallAt(t, mode, vulkan, t.TempDir())
+}
+
+// fakeInstallAt is fakeInstall in folder d.
+func fakeInstallAt(t *testing.T, mode string, vulkan bool, d string) string {
+	t.Helper()
+	upgrades.Wait() // one started before reads dir
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	was, wasSize, wasIdle := dir, modelSize, idleAfter
 	dir, modelSize = func() string { return d }, 4
 	t.Cleanup(func() {
 		Stop()
+		// a request Stop failed lets its turn go
+		turn <- struct{}{}
+		<-turn
+		upgrades.Wait()
+		disk.mu.Lock()
+		if disk.timer != nil && disk.timer.Stop() {
+			disk.saves.Done()
+		}
+		disk.timer = nil
+		disk.loaded = ""
+		disk.mu.Unlock()
+		disk.saves.Wait() // a write under way reads dir
 		srv.mu.Lock()
 		srv.cpu, srv.gpuLost, srv.failed = false, "", ""
+		srv.gpuFails, srv.gpuAgain = 0, time.Time{}
+		srv.lastErr, srv.fails, srv.retryAt = nil, 0, time.Time{}
 		srv.mu.Unlock()
 		cache.mu.Lock()
 		cache.ll.Init()
@@ -157,6 +232,19 @@ func fakeInstall(t *testing.T, mode string, vulkan bool) string {
 	t.Setenv(fakeVar, mode)
 	t.Setenv(fakeLog, log)
 	return log
+}
+
+// gpuInstall is fakeInstall with a GPU's pf-serve to start first:
+// macOS's own, which runs on Metal, or elsewhere pf-serve-vulkan, as a
+// computer with no Vulkan loader has none (#3741: these tests took
+// macOS's for every system, and were red on Linux). It answers the line
+// the stand-in logs as it starts there.
+func gpuInstall(t *testing.T, mode string) (log, gpuStart string) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		return fakeInstall(t, mode, false), "start pf-serve MTL0"
+	}
+	return fakeInstall(t, mode, true), "start pf-serve-vulkan MTL0"
 }
 
 // fakeLines are the lines the stand-in logged that start with prefix.

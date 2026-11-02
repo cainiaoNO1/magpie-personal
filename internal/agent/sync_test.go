@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,6 +42,8 @@ func syncHome(t *testing.T) string {
 	t.Setenv("SENPI_CODING_AGENT_DIR", "")
 	t.Setenv("PRIME_AGENT_CODING_AGENT_DIR", "")
 	t.Setenv("MOTHX_DIR", "")
+	t.Setenv("PENGUIN_HOME", "")
+	t.Setenv("PENGUIN_PROJECT_ID", "")
 	t.Setenv("PI_CODING_AGENT_DIR", "")
 	t.Setenv("PI_CONFIG_DIR", "")
 	t.Setenv("OMP_PROFILE", "")
@@ -139,8 +142,8 @@ func TestCrushModelsCarryMaxTokens(t *testing.T) {
 // output. ZCode and WorkBuddy cap it at zcodeMaxOutput besides, Crush falls
 // back to 16384 without a known output, OpenCode is handed no limit without
 // a window, and AtomCode and Snow CLI, each told a window of its own when
-// the model's isn't known, are cut to that. dsh is held to a quarter of
-// a known window (dshMaxTokens, #2823).
+// the model's isn't known, are cut to that. dsh is held to what leaves it
+// half of a known window, or a quarter of it (dshMaxTokens, #2823).
 func TestMaxTokensWithinContextWindow(t *testing.T) {
 	home := syncHome(t)
 	check := func(limit string, want, window int) {
@@ -181,10 +184,11 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 			told = strconv.Itoa(min(want, atomcodeContext))
 		}
 		// dsh reserves maxTokens out of its window before compacting, so a
-		// known window holds it to a quarter (dshMaxTokens, #2823).
+		// known window holds it to what leaves dsh half of it, or a quarter
+		// where that is more (dshMaxTokens, #2823, #3298).
 		dshTold := n
 		if strings.Contains(limit, "context") {
-			dshTold = strconv.Itoa(min(want, window/4))
+			dshTold = strconv.Itoa(min(want, max(window/4, window/2-65536)))
 		}
 		snowTold := n
 		if !strings.Contains(limit, "context") {
@@ -226,6 +230,10 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 	home := syncHome(t)
 	piModels := filepath.Join(home, ".pi", "agent", "models.json")
 	writeFile(t, piModels, `{"providers":{"mine":{"baseUrl":"http://x"},"magpie":{"name":"magpie","models":[]}}}`)
+	// connected: a block of magpie's name in an agent not on magpie is the
+	// user's own (TestCatalogSyncLeavesAHandWrittenMagpieBlock)
+	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"defaultProvider":"magpie","defaultModel":"relay/glm-4.6"}`)
+	setUpInMagpie("pi")
 	crushCfg := filepath.Join(home, ".config", "crush", "crush.json")
 	crushBody := `{"providers":{"mine":{"base_url":"http://x"}}}`
 	writeFile(t, crushCfg, crushBody)
@@ -432,12 +440,15 @@ func TestMiMoCodeCatalogNarrowedSeparately(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { settings.Save(settings.Settings{}) })
-	mimo := magpieProviderJSONFor("opencode", "mimocode").(map[string]any)["models"].(map[string]any)
-	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(map[string]any)
-	if len(mimo) != 1 || mimo["relay/glm-4.6"] == nil {
+	mimo := magpieProviderJSONFor("opencode", "mimocode").(map[string]any)["models"].(orderedJSON)
+	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(orderedJSON)
+	has := func(ms orderedJSON, id string) bool {
+		return slices.IndexFunc(ms, func(p jsonPair) bool { return p.k == id }) >= 0
+	}
+	if len(mimo) != 1 || !has(mimo, "relay/glm-4.6") {
 		t.Fatalf("mimocode catalog: %v", mimo)
 	}
-	if oc["relay/glm-4.6"] == nil {
+	if !has(oc, "relay/glm-4.6") {
 		t.Fatalf("opencode catalog was narrowed too: %v", oc)
 	}
 }

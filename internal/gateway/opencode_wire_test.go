@@ -134,7 +134,7 @@ func TestOtherRelayKeepsItsOneAPI(t *testing.T) {
 	if apis := p.APIs("gpt-6-luna"); apis != nil {
 		t.Errorf("relay gpt-6-luna APIs %v, want none named", apis)
 	}
-	if got := nativeEndpoints(provider.Entry{Provider: *p, Model: "gpt-6-luna", ID: "relay/gpt-6-luna"}); len(got) != 1 || got[0] != "/v1/chat/completions" {
+	if got := provider.NativeEndpoints(provider.Entry{Provider: *p, Model: "gpt-6-luna", ID: "relay/gpt-6-luna"}); len(got) != 1 || got[0] != "/v1/chat/completions" {
 		t.Errorf("relay native_endpoints %v", got)
 	}
 }
@@ -163,5 +163,15 @@ func TestWrongAPINote(t *testing.T) {
 	}
 	if got := wrongAPINote(p, "glm-5.3", res, nil); got != " (asked at https://opencode.ai/zen/go/v1/chat/completions)" {
 		t.Errorf("glm note %q", got)
+	}
+	// a relay with its chat URL alone that names Responses in Chinese:
+	// the note says to set that URL (#3766)
+	ar := provider.Provider{ID: "agentrouter", Name: "AgentRouter", Chat: "https://agentrouter.org/v1"}
+	u, _ = url.Parse("https://agentrouter.org/v1/chat/completions")
+	res = &http.Response{Request: &http.Request{URL: u}}
+	for _, body := range []string{agentRouterRefusal, agentRouterEscaped} {
+		if got := wrongAPINote(ar, "gpt-5.6-sol", res, []byte(body)); got != " (asked at https://agentrouter.org/v1/chat/completions; gpt-5.6-sol is served on /v1/responses, which AgentRouter has no URL for)" {
+			t.Errorf("AgentRouter note %q for %s", got, body)
+		}
 	}
 }

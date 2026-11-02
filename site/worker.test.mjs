@@ -54,11 +54,17 @@ const FEED = `<?xml version="1.0" encoding="UTF-8"?>
 </feed>`;
 // what the worker sent PostHog
 const captured = [];
+// what the worker passed on to PostHog for the pages' snippet (relay)
+const relayed = [];
 globalThis.fetch = async (u, init = {}) => {
   u = String(u);
   if (u === "https://us.i.posthog.com/i/v0/e/") {
     captured.push(JSON.parse(init.body));
     return new Response("{}");
+  }
+  if (/^https:\/\/us(-assets)?\.i\.posthog\.com\//.test(u)) {
+    relayed.push({ u, method: init.method, headers: new Headers(init.headers), body: init.body && (await new Response(init.body).text()) });
+    return new Response("relayed");
   }
   if (u.startsWith("https://api.github.com/")) {
     seen.push(new Headers(init.headers));
@@ -102,6 +108,16 @@ test("notes: each release in the language, English where it has no Chinese", asy
   assert.deepEqual(en.map((r) => [r.version, r.notes]), [["0.1.3", EN], ["0.1.2", BODIES["v0.1.2"]]]);
   const again = (await get("/api/notes?after=0.1.1&upto=0.1.3&lang=zh")).body.releases;
   assert.equal(again[0].notes, ZH);
+});
+
+test("notes: limit keeps the newest that many up to upto", async () => {
+  const two = (await get("/api/notes?upto=0.1.3&limit=2")).body.releases;
+  assert.deepEqual(two.map((r) => r.version), ["0.1.3", "0.1.2"]);
+  const one = (await get("/api/notes?upto=0.1.2&limit=1")).body.releases;
+  assert.deepEqual(one.map((r) => r.version), ["0.1.2"]);
+  for (const q of ["", "&limit=0", "&limit=x", "&limit=-1"]) {
+    assert.equal((await get("/api/notes?upto=0.1.3" + q)).body.releases.length, 3, q);
+  }
 });
 
 test("i18n: every string the home page marks has its Chinese, and no other", async () => {
@@ -154,6 +170,18 @@ test("docs: the bare docs paths open each language's guide", async () => {
     const res = await worker.fetch(new Request("https://usemagpie.ai" + from), env, ctx);
     assert.equal(new URL(res.headers.get("Location"), "https://usemagpie.ai").pathname, to, from);
   }
+});
+
+test("docs: the MCP hub's old pages go to the MCP router's, keeping the query", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("asset") } };
+  for (const [from, to] of [["/docs/mcp-hub", "/docs/mcp-router"], ["/docs/mcp-hub.html", "/docs/mcp-router"], ["/docs/zh/mcp-hub/", "/docs/zh/mcp-router"], ["/docs/ja/mcp-hub.html?x=1", "/docs/ja/mcp-router?x=1"]]) {
+    const res = await worker.fetch(new Request("https://usemagpie.ai" + from), env, ctx);
+    assert.equal(res.status, 301, from);
+    const got = new URL(res.headers.get("Location"));
+    assert.equal(got.pathname + got.search, to, from);
+  }
+  const res = await worker.fetch(new Request("https://usemagpie.ai/docs/mcp-router"), env, ctx);
+  assert.equal(await res.text(), "asset");
 });
 
 // #661: the update window showed no notes while GitHub's API limited the
@@ -254,6 +282,64 @@ test("download: a platform's link goes to that asset of the latest release", asy
   assert.equal((await ask("/download/nothing-like-it")).status, 404);
 });
 
+test("download: each link followed is counted, with the platform, the country and a browser or a command", async () => {
+  captured.length = 0;
+  const req = new Request("https://usemagpie.ai/download/linux", { headers: { "User-Agent": "curl/8.7.1" } });
+  req.cf = { country: "BR" };
+  assert.equal((await worker.fetch(req, {}, ctx)).status, 302);
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].event, "magpie site download");
+  assert.deepEqual(captured[0].properties, { link: "linux", file: "magpie-linux-amd64", client: "command", country: "BR", $process_person_profile: false });
+  captured.length = 0;
+  await worker.fetch(new Request("https://usemagpie.ai/download/linux", { headers: { "User-Agent": "Mozilla/5.0 (Macintosh)" } }), {}, ctx);
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured[0].properties.client, "browser");
+  // a HEAD, or a file the release doesn't have, isn't counted
+  captured.length = 0;
+  await worker.fetch(new Request("https://usemagpie.ai/download/linux", { method: "HEAD" }), {}, ctx);
+  await ask("/download/nothing-like-it");
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.deepEqual(captured, []);
+});
+
+test("install.sh: each fetch is counted", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("#!/bin/sh\n", { headers: { "Content-Type": "text/x-sh" } }) } };
+  captured.length = 0;
+  const res = await worker.fetch(new Request("https://usemagpie.ai/install.sh", { headers: { "User-Agent": "curl/8.7.1" } }), env, ctx);
+  assert.equal(await res.text(), "#!/bin/sh\n");
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].event, "magpie site install script");
+  assert.equal(captured[0].properties.client, "command");
+});
+
+test("relay: the snippet's requests reach PostHog with the visitor's address and without the site's cookies", async () => {
+  relayed.length = 0;
+  const post = new Request("https://usemagpie.ai/r/e/?ip=0&ver=1.442.1", {
+    method: "POST",
+    body: "gzipped",
+    headers: { Cookie: "lang=zh", "CF-Connecting-IP": "203.0.113.7", "Content-Type": "text/plain", "User-Agent": "Mozilla/5.0" },
+  });
+  assert.equal(await (await worker.fetch(post, {}, ctx)).text(), "relayed");
+  await worker.fetch(new Request("https://usemagpie.ai/r/static/array.js"), {}, ctx);
+  await worker.fetch(new Request("https://usemagpie.ai/r/array/phc_x/config.js"), {}, ctx);
+  await worker.fetch(new Request("https://usemagpie.ai/r/flags/?v=2"), {}, ctx);
+  assert.deepEqual(relayed.map((r) => r.u), [
+    "https://us.i.posthog.com/e/?ip=0&ver=1.442.1",
+    "https://us-assets.i.posthog.com/static/array.js",
+    "https://us-assets.i.posthog.com/array/phc_x/config.js",
+    "https://us.i.posthog.com/flags/?v=2",
+  ]);
+  const [e] = relayed;
+  assert.equal(e.method, "POST");
+  assert.equal(e.body, "gzipped");
+  assert.equal(e.headers.get("X-Forwarded-For"), "203.0.113.7");
+  assert.equal(e.headers.get("Cookie"), null);
+  assert.equal(e.headers.get("User-Agent"), "Mozilla/5.0");
+});
+
+
 test("docs: an English docs page sends a browser that prefers Chinese or Japanese to its own, until a language is picked", async () => {
   const have = new Set(["/docs/start", "/docs/zh/start", "/docs/ja/start", "/docs/only-en"]);
   const env = { ASSETS: { fetch: async (r) => new Response(have.has(new URL(r.url).pathname) ? "<html></html>" : "nf", { status: have.has(new URL(r.url).pathname) ? 200 : 404, headers: { "Content-Type": "text/plain" } }) } };
@@ -322,6 +408,10 @@ test("partners: links go through /go", () => {
   assert.equal(acme.chat, LIST[0].chat);
   assert.equal(acme.regions[0].keysUrl, "https://usemagpie.ai/go/acme/keys/cn");
   assert.equal(acme.regions[0].website, undefined);
+  // the editor names a /go website by the host it sends the browser to
+  assert.equal(acme.siteHost, "acme.example");
+  assert.equal(acme.regions[0].siteHost, undefined);
+  assert.equal(plain.siteHost, undefined);
   assert.equal(acme.regions[1].keysUrl, undefined);
   assert.deepEqual(plain, LIST[1]);
   // partners.js itself is left as it is
@@ -489,4 +579,133 @@ test("sponsors: the home page and the READMEs link every sponsor through /go", a
     }
   const home = readFileSync(pages.home[0], "utf8");
   for (const s of SPONSORS.filter((s) => s.home)) assert.ok(home.includes(`href="/go/${s.id}/home"`), s.id);
+});
+
+// HTMLRewriter is Cloudflare's; this stands in for the two uses here: a
+// selector's inner content set, and the body appended to
+class FakeRewriter {
+  constructor() { this.h = []; }
+  on(sel, h) { this.h.push([sel, h]); return this; }
+  transform(res) {
+    const hs = this.h;
+    return new Response(new ReadableStream({
+      async start(c) {
+        let t = await res.text();
+        for (const [sel, h] of hs) {
+          let inner, tail = "";
+          h.element({ setInnerContent: (x) => (inner = x), append: (x) => (tail += x) });
+          if (sel === "#wall" && inner !== undefined) t = t.replace(/(<div id="wall">)[\s\S]*?(<\/div>)/, (_, a, b) => a + inner + b);
+          if (sel === "body") t = t.replace("</body>", tail + "</body>");
+        }
+        c.enqueue(new TextEncoder().encode(t));
+        c.close();
+      },
+    }), res);
+  }
+}
+
+test("contributors: each language's page gets its own table, and keeps its line without one", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { renderWall } = await import("./credits.mjs");
+  const data = { people: [{ name: "packinggoodsllc_07668", via: ["Discord"], releases: [{ v: "0.1.2581", what: ["a contributors page"] }] }] };
+  const page = (p) => new URL(`./public${p}.html`, import.meta.url);
+  let fragments = true;
+  const asked = [];
+  const env = {
+    ASSETS: {
+      fetch: async (r) => {
+        const p = new URL(r.url).pathname.replace(/\.html$/, "");
+        asked.push(p);
+        const m = p.match(/^\/contributors\/(en|zh|ja)$/);
+        if (m) return fragments ? new Response(renderWall(data, m[1]), { headers: { "Content-Type": "text/html" } }) : new Response("nf", { status: 404 });
+        try { return new Response(readFileSync(page(p), "utf8"), { headers: { "Content-Type": "text/html; charset=utf-8" } }); } catch { return new Response("nf", { status: 404 }); }
+      },
+    },
+  };
+  const was = globalThis.HTMLRewriter;
+  globalThis.HTMLRewriter = FakeRewriter;
+  try {
+    const get = async (path) => (await worker.fetch(new Request(`https://usemagpie.ai${path}`, { headers: { Cookie: "lang=en" } }), env, ctx)).text();
+    for (const [path, lang, head] of [["/docs/contributors", "en", "What came of it"], ["/docs/zh/contributors", "zh", "带来的改动"], ["/docs/ja/contributors.html", "ja", "そこから生まれた"]]) {
+      const html = await get(path);
+      assert.match(html, /<div id="wall"><div class="table-wrap"><table class="cw">/, path);
+      assert.ok(html.includes(head), `${path} has the ${lang} table`);
+      assert.ok(html.includes("packinggoodsllc_07668") && html.includes("v0.1.2581"), path);
+      assert.match(html, /static\.cloudflareinsights\.com/, `${path} keeps the beacon`);
+    }
+    fragments = false;
+    const bare = await get("/docs/zh/contributors");
+    assert.ok(!bare.includes('<table class="cw">'));
+    assert.match(bare, /<div id="wall"><p>名单在每次部署网站时/);
+    // no other page asks for a table
+    asked.length = 0;
+    await get("/docs/start");
+    assert.deepEqual(asked, ["/docs/start"]);
+  } finally {
+    globalThis.HTMLRewriter = was;
+  }
+});
+
+test("contributors: the pages say how to be left off, and every docs footer links them", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const dir = (d) => new URL(`./public/docs/${d}`, import.meta.url);
+  for (const [pre, file] of [["/docs/", "contributors.html"], ["/docs/zh/", "zh/contributors.html"], ["/docs/ja/", "ja/contributors.html"]]) {
+    const html = readFileSync(dir(file), "utf8");
+    assert.match(html, /<div id="wall">/, file);
+    assert.ok(html.includes("site/contributors-exclude.txt"), file);
+    for (const l of ["en", "zh", "ja"]) assert.ok(html.includes(`hreflang="${l}" href="https://usemagpie.ai/docs/${l === "en" ? "" : l + "/"}contributors"`), `${file} ${l}`);
+    assert.ok(!/privacy" hreflang=|og:url" content="[^"]*privacy/.test(html), `${file} still points at the page it was made from`);
+  }
+  for (const sub of ["", "zh/", "ja/"]) {
+    const pre = `/docs/${sub}`;
+    for (const f of readdirSync(dir(sub)).filter((f) => f.endsWith(".html"))) {
+      const foot = readFileSync(dir(sub + f), "utf8").split("<footer")[1];
+      assert.ok(foot.includes(`<a href="${pre}contributors">`), `${sub}${f}'s footer`);
+    }
+  }
+  assert.ok(readFileSync(new URL("./public/index.html", import.meta.url), "utf8").includes('<a href="/docs/contributors" data-i18n="foot.contrib">'));
+});
+
+test("seo: the sitemap lists the home pages and every docs page, each its own canonical", async () => {
+  const { readFile, readdir } = await import("node:fs/promises");
+  const { LANGS } = await import("./i18n.js");
+  const pub = new URL("./public/", import.meta.url);
+  const xml = await readFile(new URL("sitemap.xml", pub), "utf8");
+  const listed = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+  const want = ["https://usemagpie.ai/", ...Object.keys(LANGS).map((l) => `https://usemagpie.ai/${l}/`)];
+  for (const dir of ["docs/", "docs/zh/", "docs/ja/"])
+    for (const f of (await readdir(new URL(dir, pub))).filter((f) => f.endsWith(".html")).sort())
+      want.push(`https://usemagpie.ai/${dir}${f.slice(0, -5)}`);
+  assert.deepEqual([...listed].sort(), [...want].sort());
+  const home = await readFile(new URL("index.html", pub), "utf8");
+  assert.match(home, /<link rel="canonical" data-i18n-attr="href:meta.url" href="https:\/\/usemagpie.ai\/">/);
+  for (const [l, { dict }] of Object.entries(LANGS)) assert.equal(dict["meta.url"], `https://usemagpie.ai/${l}/`);
+  for (const u of listed.filter((u) => u.includes("/docs/"))) {
+    const html = await readFile(new URL(u.slice("https://usemagpie.ai/".length) + ".html", pub), "utf8");
+    const canon = [...html.matchAll(/<link rel="canonical" href="([^"]+)">/g)].map((m) => m[1]);
+    assert.deepEqual(canon, [u], `${u} canonical`);
+    assert.ok(html.includes(`<link rel="alternate" hreflang="x-default" href="https://usemagpie.ai/docs/${u.split("/").pop()}">`), `${u} x-default`);
+    assert.ok(!/name="robots" content="[^"]*noindex/.test(html), `${u} is noindex`);
+    // every alternate is a page that exists, so none is listed as a 404
+    for (const [, alt] of html.matchAll(/<link rel="alternate" hreflang="[a-z-]+" href="([^"]+)">/g))
+      assert.ok(listed.includes(alt), `${u}: ${alt}`);
+  }
+});
+
+test("seo: robots.txt names the sitemap and keeps crawlers off the counted links", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const txt = await readFile(new URL("./public/robots.txt", import.meta.url), "utf8");
+  assert.match(txt, /^Sitemap: https:\/\/usemagpie.ai\/sitemap.xml$/m);
+  for (const p of ["/api/", "/go/", "/r/", "/download"]) assert.match(txt, new RegExp(`^Disallow: ${p}$`, "m"));
+});
+
+test("seo: the home page's structured data parses and its title is in every language", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { LANGS } = await import("./i18n.js");
+  const html = await readFile(new URL("./public/index.html", import.meta.url), "utf8");
+  const ld = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  const app = JSON.parse(ld[1])["@graph"].find((n) => n["@type"] === "SoftwareApplication");
+  assert.equal(app.offers.price, "0");
+  assert.match(html, /<title data-i18n="meta.title">[^<]{20,70}<\/title>/);
+  for (const [l, { dict }] of Object.entries(LANGS)) assert.ok(dict["meta.title"].startsWith("magpie"), l);
 });

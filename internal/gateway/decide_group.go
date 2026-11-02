@@ -90,6 +90,7 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 		return
 	}
 	g = g.Live()
+	r = heldByGroup(r, g) // held to the group's accounts, if it is
 	keyWho, keyHeld := keyHolds(r)
 	accWho, accHeld := accountHolds(r)
 	// a gateway key held to some models (#882) names the group, or the
@@ -235,7 +236,7 @@ func (s *Server) serveDecideTries(w http.ResponseWriter, r *http.Request, body [
 			ctype = "application/json"
 		}
 		if status >= 400 {
-			keepRetry(w.Header(), header, b)
+			keepRetryOut(w.Header(), header, b)
 		}
 		w.Header().Set("Content-Type", ctype)
 		w.WriteHeader(status)
@@ -261,7 +262,7 @@ func (e decideRefused) Unwrap() error { return e.err }
 // accounts in the group's order, each asked as Jev is (askJev) until one
 // answers, the one that failed resting as it would for a chat. ok is false
 // when model names no decision group.
-func (s *Server) askDecisionGroup(model string, intents []string, prev before, effort bool, text string) (v verdict, ok bool, err error) {
+func (s *Server) askDecisionGroup(wait time.Duration, model string, intents []string, prev before, effort bool, text string) (v verdict, ok bool, err error) {
 	if !provider.IsGroupRef(model) {
 		return verdict{}, false, nil
 	}
@@ -272,38 +273,54 @@ func (s *Server) askDecisionGroup(model string, intents []string, prev before, e
 	g = g.Live()
 	ms, _ = provider.PausedOut(g, ms, RouterAgent, "", ruleClock())
 	cs, _, _ := s.decideTries(g, ms)
+	// held to the group's own accounts, if it is: no request carries a
+	// caller here to hold (heldByGroup)
+	cs = slices.DeleteFunc(cs, func(c candidate) bool { return groupHeld(c, []provider.Group{g}) != "" })
 	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
 	if len(cs) == 0 {
 		return verdict{}, true, fmt.Errorf("no decision model of the group %s can be asked now", g.Name)
 	}
-	v, err = s.askDecideTries(cs, intents, prev, effort, text)
+	v, err = s.askDecideTries(wait, cs, intents, prev, effort, text)
 	return v, true, err
 }
 
 // askDecider is askClassifier for one decision provider's model: its keys
 // or accounts in its routing's order (decideKeys), each asked until one
 // answers, as a decision group's are.
-func (s *Server) askDecider(p provider.Provider, model string, intents []string, prev before, effort bool, text string) (verdict, error) {
+func (s *Server) askDecider(wait time.Duration, p provider.Provider, model string, intents []string, prev before, effort bool, text string) (verdict, error) {
 	cs, _ := s.decideKeys(p, model)
 	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
 	if len(cs) == 0 {
 		return verdict{}, fmt.Errorf("no key or account of %s may be asked %s now", p.Name, model)
 	}
-	return s.askDecideTries(cs, intents, prev, effort, text)
+	return s.askDecideTries(wait, cs, intents, prev, effort, text)
 }
 
 // askDecideTries asks each of cs as Jev is (askJev) until one answers, the
 // one that failed resting as it would for a chat; the last one's error
-// when none does.
-func (s *Server) askDecideTries(cs []candidate, intents []string, prev before, effort bool, text string) (v verdict, err error) {
+// when none does. Every try shares the one classifier's wait, as Settings
+// says it is given, its failover included: a try each given the whole
+// wait held a request N waits before routing it (Jason on Discord, a 2m
+// hold). wait is that wait, or what a request has left of it (askWaited):
+// a try cut off by less than the whole wait is not rested for it.
+func (s *Server) askDecideTries(wait time.Duration, cs []candidate, intents []string, prev before, effort bool, text string) (v verdict, err error) {
+	full := classifyTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
 	for _, c := range cs {
-		if v, err = s.askJev(c.p, c.model, intents, prev, effort, text); err == nil {
+		if ctx.Err() != nil {
+			break // the wait is spent: the rest are not asked, nor rested
+		}
+		if v, err = s.askJev(ctx, wait, c.p, c.model, intents, prev, effort, text); err == nil {
 			servedCandidate(c, 0)
 			return v, nil
 		}
 		var refused decideRefused
 		var answer answerError
 		switch {
+		case wait < full && ctx.Err() != nil && !errors.As(err, &refused) && !errors.As(err, &answer):
+			// cut off by the request's wait running out, not its own
+			return verdict{}, cutShort(c.p.Name+"/"+c.model, wait, full)
 		case errors.As(err, &refused):
 			s.decideFailed(c, refused.status, refused.header, refused.body)
 		case errors.As(err, &answer), errors.Is(err, context.Canceled):

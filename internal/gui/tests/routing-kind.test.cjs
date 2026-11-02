@@ -59,6 +59,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 860 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
@@ -112,6 +113,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator(".rt-req").nth(kinds.indexOf("composer_predictions")).click();
       await page.waitForTimeout(300);
       assert.match(await story.textContent(), lang === "zh" ? /设置 › 常规 › 显示预测内容/ : /Settings › General › Show predictions/);
+      // magpie's own setting is in Codex's row on the Agents page since
+      // f1e4516d, not in Settings › General (#3425, chiperman)
+      assert.match(await story.textContent(), lang === "zh" ? /Agent 页 Codex 那一行的设置里/ : /under Settings in Codex's row on the Agents page/);
+      assert.doesNotMatch(await story.textContent(), lang === "zh" ? /设置 › 常规 › Codex 输入框预测/ : /Settings › General › Codex composer predictions/);
       assert.match(await story.textContent(), lang === "zh" ? /Codex 输入框预测/ : /Codex composer predictions/);
       // a turn has no tag in its story
       await page.locator(".rt-req").nth(kinds.length - 1).click();

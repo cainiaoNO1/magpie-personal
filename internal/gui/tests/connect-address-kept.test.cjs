@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 const { fixture } = require("./fixtures/caller-keys.cjs");
-const { openPart } = require("./reader.cjs");
+const { openPart, reach } = require("./reader.cjs");
 
 // coeo91 on Discord: the LAN address picked as Gateway's Base URL went back
 // to 127.0.0.1 after a restart or an update. The address and the gateway key
@@ -17,7 +17,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
         t.after(() => browser.close());
         const page = await (await browser.newContext({ viewport: { width, height: 800 }, reducedMotion: "reduce" })).newPage();
+        await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
         page.setDefaultTimeout(6000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const lanURLs = ["http://192.168.1.10:3999", "http://10.0.0.10:3999"];
@@ -62,6 +64,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#prefs").click();
         await openPart(page, "network");
         await page.locator("#lanList .lan-address-row").waitFor();
+        // wheeled to as a reader would: the rows above, their lines wrapped
+        // whole (arculongus on Discord), put it below a narrow window, and
+        // Playwright's own scroll to it is undone, its menu opened out of sight
+        await reach(page, page.locator("#lanList .lan-interface"));
         await pick("#lanList .lan-interface", "10.0.0.10");
         await page.reload();
         await page.locator("#prefs").click();
