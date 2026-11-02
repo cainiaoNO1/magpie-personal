@@ -541,8 +541,12 @@ func wbProbe(ctx context.Context, providerID, account, model string) (int, error
 	wbWake(providerID, account, model)
 	ctx, cancel := context.WithTimeout(ctx, wbWarmProbeTimeout)
 	defer cancel()
+	reqModel := model
+	if providerID != "" && !strings.Contains(reqModel, "/") {
+		reqModel = providerID + "/" + reqModel
+	}
 	body, _ := json.Marshal(map[string]any{
-		"model":      model,
+		"model":      reqModel,
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
 		"max_tokens": 1,
 	})
@@ -551,6 +555,9 @@ func wbProbe(ctx context.Context, providerID, account, model string) (int, error
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if providerID != "" {
+		req.Header.Set("X-Magpie-Provider", providerID)
+	}
 	req.Header.Set("X-Magpie-Account", account)
 	// magpie's own call, as the usage log reads one: a probe is not the
 	// account's own use of its window, and the Usage page counts the two
