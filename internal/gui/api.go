@@ -1126,6 +1126,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	usageRoutes(mux, w)
 	workbuddyCustomRoutes(mux)
 	workbuddyRequestRoutes(mux)
+	geminiCustomRoutes(mux)
 	callerKeyRoutes(mux)
 	sessionRoutes(mux, w)
 	sessionManageRoutes(mux, w)
@@ -1186,6 +1187,10 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		// nor the Custom page's scheduled requests, which it sets itself
 		if _, sent := fields["workbuddyWatch"]; !sent {
 			in.WorkBuddyWatch = cur.WorkBuddyWatch
+		}
+		// nor the Gemini page's, which it sets itself too
+		if _, sent := fields["geminiWatch"]; !sent {
+			in.GeminiWatch = cur.GeminiWatch
 		}
 		// nor whether the masked words match in any case
 		if _, sent := fields["redactWordsAnyCase"]; !sent {

@@ -238,6 +238,11 @@ func watchOf(w settings.WorkBuddyWatch) provider.WorkBuddyWatch {
 	return provider.WorkBuddyWatchOf(w.On, w.Models, w.EveryFor(), w.Per)
 }
 
+// geminiWatchOf is the Gemini page's setting as its warm-up reads it.
+func geminiWatchOf(w settings.GeminiWatch) provider.GeminiWatch {
+	return provider.GeminiWatchOf(w.On, w.EveryFor())
+}
+
 // wakeWorkBuddy lifts the rest a WorkBuddy account and model rests under,
 // so a warm-up probe reaches the account it asks about: a request pinned
 // to a resting account is turned away at the gateway, which would read as
@@ -619,6 +624,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// the models watched and the interval, as the Custom page left them
 	provider.SetWorkBuddyWatch(watchOf(settings.Load().WorkBuddyWatch))
 	go provider.KeepWorkBuddyWarm(ctx)
+	// and, when the Gemini page says to, makes the one call that starts an
+	// Antigravity account's 5-hour window, through this gateway as a client
+	// does: the window runs 5 hours from the first request spending anything
+	// of it, so one made while the account is at the user's own keyboard puts
+	// its hours where the user is
+	provider.SetGeminiProbeURL(URL())
+	provider.SetGeminiWatch(geminiWatchOf(settings.Load().GeminiWatch))
+	go provider.KeepGeminiWarm(ctx)
 	// and spends a Codex reset about to run out unused, for the accounts
 	// that let it
 	go provider.KeepResetsFromRunningOut(ctx)

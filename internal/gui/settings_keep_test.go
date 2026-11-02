@@ -184,6 +184,7 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 			On: true, Models: []string{"deepseek-v4.1-flash"}, Every: 600,
 			Per: map[string]int{"me@example.com\x00deepseek-v4.1-flash": 300},
 		},
+		GeminiWatch: settings.GeminiWatch{On: true, Every: 600},
 	}
 	was.DesktopSubagentEffort = "high"
 	was.CodexAsyncCompact, was.CodexAsyncCompactPercent = true, 70

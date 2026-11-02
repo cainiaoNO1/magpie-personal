@@ -213,6 +213,10 @@ type Settings struct {
 	// answers is asked. Empty is magpie's own watching (deepseek's free
 	// model, every half hour).
 	WorkBuddyWatch WorkBuddyWatch `json:"workbuddyWatch,omitzero"`
+	// GeminiWatch is the Gemini page's self-use warm-up: whether magpie makes
+	// the first call that starts an Antigravity account's 5-hour window, and
+	// how often it looks to see whether that is still to be done.
+	GeminiWatch GeminiWatch `json:"geminiWatch,omitzero"`
 	// TraeCheckin presses Trae CN's daily check-in (每日签到) for each
 	// signed-in Trae CN account (its plugin's) once a Beijing day, claiming
 	// the credits it gives.
