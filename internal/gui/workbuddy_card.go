@@ -62,6 +62,9 @@ func workbuddyRows(now time.Time) []workbuddyRow {
 	rows := make([]workbuddyRow, 0, len(warmed))
 	for key, w := range warmed {
 		_ = key // the key is the account and model, as the row has them
+		if w.Provider != provider.WorkBuddyAIID {
+			continue
+		}
 		row := workbuddyRow{
 			Provider: w.Provider,
 			User:     w.User,
@@ -124,7 +127,7 @@ func workbuddyFirstCalls(rows []workbuddyRow, now time.Time) {
 
 	firstFound := make(map[string]time.Time, len(rows))
 	for _, rec := range usage.Load(floor) {
-		if rec.ProviderAccount == "" || rec.Time.Before(floor) {
+		if rec.Provider != provider.WorkBuddyAIID || rec.ProviderAccount == "" || rec.Time.Before(floor) {
 			continue
 		}
 		key := wbRowKey(rec.ProviderAccount, rec.Model)
@@ -169,7 +172,7 @@ func workbuddySpent(rows []workbuddyRow, now time.Time) {
 		}
 	}
 	for _, rec := range usage.Load(since) {
-		if rec.Time.Before(since) || rec.ProviderAccount == "" {
+		if rec.Provider != provider.WorkBuddyAIID || rec.Time.Before(since) || rec.ProviderAccount == "" {
 			continue
 		}
 		key := wbRowKey(rec.ProviderAccount, rec.Model)

@@ -120,11 +120,17 @@ var wbWarmMu struct {
 func wbWarmPath() string { return filepath.Join(filepath.Dir(Path()), "workbuddy-warmup.json") }
 
 // readWBWarmState reads the kept state, none when it can't be read: a
-// file lost only costs the accounts a fresh freeze each.
+// file lost only costs the accounts a fresh freeze each. Domestic WorkBuddy
+// accounts are pruned so only international WorkBuddy AI accounts are watched.
 func readWBWarmState(path string) wbWarmState {
 	st := wbWarmState{}
 	if b, err := os.ReadFile(path); err == nil {
 		json.Unmarshal(b, &st)
+	}
+	for k, v := range st {
+		if v.Provider != WorkBuddyAIID {
+			delete(st, k)
+		}
 	}
 	return st
 }
@@ -143,14 +149,15 @@ func writeWBWarmState(path string, st wbWarmState) {
 }
 
 // wbFrozen is a probe's provider and model as the routing trace gives
-// them, to tell whether they are WorkBuddy's: "plugin:workbuddy-ai".
+// them, to tell whether they are WorkBuddy AI's: "plugin:workbuddy-ai".
+// The domestic build ("workbuddy") is excluded.
 func wbFrozen(agent string) (id string, ok bool) {
 	rest, found := strings.CutPrefix(agent, "plugin:")
 	if !found {
 		return "", false
 	}
 	switch rest {
-	case "workbuddy", WorkBuddyAIID:
+	case WorkBuddyAIID:
 		return rest, true
 	}
 	return "", false
@@ -344,7 +351,7 @@ func SetWorkBuddyWatch(w WorkBuddyWatch) {
 	}
 	dropped := false
 	for key, cur := range wbWarmMu.state {
-		if !slices.Contains(models, cur.Model) {
+		if cur.Provider != WorkBuddyAIID || !slices.Contains(models, cur.Model) {
 			delete(wbWarmMu.state, key)
 			dropped = true
 		}

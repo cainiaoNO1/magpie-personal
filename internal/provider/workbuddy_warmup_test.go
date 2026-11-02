@@ -95,10 +95,10 @@ func TestWorkBuddyFrozenOnlyWorkBuddy(t *testing.T) {
 	if got := WorkBuddyWarmed(); len(got) != 0 {
 		t.Fatalf("kept %d, want none: %+v", len(got), got)
 	}
-	// WorkBuddy (the China build) is kept as WorkBuddy AI is
+	// WorkBuddy (the China build) is not kept: only WorkBuddy AI (international)
 	NoteWorkBuddyFrozen("plugin:workbuddy", "c@d.e", "m", wbAt(30), wbAt(0))
-	if _, ok := wbGot("c@d.e", "m"); !ok {
-		t.Fatal("the China build's account wasn't kept")
+	if _, ok := wbGot("c@d.e", "m"); ok {
+		t.Fatal("the China build's account was kept")
 	}
 }
 
@@ -290,15 +290,17 @@ func TestWorkBuddyWatchSeedsEveryAccount(t *testing.T) {
 	t.Cleanup(func() { wbQuotas = Quotas })
 	wbWatch(context.Background(), wbAt(0))
 	got := WorkBuddyWarmed()
-	// one entry per account's model: the plugin's models are unknown here,
-	// so the free one stands in for each
-	if len(got) != 3 {
-		t.Fatalf("watched %d, want 3: %+v", len(got), got)
+	// one entry per account's model: only WorkBuddy AI accounts are watched
+	if len(got) != 2 {
+		t.Fatalf("watched %d, want 2: %+v", len(got), got)
 	}
-	for _, user := range []string{"a@b.c", "d@e.f", "g@h.i"} {
+	for _, user := range []string{"a@b.c", "d@e.f"} {
 		if _, ok := wbGot(user, wbProbeModel); !ok {
 			t.Fatalf("%s isn't watched", user)
 		}
+	}
+	if _, ok := wbGot("g@h.i", wbProbeModel); ok {
+		t.Fatal("domestic workbuddy account was watched")
 	}
 	if _, ok := wbGot("not-workbuddy@x.y", wbProbeModel); ok {
 		t.Fatal("another vendor's account was watched")

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 	"github.com/yetone/magpie/internal/usageapi"
 )
@@ -59,7 +60,7 @@ func workbuddyCallsOf(user, model, kind string, offset, limit int, now time.Time
 	if !ok {
 		p, _ = usage.LastOf(workbuddyWindowSpan)
 	}
-	f := usage.Filter{Account: user, Model: model}
+	f := usage.Filter{Account: user, Model: model, Provider: provider.WorkBuddyAIID}
 	out := workbuddyCalls{From: from, To: now, Why: why, Period: p}
 	if kind == "probe" {
 		f.Agent = "magpie"
@@ -81,7 +82,7 @@ func workbuddyCallsOf(user, model, kind string, offset, limit int, now time.Time
 // own and how many the account's.
 func workbuddyCounts(p usage.Period, user, model string) (probe, use int) {
 	for _, r := range usage.Load(time.Time{}) {
-		if r.ProviderAccount != user || (model != "" && r.Model != model) {
+		if r.Provider != provider.WorkBuddyAIID || r.ProviderAccount != user || (model != "" && r.Model != model) {
 			continue
 		}
 		if !workbuddyIn(p, r.Time) {
@@ -117,7 +118,7 @@ func workbuddyDropProbes(l *usageapi.Ledger) {
 // workbuddyOurs is whether a call went to that account and model; an
 // empty model keeps every model of the account.
 func workbuddyOurs(r usage.Record, user, model string) bool {
-	if r.ProviderAccount != user {
+	if r.Provider != provider.WorkBuddyAIID || r.ProviderAccount != user {
 		return false
 	}
 	return model == "" || r.Model == model
