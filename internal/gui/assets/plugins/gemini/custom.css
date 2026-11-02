@@ -1,0 +1,46 @@
+/* Gemini: Antigravity's windows, opened on a schedule (page.js) */
+.gm-view { display: flex; flex-direction: column; gap: 14px; }
+.gm-card { padding: 12px 14px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--card, transparent); }
+.gm-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.gm-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.gm-sub { margin-top: 4px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.gm-switch { flex: 0 0 auto; padding: 3px 12px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 600; cursor: pointer; }
+.gm-switch.on { border-color: color-mix(in srgb, var(--ok, #2e9e5b) 45%, transparent); background: color-mix(in srgb, var(--ok, #2e9e5b) 14%, transparent); color: var(--ok, #2e9e5b); }
+.gm-row { display: flex; align-items: center; gap: 10px; margin-top: 11px; flex-wrap: wrap; }
+.gm-k { flex: 0 0 auto; min-width: 150px; font-size: 11.5px; color: var(--muted); }
+.gm-note { font-size: 10.5px; color: var(--muted); }
+.gm-err { margin-top: 10px; padding: 7px 9px; border-radius: 6px; background: color-mix(in srgb, var(--err, #d64545) 12%, transparent); color: var(--err, #d64545); font-size: 11px; }
+.gm-accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); gap: 10px; }
+.gm-account { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.gm-account:hover { border-color: color-mix(in srgb, var(--fg) 22%, var(--line)); }
+.gm-account.picked { border-color: color-mix(in srgb, var(--accent, #4b7bec) 55%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #4b7bec) 30%, transparent); }
+.gm-account:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent, #4b7bec) 60%, transparent); outline-offset: 2px; }
+.gm-badge { flex: 0 0 auto; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gm-badge.ok { color: var(--ok, #2e9e5b); background: color-mix(in srgb, var(--ok, #2e9e5b) 14%, transparent); }
+.gm-badge.rest { color: var(--warn, #c8871a); background: color-mix(in srgb, var(--warn, #c8871a) 16%, transparent); }
+.gm-badge.off { color: var(--muted); background: color-mix(in srgb, var(--muted) 14%, transparent); }
+/* one block a pool: a plan's pools open on clocks of their own, so each is
+   drawn with its own name, its own windows and its own first call */
+.gm-pool { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+.gm-poolname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; font-weight: 600; color: var(--fg-2); }
+.gm-pool .gm-top + .gm-win { margin-top: 8px; }
+.gm-win + .gm-win { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.gm-whead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.gm-wname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--fg-2); }
+.gm-wuse { flex: 0 0 auto; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.gm-labels { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin: 6px 0 4px; font-size: 10.5px; color: var(--muted); }
+.gm-labels .gm-n { color: var(--fg-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.gm-track { height: 4px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.gm-track > i { display: block; height: 100%; border-radius: inherit; background: var(--warn, #c8871a); transition: width .3s; }
+.gm-track > i.ok { background: var(--ok, #2e9e5b); }
+.gm-reset { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-top: 5px; font-size: 10.5px; color: var(--muted); }
+.gm-reset .gm-left { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.gm-why { margin-top: 3px; font-size: 10px; line-height: 1.45; color: var(--muted); word-break: break-word; }
+.gm-empty { padding: 14px; border: 1px dashed var(--line); border-radius: 10px; font-size: 11.5px; line-height: 1.6; color: var(--muted); }
+
+/* the calls below the cards, drawn by the Usage page itself: the frame's
+   height is set from what it drew, so it needs no scrollbar of its own */
+.gm-records .row-head { gap: 10px; flex-wrap: wrap; }
+.gm-records .row-head .label { font-weight: 600; }
+.gm-frame { margin-top: 8px; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; overflow: hidden; }
+.gm-iframe { display: block; width: 100%; height: 2600px; border: 0; background: var(--bg, #fff); overflow: hidden; }

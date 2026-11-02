@@ -1340,6 +1340,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	usageRoutes(mux, w)
 	workbuddyCustomRoutes(mux)
 	workbuddyRequestRoutes(mux)
+	geminiCustomRoutes(mux)
 	callerKeyRoutes(mux)
 	sessionRoutes(mux, w)
 	sessionManageRoutes(mux, w)

@@ -186,6 +186,10 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	if _, sent := fields["workbuddyWatch"]; !sent {
 		in.WorkBuddyWatch = cur.WorkBuddyWatch
 	}
+	// nor the Gemini page's, which it sets itself too
+	if _, sent := fields["geminiWatch"]; !sent {
+		in.GeminiWatch = cur.GeminiWatch
+	}
 	// nor the update channel (ssharpcc on X)
 	if _, sent := fields["updateChannel"]; !sent {
 		in.UpdateChannel = cur.UpdateChannel

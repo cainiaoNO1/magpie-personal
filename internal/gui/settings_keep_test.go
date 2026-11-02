@@ -197,6 +197,7 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		RedactModelName:      "astrlink-guard",
 		RedactModelScore:     map[string]float64{"astrlink-guard": 0.9},
 		RedactRouteTo:        "fake/m1",
+		GeminiWatch:          settings.GeminiWatch{On: true, Every: 600},
 	}
 	was.RedactModelOff, was.RedactModelAuto = true, true
 	was.DesktopSubagentEffort = "high"
