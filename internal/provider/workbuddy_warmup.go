@@ -69,8 +69,10 @@ const wbWatchSpread = 10 * time.Minute
 const wbWatchEvery = 30 * time.Minute
 
 // wbProbeModel is the model asked when the account was never frozen here,
-// so no model is known for it: WorkBuddy's free one.
-const wbProbeModel = "deepseek-v4.1-flash"
+// so no model is known for it: WorkBuddy's free one. DeepSeek-V4.1-Flash
+// (and its -sg rename, deepseek-v4.1-flash-sg) costs credits now, so the
+// free model WorkBuddy still serves is asked instead.
+const wbProbeModel = "hy4flash-free"
 
 // WorkBuddyWindow is a free model's window: the 24 hours after the first
 // call that used one up. A refusal that names no reset is read as one of
